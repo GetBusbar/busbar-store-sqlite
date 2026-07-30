@@ -1,1 +1,6 @@
 /target
+
+# Default relative governance db (see README's `db_path` warning) and its WAL sidecars — stray files
+# any accidental default-relative-path open (or a panicking test that skips its own cleanup) could
+# strand in the repo root.
+busbar-governance.db*

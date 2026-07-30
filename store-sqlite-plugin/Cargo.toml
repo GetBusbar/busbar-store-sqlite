@@ -26,3 +26,8 @@ serde_json = "1"
 # the built cdylib over the real loader ABI seam, so it needs the real loader — never shipped in the
 # plugin artifact itself.
 busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
+# Dev-only: the `busy_timeout_ms_is_actually_applied` unit test opens a second, independent
+# connection to the SAME sqlite file to hold a lock and observe the plugin's configured busy_timeout
+# behaviorally. `SqliteStore` doesn't expose its inner connection, so the test needs its own. Same
+# version/feature as `busbar-store-sqlite`'s dependency so only one sqlite is ever linked in.
+rusqlite = { version = "0.40.0", features = ["bundled"] }

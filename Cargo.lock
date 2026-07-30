@@ -131,6 +131,7 @@ dependencies = [
  "busbar-plugin-loader",
  "busbar-plugin-sdk",
  "busbar-store-sqlite",
+ "rusqlite",
  "serde_json",
 ]
 

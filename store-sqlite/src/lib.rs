@@ -9,7 +9,7 @@ use busbar_api::{
     AuditRecord, AwsCredential, MeteringDelta, MeteringRow, ModelTokens, Store, StoreError,
     StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::Mutex;
 
 // rusqlite error -> the api's backend-agnostic `StoreError` (the contract crate stays storage-free,
@@ -148,12 +148,18 @@ impl SqliteStore {
         // Skip both for an in-memory path: `:memory:` ignores WAL (no rollback journal file exists)
         // and has no second connection to contend with, so the pragmas are inapplicable there.
         if !path.starts_with(":memory:") && !path.contains("mode=memory") {
-            // `journal_mode` returns the resulting mode as a row, so use `pragma_update`/query rather
-            // than `execute` (which rejects a statement that yields rows). `busy_timeout` is a plain
-            // setter and is safe via `execute_batch`.
-            conn.pragma_update(None, "journal_mode", "WAL").store()?;
+            // `busy_timeout` FIRST, `journal_mode` second: switching a not-yet-WAL file into WAL mode
+            // itself needs to briefly acquire the database, so if another connection is already
+            // holding it, that acquisition is subject to whatever busy_timeout is in effect at the
+            // time — SQLite's default is 0 (fail instantly). Setting `busy_timeout` before
+            // `journal_mode` ensures the CONFIGURED timeout (not the zero default) governs even this
+            // first pragma, not just the queries `migrate()` runs afterward. `journal_mode` returns
+            // the resulting mode as a row, so use `pragma_update`/query rather than `execute` (which
+            // rejects a statement that yields rows). `busy_timeout` is a plain setter and is safe via
+            // `execute_batch`.
             conn.pragma_update(None, "busy_timeout", busy_timeout_ms)
                 .store()?;
+            conn.pragma_update(None, "journal_mode", "WAL").store()?;
         }
         let store = Self {
             conn: Mutex::new(conn),
@@ -205,7 +211,18 @@ impl SqliteStore {
         // dropping `virtual_keys` and losing power before `usage_windows` clears BOTH sentinels; the
         // re-run then sees no legacy tables, skips the drops, and stamps v4 over a v3-shaped table
         // that `CREATE TABLE IF NOT EXISTS` cannot fix.
-        let tx = conn.transaction().store()?;
+        //
+        // IMMEDIATE, not deferred: a plain `conn.transaction()` (deferred `BEGIN`) only acquires the
+        // write lock lazily, on its first write. On an already-migrated database that first write
+        // ends up being the trailing `PRAGMA user_version = ...` below — and SQLite does NOT retry a
+        // deferred-transaction's lock-upgrading PRAGMA through the busy handler the way it retries a
+        // normal `BEGIN IMMEDIATE`/DML write: contending with another writer at that point fails with
+        // `SQLITE_BUSY` INSTANTLY, ignoring `busy_timeout_ms` entirely. Acquiring the write lock
+        // up front via `BEGIN IMMEDIATE` makes the whole migration honor the configured busy_timeout
+        // the same way every other write in this file already does.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .store()?;
         if version < SCHEMA_VERSION {
             let has_legacy: bool = tx
                 .query_row(

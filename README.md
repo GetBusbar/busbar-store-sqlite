@@ -29,7 +29,7 @@ mutex-guarded `rusqlite::Connection` handling — lives in the
 deliberately tiny: it adapts the engine's JSON `open` config into a
 `SqliteStore` and hands the trait object to
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the five `extern "C"` symbols the loader resolves. (A custom
+which emits the six `extern "C"` symbols the loader resolves. (A custom
 build can also link `busbar-store-sqlite` statically instead of using
 this dynamic wrapper — see busbarAI's plugin docs.)
 
@@ -113,6 +113,25 @@ for the full store config reference.
 |---|---|---|---|
 | `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
 | `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. |
+
+**`db_path` must be an explicit absolute path in any real deployment.** The
+`busbar-governance.db` default is resolved relative to the engine
+process's *current working directory* at the moment it calls `open` —
+not relative to the plugin, the config file, or `plugins.dir`. Under
+systemd without an explicit `WorkingDirectory=`, or across a deploy that
+changes cwd between restarts, the engine can silently bind to a
+*different* file each time: it boots healthy, but against an empty
+database (no virtual keys, no budgets, no usage history). This looks
+like nothing is wrong at boot — it reads as data loss only once someone
+notices the governance state is missing. Always set `db_path` to a full
+absolute path (e.g. `/var/lib/busbar/governance.db`, as in the example
+above) in production.
+
+A `db_path`/`busy_timeout_ms` key that is *present* in the config but
+the wrong JSON type (a number for `db_path`, a string for
+`busy_timeout_ms`, etc.) is a config error and `open` fails loudly — it
+is never silently replaced with the default. Only an *absent* key falls
+back to its default.
 
 ## Tests
 

@@ -25,6 +25,35 @@
 use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
 
+/// RAII scratch directory: removes itself on drop, including on an early return via a panicking
+/// assertion partway through a test — unlike a manual `remove_dir_all` call placed at the end of the
+/// test body, which never runs if an assertion above it fails first.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn create(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "busbar-sqlite-plugin-e2e-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir for the real sqlite file");
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Locate the built `busbar-store-sqlite-plugin` cdylib in the target dir (mirrors the loader's own
 /// `sqlite_plugin_path` helper in the monorepo).
 fn plugin_path() -> Option<std::path::PathBuf> {
@@ -53,12 +82,7 @@ fn load_and_exercise_sqlite_plugin_persists_to_real_file_across_reopen() {
         eprintln!("skip: store-sqlite-plugin cdylib not built (run cargo test/build first)");
         return;
     };
-    let dir = std::env::temp_dir().join(format!(
-        "busbar-sqlite-plugin-e2e-{}-{}",
-        std::process::id(),
-        "persist"
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir for the real sqlite file");
+    let dir = ScratchDir::create("persist");
     let db_path = dir.join("governance.db");
     let db_path_str = db_path.to_str().unwrap();
     let cfg = serde_json::json!({ "db_path": db_path_str }).to_string();
@@ -151,7 +175,7 @@ fn load_and_exercise_sqlite_plugin_persists_to_real_file_across_reopen() {
         "usage must be physically present in the sqlite file, not just cached in-process"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir); // explicit: removes the scratch dir now rather than at end of scope by coincidence
 }
 
 /// End-to-end FAILURE: an `open()` config that cannot produce a usable database — here, a
