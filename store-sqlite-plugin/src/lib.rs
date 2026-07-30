@@ -3,7 +3,7 @@
 
 //! The **SQLite store as a droppable busbar plugin** — a `cdylib` that exports the store C ABI.
 //! Build it, drop the resulting `.so`/`.dll`/`.dylib` into the engine's plugins folder, and set
-//! `governance.store: sqlite`; the engine loads it in-process at boot.
+//! `store: { module: sqlite, settings: {...} }`; the engine loads it in-process at boot.
 //!
 //! This crate is deliberately tiny: all the SQLite logic lives in the `busbar-store-sqlite` `lib`
 //! crate (which a custom build can also link statically). Here we only adapt the engine's JSON
