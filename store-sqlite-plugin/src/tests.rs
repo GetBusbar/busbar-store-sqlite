@@ -88,13 +88,16 @@ fn explicit_in_memory_db_path_is_honored() {
     let store = open(r#"{"db_path": ":memory:"}"#).expect("in-memory db_path must open");
     let key = busbar_api::VirtualKey {
         id: "vk_adapter_test".into(),
-        key_hash: "h".into(),
+        generation_hash: "h".into(),
         name: "n".into(),
         allowed_pools: None,
         enabled: true,
         created_at: 1,
         group: None,
         labels: Default::default(),
+        expires_at: None,
+        deleted_at: None,
+        revision: 0,
     };
     store
         .put_key(&key)

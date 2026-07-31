@@ -281,6 +281,17 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> StoreResult<Self> {
+        // `:memory:` is not a real file path -- SQLite opens a NEW, PRIVATE in-memory database
+        // per connection to that literal string, never a shared one. Opening a writer + N readers
+        // against `:memory:` the normal way would silently create N+1 isolated, mutually-invisible
+        // databases (only the writer's copy would ever get `migrate()`'s schema; every reader would
+        // see "no such table"). Route to the single-connection path instead, matching
+        // `open_in_memory()`'s own doc comment on exactly this hazard. This makes `:memory:` behave
+        // correctly for EVERY caller of `open()` (config-driven plugin adapters included), not just
+        // callers who already knew to use `open_in_memory()` explicitly.
+        if path == ":memory:" {
+            return Self::open_in_memory();
+        }
         Self::open_with_readers(
             path,
             busy_timeout_ms,

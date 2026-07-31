@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! End-to-end coverage of the built `busbar-store-sqlite-plugin` cdylib, loaded over the REAL
-//! `busbar-plugin-loader` C ABI seam (`load_store`) — the exact seam busbar's engine uses when
-//! `governance.store: sqlite` drops this plugin into its plugins folder. This is a real `dlopen`,
-//! real FFI, real SQLite-file test, not a call into the Rust functions directly.
+//! End-to-end coverage of the built `busbar-store-sqlite-plugin` cdylib, loaded over the real
+//! `busbar-plugin-loader` C ABI seam (`load_store`) — a real `dlopen`, real FFI, real SQLite-file
+//! test.
+//!
+//! KNOWN GAP, not fixed here: `load_store()` is called directly, in-process, by these tests — no
+//! real end user or operator does this (nobody imports `busbar-plugin-loader` and calls its
+//! internal function). The two real, end-user-mimicking mechanisms are (1) drop the packed tarball
+//! in `plugins.dir` and boot a real `busbar` binary, or (2) install it live via the real
+//! `POST /plugins` admin API against a running instance. `store-postgres` has already been
+//! converted to mechanism 1 (see `GetBusbar/store-postgres`'s `store-postgres-plugin/tests/e2e.rs`
+//! for the pattern — packs via `busbar-plugin-pack`, drops in a real `plugins.dir`, runs the real
+//! `busbar --validate` binary, confirms via an independent connection). This file should get the
+//! same treatment; tracked as part of the plugin closeout audit pass, not done in this commit.
 //!
 //! Ported from the monorepo's `busbar-plugin-loader::tests::load_and_exercise_sqlite_plugin_*`
 //! (`crates/plugin-loader/src/lib.rs`), which is where this plugin's real ABI-crossing coverage
@@ -89,13 +98,16 @@ fn load_and_exercise_sqlite_plugin_persists_to_real_file_across_reopen() {
 
     let key = VirtualKey {
         id: "vk_real_file".into(),
-        key_hash: "hash-real".into(),
+        generation_hash: "hash-real".into(),
         name: "real-file-key".into(),
         allowed_pools: Some(vec!["p".into()]),
         enabled: true,
         created_at: 42,
         group: Some("infra".into()),
         labels: std::collections::BTreeMap::from([("env".into(), "prod".into())]),
+        expires_at: None,
+        deleted_at: None,
+        revision: 0,
     };
     let ledger = UsageLedger {
         requests: 5,
