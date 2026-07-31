@@ -189,6 +189,18 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 /// `is_writer` gates the writer-only pragmas (`journal_size_limit`, `wal_autocheckpoint`) and
 /// `query_only` (readers only — NOT `SQLITE_OPEN_READ_ONLY`, which cannot create the `-wal`/`-shm`
 /// files on a fresh database and would race the writer's first open).
+/// True for any SQLite path spelling that opens a private in-memory database: the bare `:memory:`
+/// literal, or a URI filename using `mode=memory` (e.g. `file::memory:?cache=shared`,
+/// `file:foo?mode=memory`). Every caller that needs to special-case in-memory routing (pragma
+/// selection here, and `SqliteStore::open`'s single-connection routing) MUST share this check —
+/// two independent, drifting definitions is exactly how `open()` missed URI spellings that
+/// `apply_pragmas` already recognized (see `SqliteStore::open`'s doc comment).
+fn is_memory_path(path: &str) -> bool {
+    path.starts_with(":memory:")
+        || path.contains("mode=memory")
+        || (path.starts_with("file:") && path.contains(":memory:"))
+}
+
 fn apply_pragmas(
     conn: &Connection,
     path: &str,
@@ -197,7 +209,7 @@ fn apply_pragmas(
 ) -> StoreResult<()> {
     conn.pragma_update(None, "busy_timeout", busy_timeout_ms)
         .store()?;
-    let is_memory = path.starts_with(":memory:") || path.contains("mode=memory");
+    let is_memory = is_memory_path(path);
     if !is_memory {
         conn.pragma_update(None, "journal_mode", "WAL").store()?;
         let mode: String = conn
@@ -281,15 +293,18 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> StoreResult<Self> {
-        // `:memory:` is not a real file path -- SQLite opens a NEW, PRIVATE in-memory database
-        // per connection to that literal string, never a shared one. Opening a writer + N readers
-        // against `:memory:` the normal way would silently create N+1 isolated, mutually-invisible
-        // databases (only the writer's copy would ever get `migrate()`'s schema; every reader would
-        // see "no such table"). Route to the single-connection path instead, matching
-        // `open_in_memory()`'s own doc comment on exactly this hazard. This makes `:memory:` behave
-        // correctly for EVERY caller of `open()` (config-driven plugin adapters included), not just
-        // callers who already knew to use `open_in_memory()` explicitly.
-        if path == ":memory:" {
+        // `:memory:` (and its URI-form spellings, e.g. `file::memory:`, `file:foo?mode=memory`) is
+        // not a real file path -- SQLite opens a NEW, PRIVATE in-memory database per connection to
+        // it, never a shared one. Opening a writer + N readers against it the normal way would
+        // silently create N+1 isolated, mutually-invisible databases (only the writer's copy would
+        // ever get `migrate()`'s schema; every reader would see "no such table"). Route to the
+        // single-connection path instead, matching `open_in_memory()`'s own doc comment on exactly
+        // this hazard. This makes every in-memory spelling behave correctly for EVERY caller of
+        // `open()` (config-driven plugin adapters included), not just callers who already knew to
+        // use `open_in_memory()` explicitly, or who happened to pass the exact `:memory:` literal —
+        // `is_memory_path` is the same check `apply_pragmas` already uses, so this routing decision
+        // can never drift out of sync with the pragma-selection one again.
+        if is_memory_path(path) {
             return Self::open_in_memory();
         }
         Self::open_with_readers(
@@ -522,13 +537,20 @@ fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
 }
 
 fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -> StoreResult<()> {
+    // `?6` (created_at) seeds `updated_at` on a fresh INSERT, where created_at == updated_at is
+    // correct. The ON CONFLICT branch must NOT reuse `?6` there -- every other mutation path in
+    // this file (delete_key, scrub_key, revoke_credential) stamps updated_at to the actual
+    // mutation time (`now_secs()`), and put_key's UPDATE branch needs the same: reusing created_at
+    // would silently freeze `keys.updated_at` at the row's original creation time forever, even
+    // though this column has no Rust-side reader (KEY_COLS omits it) and exists purely for direct
+    // SQL/operator inspection of "when did this key last change".
     conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
-            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?6, revision=?11",
+            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11",
         params![
             key.id,
             key.generation_hash,
@@ -541,6 +563,7 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
             key.expires_at.map(|v| v as i64),
             key.deleted_at.map(|v| v as i64),
             revision,
+            now_secs(),
         ],
     )
     .store()?;
@@ -854,15 +877,20 @@ impl Store for SqliteStore {
         // Same sentinel-row discipline as put_usage: requests/billable_requests accumulate
         // unconditionally on model='', regardless of whether this particular delta touched any
         // models (a rejected/errored request can add to `requests` while reaching zero models).
-        tx.execute(
+        // `prepare_cached`, not `execute`/`prepare`: this fires once per admitted request (the
+        // hottest write path in the crate), and these two statement texts never vary — caching
+        // avoids paying SQLite's parse+plan cost on every single request.
+        tx.prepare_cached(
             "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
              VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
              ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
                 requests = MAX(0, requests + ?3), billable_requests = MAX(0, billable_requests + ?4)",
-            params![window_start as i64, bucket_id, delta.requests, delta.billable_requests],
-        ).store()?;
+        )
+        .store()?
+        .execute(params![window_start as i64, bucket_id, delta.requests, delta.billable_requests])
+        .store()?;
         for m in &delta.models {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
                  VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
@@ -871,11 +899,13 @@ impl Store for SqliteStore {
                     tokens_output      = MAX(0, tokens_output + ?5),
                     tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
                     tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
-                params![
-                    window_start as i64, bucket_id, m.model,
-                    m.tokens.input, m.tokens.output, m.tokens.cache_read, m.tokens.cache_write,
-                ],
-            ).store()?;
+            )
+            .store()?
+            .execute(params![
+                window_start as i64, bucket_id, m.model,
+                m.tokens.input, m.tokens.output, m.tokens.cache_read, m.tokens.cache_write,
+            ])
+            .store()?;
         }
         tx.commit().store()?;
         Ok(())

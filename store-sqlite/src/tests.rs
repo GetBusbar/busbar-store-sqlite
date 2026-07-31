@@ -71,6 +71,57 @@ fn put_get_roundtrips_a_key() {
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 }
 
+/// `keys.updated_at` has no Rust-side reader (`KEY_COLS` omits it -- it exists purely for direct
+/// SQL/operator inspection), so this reads it back via raw SQL like the other CHECK/trigger tests
+/// in this file. Regression test for `put_key_inner`'s ON CONFLICT branch reusing `created_at`
+/// (bound param `?6`) for `updated_at` instead of stamping the actual mutation time.
+#[test]
+fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_stamp", "g1");
+    k.created_at = 1_000;
+    s.put_key(&k).unwrap();
+    // Mutate (rename) and put again -- this goes through the ON CONFLICT DO UPDATE branch.
+    k.name = "renamed".to_string();
+    s.put_key(&k).unwrap();
+    let conn = s.lock_writer();
+    let updated_at: i64 = conn
+        .query_row("SELECT updated_at FROM keys WHERE id='vk_stamp'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_ne!(
+        updated_at, k.created_at as i64,
+        "updated_at must reflect the actual mutation time, not be frozen at created_at"
+    );
+}
+
+/// `SqliteStore::open`'s `:memory:` routing must recognize every spelling `apply_pragmas`'s own
+/// `is_memory` check recognizes -- not just the bare `:memory:` literal. Regression test for a
+/// gap where `open()` used `path == ":memory:"` (exact match only) while `apply_pragmas` already
+/// used the broader `is_memory_path` check: a URI-form spelling like `file::memory:` would fall
+/// through to `open_with_readers`, which opens N+1 independent, mutually-invisible private
+/// in-memory databases (only the writer gets `migrate()`'s schema; every reader sees no tables).
+#[test]
+fn memory_uri_spellings_other_than_the_bare_literal_are_still_single_connection() {
+    for path in ["file::memory:", "file:test?mode=memory&cache=shared"] {
+        let s = SqliteStore::open(path, 5000)
+            .unwrap_or_else(|e| panic!("open({path:?}) must succeed: {e}"));
+        assert!(
+            s.readers.is_empty(),
+            "open({path:?}) must route through the single-connection in-memory path, not open_with_readers"
+        );
+        let k = sample_key("vk_mem", "g");
+        s.put_key(&k).unwrap();
+        // If a reader pool had been created against an isolated private DB, this would fail with
+        // "no such table: keys" instead of returning the row just written on the writer.
+        assert!(
+            s.get_key("vk_mem").unwrap().is_some(),
+            "open({path:?}): reader path must see the row written on the writer connection"
+        );
+    }
+}
+
 #[test]
 fn allowed_pools_none_vs_empty_round_trip_distinctly() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -96,6 +147,44 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     let delta = s.list_keys_since(watermark).unwrap();
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].id, "vk_b");
+}
+
+/// The credential-side half of the same revision-based hydration mechanism as
+/// `list_keys_since_only_returns_keys_past_the_watermark` — had zero coverage before this test.
+#[test]
+fn list_credentials_since_only_returns_credentials_past_the_watermark() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_ca", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_ca", "AKIA_A", 0))
+        .unwrap();
+    let watermark = s.list_credentials("vk_ca").unwrap()[0].revision;
+    s.put_credential(&sample_credential("vk_ca", "AKIA_B", 1))
+        .unwrap();
+    let delta = s.list_credentials_since(watermark).unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].meta.public_id, "AKIA_B");
+    // Must be ordered by revision (the hydration contract), not insertion/id order. Revoking
+    // slot 0 bumps that SAME physical row's revision again (revoke/remint reuse the row via the
+    // key_id+kind+slot UPSERT) rather than appending a new one, so the delta still reflects each
+    // row's latest state, ordered by its latest revision.
+    let a_id = s.list_credentials("vk_ca").unwrap()[0].id.clone();
+    s.revoke_credential(&a_id, "rotated").unwrap();
+    let delta2 = s.list_credentials_since(watermark).unwrap();
+    assert_eq!(
+        delta2.len(),
+        2,
+        "revoke updates AKIA_A's existing row rather than adding one"
+    );
+    assert!(
+        delta2[0].meta.revision < delta2[1].meta.revision,
+        "delta must be ordered by revision"
+    );
+    assert!(
+        delta2
+            .iter()
+            .any(|c| c.meta.public_id == "AKIA_A" && c.meta.revoked_at.is_some()),
+        "the revoked row's latest state must be visible in the delta"
+    );
 }
 
 // ── Tombstone delete: the redesign's central behavior change ──────────────────────────────────
@@ -244,6 +333,51 @@ fn credential_mint_into_revoked_slot_succeeds() {
         .collect();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].public_id, "AKIA_NEW");
+}
+
+/// Overlap-window rotation: mint into the FREE slot (1) while slot 0 is still live, so both
+/// credentials for the same key_id+kind are live simultaneously — the actual scenario `slot`
+/// exists for (mint the replacement, hand it out, only THEN revoke the old one). Every other
+/// credential test in this file uses slot 0 exclusively; this is the only one that ever puts a
+/// row into slot 1 or has two live rows for one key_id+kind at once.
+#[test]
+fn credential_overlap_window_rotation_keeps_both_slots_live_simultaneously() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_overlap", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_overlap", "AKIA_OLD", 0))
+        .unwrap();
+    // Mint the replacement into the free slot (1) BEFORE revoking slot 0 -- both must be live.
+    s.put_credential(&sample_credential("vk_overlap", "AKIA_NEW", 1))
+        .unwrap();
+    let live: std::collections::BTreeSet<_> = s
+        .list_credentials("vk_overlap")
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.revoked_at.is_none())
+        .map(|c| c.public_id)
+        .collect();
+    assert_eq!(
+        live,
+        std::collections::BTreeSet::from(["AKIA_OLD".to_string(), "AKIA_NEW".to_string()]),
+        "both slots must resolve as live during the overlap window"
+    );
+    // Only now retire the old one, leaving exactly the new credential live.
+    let old_id = s
+        .list_credentials("vk_overlap")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.public_id == "AKIA_OLD")
+        .unwrap()
+        .id;
+    s.revoke_credential(&old_id, "rotation complete").unwrap();
+    let live_after: Vec<_> = s
+        .list_credentials("vk_overlap")
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.revoked_at.is_none())
+        .map(|c| c.public_id)
+        .collect();
+    assert_eq!(live_after, vec!["AKIA_NEW".to_string()]);
 }
 
 #[test]
