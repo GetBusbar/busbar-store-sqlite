@@ -481,11 +481,14 @@ impl SqliteStore {
 // comma-delimited string, which CORRUPTS any pool name containing a comma: a single intended pool
 // `"prod,special"` round-trips as two pools `["prod", "special"]`, so `pool_allowed` matches EITHER
 // fragment (a silent privilege expansion) and never matches the real compound name (a silent deny).
-// A JSON array is delimiter-safe for arbitrary string values, so we now SERIALIZE as JSON. We still
-// READ legacy comma-delimited rows transparently (a value that is not valid JSON array TEXT — i.e.
-// every row written before this change — falls back to the comma split), so an existing on-disk DB
-// keeps working without a migration. New writes are always JSON, so a comma-bearing name survives a
-// write/read round-trip exactly.
+// A JSON array is delimiter-safe for arbitrary string values, so we SERIALIZE as JSON.
+//
+// There is no comma-delimited read fallback, and none is needed: `migrate()` unconditionally DROPS
+// and recreates any pre-v4 database (1.5.0 is unreleased — a bump, never a migration; see
+// `migrate()`'s own doc comment), so a legacy comma-delimited row can never actually reach
+// `pools_from_storage` — every row this code ever reads was written by this code, as JSON. A value
+// that fails to parse as a JSON string array (only reachable via a direct, out-of-band DB edit) reads
+// as the EMPTY grant — the most restrictive reading, never a silent widen to "all pools".
 fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
     // C6 intent preserved through storage: `None` (grant omitted = ALL pools) persists as SQL
     // NULL; `Some(list)` - INCLUDING the explicit empty grant `Some([])` = NO pools - persists as
@@ -605,6 +608,14 @@ impl Store for SqliteStore {
         tx.execute("DELETE FROM usage_windows WHERE bucket_id=?1", params![id])
             .store()?;
         tx.execute("DELETE FROM usage_ledger WHERE bucket_id=?1", params![id])
+            .store()?;
+        // The raw per-(key_id,bucket,model,provider) billing ledger also keys on this id and must not
+        // survive a hard delete: an orphaned row here silently corrupts cost reconstruction if the id
+        // is ever reused. (Operators who want to retire a key while KEEPING its billing/audit history
+        // have two non-destructive paths that never reach this method: PATCH /keys/{id} enabled:false,
+        // or POST /keys/{id}/revoke — both documented in admin-api.md as preserving history. DELETE is
+        // the deliberate hard-purge primitive, so it must purge everything, this table included.)
+        tx.execute("DELETE FROM usage_metering WHERE key_id=?1", params![id])
             .store()?;
         // Remove any AWS credential rows tied to this key in the SAME transaction: a revoked key's
         // SigV4 credential must NOT outlive the key, or a Bedrock-SDK client signing with that

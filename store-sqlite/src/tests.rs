@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{ModelTokensDelta, Store, TierTokensDelta, VirtualKey};
+use busbar_api::{AwsCredential, ModelTokensDelta, Store, TierTokensDelta, VirtualKey};
 
 fn sample_key(id: &str, hash: &str) -> VirtualKey {
     VirtualKey {
@@ -544,6 +544,44 @@ fn test_delete_key_removes_key_and_ledger_atomically() {
 }
 
 #[test]
+fn test_delete_key_removes_usage_metering_rows() {
+    // The raw per-(key_id,bucket,model,provider) billing ledger keys on the same id and must not
+    // survive a delete: an orphaned row here silently corrupts cost reconstruction if the id is
+    // ever reused.
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_meter_del", "hash_meter_del"))
+        .unwrap();
+    let bucket = 20_270_101_u64;
+    s.add_metering(&MeteringDelta {
+        key_id: "vk_meter_del".into(),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_creation: 0,
+        requests: 1,
+    })
+    .unwrap();
+    assert!(
+        s.list_metering(bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == "vk_meter_del"),
+        "metering row must exist before delete"
+    );
+    s.delete_key("vk_meter_del").unwrap();
+    assert!(
+        !s.list_metering(bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == "vk_meter_del"),
+        "delete_key must remove usage_metering rows too"
+    );
+}
+
+#[test]
 fn test_delete_key_does_not_inherit_stale_ledger_on_recreate() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.put_key(&sample_key("vk_reuse", "hash_vk_reuse")).unwrap();
@@ -554,5 +592,62 @@ fn test_delete_key_does_not_inherit_stale_ledger_on_recreate() {
         s.get_usage("vk_reuse", 100).unwrap(),
         UsageLedger::default(),
         "re-created key must not inherit the deleted key's ledger"
+    );
+}
+
+/// The AWS-credential path (`put_aws_credential`, `list_aws_credentials`,
+/// `put_key_with_aws_credential`, and the cascade-delete of `aws_credentials` inside `delete_key`)
+/// had zero test coverage anywhere in this crate despite `delete_key`'s own doc comment claiming
+/// the cascade as a load-bearing security property ("a revoked key's SigV4 credential must NOT
+/// outlive the key").
+#[test]
+fn test_aws_credential_path_end_to_end() {
+    let s = SqliteStore::open_in_memory().unwrap();
+
+    // put_key_with_aws_credential: the atomic mint path.
+    let key = sample_key("vk_cred_mint", "hash_cred_mint");
+    let cred = AwsCredential {
+        access_key_id: "AKIACREDMINT".into(),
+        key_id: "vk_cred_mint".into(),
+        secret_access_key: "secret1".into(),
+    };
+    s.put_key_with_aws_credential(&key, &cred).unwrap();
+    assert!(s.get_key("vk_cred_mint").unwrap().is_some());
+    let creds = s.list_aws_credentials().unwrap();
+    assert!(
+        creds
+            .iter()
+            .any(|c| c.access_key_id == "AKIACREDMINT" && c.key_id == "vk_cred_mint"),
+        "put_key_with_aws_credential must mint both the key and its credential atomically"
+    );
+
+    // put_aws_credential: standalone add (a second credential for the same key).
+    let cred2 = AwsCredential {
+        access_key_id: "AKIACREDSTANDALONE".into(),
+        key_id: "vk_cred_mint".into(),
+        secret_access_key: "secret2".into(),
+    };
+    s.put_aws_credential(&cred2).unwrap();
+    let creds = s.list_aws_credentials().unwrap();
+    assert!(
+        creds
+            .iter()
+            .any(|c| c.access_key_id == "AKIACREDSTANDALONE"),
+        "put_aws_credential must add a standalone credential"
+    );
+    assert_eq!(
+        creds.iter().filter(|c| c.key_id == "vk_cred_mint").count(),
+        2,
+        "a key may have more than one credential"
+    );
+
+    // The cascade-delete: delete_key must remove EVERY credential tied to that key.
+    s.delete_key("vk_cred_mint").unwrap();
+    assert!(s.get_key("vk_cred_mint").unwrap().is_none());
+    let creds_after = s.list_aws_credentials().unwrap();
+    assert!(
+        !creds_after.iter().any(|c| c.key_id == "vk_cred_mint"),
+        "delete_key must remove ALL AWS credentials tied to the key, not just leave them behind: \
+         a revoked key's SigV4 credential must not outlive it. Survivors: {creds_after:?}"
     );
 }

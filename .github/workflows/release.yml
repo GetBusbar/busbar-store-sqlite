@@ -24,10 +24,12 @@ permissions:
   attestations: write  # record the build-provenance attestation
 
 env:
-  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
-  # ci.yml / plugin-ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
-  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
-  BUSBAR_REF: 1.5.0-dev
+  # SHA-pinned, matching the convention every sibling plugin repo (auth-oidc, store-postgres,
+  # store-redis, webrequest-hook) already uses — a mutable branch here means the signing/release
+  # build for a git-tagged release is not reproducible (it could build against whatever 1.5.0-dev
+  # happens to point at on a given day). Update to `main` once busbar 1.5.0 actually ships; until
+  # then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
+  BUSBAR_REF: ddc97f1e337098d6b3b8f6cba32573cf2d652d5f
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
@@ -126,7 +128,7 @@ jobs:
           lib="store-sqlite/target/${target}/release/${{ matrix.libprefix }}busbar_store_sqlite_plugin.${{ matrix.libext }}"
           "$pack" pack \
             --lib "$lib" \
-            --name "busbar-store-sqlite" --alias "sqlite" --kind store \
+            --name "busbar-store-sqlite-plugin" --alias "sqlite" --kind store \
             --version "$ver" --publisher busbar \
             --description "First-party signed kind:store plugin cdylib: the SQLite governance store packaged as a droppable busbar plugin exporting the store C ABI. Drop the built library into the plugins folder and set store.module: sqlite." \
             --license Apache-2.0 \
