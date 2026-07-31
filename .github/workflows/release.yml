@@ -26,10 +26,13 @@ permissions:
 env:
   # SHA-pinned, matching the convention every sibling plugin repo (auth-oidc, store-postgres,
   # store-redis, webrequest-hook) already uses — a mutable branch here means the signing/release
-  # build for a git-tagged release is not reproducible (it could build against whatever 1.5.0-dev
+  # build for a git-tagged release is not reproducible (it could build against whatever dev
   # happens to point at on a given day). Update to `main` once busbar 1.5.0 actually ships; until
-  # then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
-  BUSBAR_REF: ddc97f1e337098d6b3b8f6cba32573cf2d652d5f
+  # then the plugin ABI surface this crate depends on only exists on dev. Previously pinned to
+  # ddc97f1e (pre-dates the generic-credentials redesign and the ScopeRef admission-topology
+  # generalization this crate's own code now requires); bumped to dev's tip after verifying a
+  # clean build/test/clippy/fmt pass against it.
+  BUSBAR_REF: d7d1a81bd60b9318f89a8a9040e1f850af6943c1
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to

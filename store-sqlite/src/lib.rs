@@ -9,7 +9,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,9 +59,11 @@ CREATE TABLE IF NOT EXISTS keys (
     name            TEXT NOT NULL,
     -- Bare string, NOT a foreign key: groups are config-defined, not persisted entities.
     key_group       TEXT,
-    -- NULLABLE JSON array: NULL = the pool grant was OMITTED at mint = ALL pools; a JSON array
-    -- (including '[]') = the exhaustive grant. Matches VirtualKey::allowed_pools: Option<Vec<String>>
-    -- exactly (C6: None vs Some([]) must never collapse into each other).
+    -- NULLABLE JSON array of bare pool-name strings: NULL = the pool grant was OMITTED at mint =
+    -- ALL pools; a JSON array (including '[]') = the exhaustive grant. Matches
+    -- VirtualKey::allowed_scopes: Option<Vec<ScopeRef>> (every entry kind=pool by construction
+    -- today) — wire/storage shape is unchanged by the ScopeRef generalization, only the in-memory
+    -- Rust type changed (C6: None vs Some([]) must never collapse into each other).
     allowed_pools   TEXT,
     labels          TEXT NOT NULL DEFAULT '{}',
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -441,18 +444,29 @@ impl SqliteStore {
     }
 }
 
-// `allowed_pools` / `labels` JSON (de)serialization — unchanged from the pre-redesign store: C6
-// intent (None vs Some([])) round-trips through NULL vs a JSON array; a malformed value (only
-// reachable via a direct out-of-band DB edit, since `migrate()` unconditionally recreates a pre-v5
-// database) reads as the most restrictive grant, never a silent widen.
-fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
-    pools
-        .as_ref()
-        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
+// `allowed_pools` / `labels` JSON (de)serialization — storage shape unchanged from the
+// pre-ScopeRef-generalization store: C6 intent (None vs Some([])) round-trips through NULL vs a
+// JSON array of bare pool-name strings; a malformed value (only reachable via a direct
+// out-of-band DB edit, since `migrate()` unconditionally recreates a pre-v5 database) reads as
+// the most restrictive grant, never a silent widen. Only the in-memory Rust type changed
+// (Option<Vec<String>> -> Option<Vec<ScopeRef>>) — every entry is `kind: "pool"` by construction,
+// since "pool" is the only registered scope kind today, matching busbar_api's own
+// allowed_scopes_wire serde shim.
+fn pools_to_storage(scopes: &Option<Vec<ScopeRef>>) -> Option<String> {
+    scopes.as_ref().map(|list| {
+        let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
+        serde_json::to_string(&bare).unwrap_or_else(|_| "[]".to_string())
+    })
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
     let stored = stored?;
-    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
+    Some(
+        serde_json::from_str::<Vec<String>>(stored.trim())
+            .unwrap_or_default()
+            .into_iter()
+            .map(ScopeRef::pool)
+            .collect(),
+    )
 }
 fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
     serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
@@ -466,7 +480,7 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         id: r.get(0)?,
         generation_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)?),
+        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)?),
         enabled: r.get::<_, i64>(4)? != 0,
         created_at: r.get::<_, i64>(5)? as u64,
         group: r.get(6)?,
@@ -555,7 +569,7 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
             key.id,
             key.generation_hash,
             key.name,
-            pools_to_storage(&key.allowed_pools),
+            pools_to_storage(&key.allowed_scopes),
             key.enabled as i64,
             key.created_at as i64,
             key.group,
