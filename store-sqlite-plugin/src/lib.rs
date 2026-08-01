@@ -44,9 +44,25 @@ fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     let busy_timeout_ms = match v.get("busy_timeout_ms") {
         None | Some(serde_json::Value::Null) => 5000,
         Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
-            n.as_i64().ok_or_else(|| {
+            let ms = n.as_i64().ok_or_else(|| {
                 format!("invalid sqlite plugin config: `busy_timeout_ms` out of range, got {n}")
-            })?
+            })?;
+            // A negative duration has no meaning and can only be a config mistake (a unit-
+            // conversion bug, a stray sign, a bad template substitution) -- unlike `0`, which is a
+            // real, deliberate SQLite setting (see `apply_pragmas`'s own doc: SQLite's own
+            // zero-second default), a negative number names nothing SQLite or an operator could
+            // sensibly mean. SQLite doesn't reject it either -- like `0`, any `busy_timeout <= 0`
+            // silently disables the busy handler entirely (every write fails instantly on the
+            // slightest lock contention instead of retrying), which reads as a healthy boot with a
+            // quietly degraded reliability posture. `0` is left as a legal, if unusual, explicit
+            // "never retry" choice; only the never-sensible negative case is rejected here, the
+            // same silent-footgun class the wrong-JSON-type check above already guards against.
+            if ms < 0 {
+                return Err(format!(
+                    "invalid sqlite plugin config: `busy_timeout_ms` must not be negative, got {ms}"
+                ));
+            }
+            ms
         }
         Some(other) => {
             return Err(format!(
