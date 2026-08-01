@@ -113,7 +113,7 @@ for the full store config reference.
 | Setting | Required | Default | Notes |
 |---|---|---|---|
 | `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
-| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. |
+| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value is rejected as a config error, since it can only be a mistake. |
 
 **`db_path` must be an explicit absolute path in any real deployment.** The
 `busbar-governance.db` default is resolved relative to the engine
@@ -130,9 +130,9 @@ above) in production.
 
 A `db_path`/`busy_timeout_ms` key that is *present* in the config but
 the wrong JSON type (a number for `db_path`, a string for
-`busy_timeout_ms`, etc.) is a config error and `open` fails loudly — it
-is never silently replaced with the default. Only an *absent* key falls
-back to its default.
+`busy_timeout_ms`, etc.) — or a negative `busy_timeout_ms` — is a config
+error and `open` fails loudly — it is never silently replaced with the
+default. Only an *absent* key falls back to its default.
 
 ## Tests
 

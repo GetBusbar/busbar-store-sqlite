@@ -18,6 +18,23 @@ fn malformed_json_is_rejected() {
     );
 }
 
+/// A negative `busy_timeout_ms` passes the existing type check (`n.is_i64()` is true for a negative
+/// integer) but is nonsensical as a duration and can only be a config mistake -- unlike `0`, which
+/// is a legal, deliberate "never retry" setting, a negative number names nothing SQLite or an
+/// operator could sensibly mean. That's the same silent-footgun class the type-strict parsing above
+/// already guards against for the wrong JSON type; a negative number must be rejected the same way,
+/// not passed straight through to `SqliteStore::open`. `db_path` is pinned to `:memory:` so this
+/// stays hermetic even while unfixed: without it, the pre-fix code reaches a real `SqliteStore::open`
+/// against the default relative `busbar-governance.db` path and creates a real file in the test's cwd.
+#[test]
+fn negative_busy_timeout_ms_is_rejected() {
+    let err = expect_err(open(r#"{"db_path": ":memory:", "busy_timeout_ms": -1}"#));
+    assert!(
+        err.contains("busy_timeout_ms") && err.contains("negative"),
+        "error should name the offending field and explain why: {err}"
+    );
+}
+
 /// RAII guard that switches the process cwd to a fresh scratch temp directory and restores the
 /// original cwd (then removes the scratch directory) on drop — including on an early return via
 /// panic/`?`, so a failing assertion can never strand files in the repo root. `set_current_dir` is

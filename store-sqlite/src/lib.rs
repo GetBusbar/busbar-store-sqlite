@@ -451,7 +451,9 @@ impl SqliteStore {
 // the most restrictive grant, never a silent widen. Only the in-memory Rust type changed
 // (Option<Vec<String>> -> Option<Vec<ScopeRef>>) — every entry is `kind: "pool"` by construction,
 // since "pool" is the only registered scope kind today, matching busbar_api's own
-// allowed_scopes_wire serde shim.
+// allowed_scopes_wire serde shim. The conversion happens here, at construction
+// (`ScopeRef::pool(name)`) and at read (`.value`), mirroring `store-postgres`'s
+// `pools_to_storage`/`pools_from_storage`.
 fn pools_to_storage(scopes: &Option<Vec<ScopeRef>>) -> Option<String> {
     scopes.as_ref().map(|list| {
         let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
