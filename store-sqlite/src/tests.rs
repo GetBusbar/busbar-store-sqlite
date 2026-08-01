@@ -751,6 +751,256 @@ fn foreign_keys_cascade_is_real_not_just_the_app_level_delete() {
     );
 }
 
+// ── Mutation-testing regressions (cargo-mutants round 1, store-sqlite/src/lib.rs) ──────────────
+
+#[test]
+fn is_memory_path_rejects_a_plain_file_path() {
+    assert!(
+        !is_memory_path("/var/lib/busbar/governance.db"),
+        "a real on-disk path must never be routed as an in-memory spelling"
+    );
+}
+
+#[test]
+fn is_memory_path_recognizes_every_documented_spelling() {
+    assert!(is_memory_path(":memory:"));
+    assert!(is_memory_path("file::memory:"));
+    assert!(is_memory_path("file:test?mode=memory&cache=shared"));
+}
+
+#[test]
+fn is_memory_path_file_prefix_alone_is_not_enough() {
+    // `starts_with("file:")` alone must NOT be sufficient -- it must ALSO contain `:memory:`.
+    // A real on-disk `file:` URI naming an ordinary rwc-mode database must not be misrouted.
+    assert!(
+        !is_memory_path("file:/var/lib/busbar/governance.db?mode=rwc"),
+        "a file: URI without :memory: must not be treated as an in-memory spelling"
+    );
+}
+
+#[test]
+fn apply_pragmas_writer_and_reader_cache_sizes_are_negative_kib_budgets() {
+    // Negative `cache_size` means "KiB budget" (not "N pages") in SQLite's own pragma semantics --
+    // the sign is load-bearing, not cosmetic. A writer gets a larger budget than a reader.
+    let conn = Connection::open_in_memory().unwrap();
+    apply_pragmas(&conn, ":memory:", 5000, true).unwrap();
+    let writer_cache: i64 = conn
+        .query_row("PRAGMA cache_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        writer_cache, -65536,
+        "writer cache_size must be -65536 (a 64MiB budget)"
+    );
+
+    let conn = Connection::open_in_memory().unwrap();
+    apply_pragmas(&conn, ":memory:", 5000, false).unwrap();
+    let reader_cache: i64 = conn
+        .query_row("PRAGMA cache_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        reader_cache, -16384,
+        "reader cache_size must be -16384 (a 16MiB budget)"
+    );
+}
+
+#[test]
+fn apply_pragmas_mmap_disabled_only_for_a_real_network_style_path() {
+    // A path that "looks like" a network filesystem (contains `//`, does not start with `:`, i.e.
+    // is not one of the in-memory spellings) disables mmap defensively. Uses a real temp file
+    // connection (not `:memory:`) so the WAL-enable branch actually runs, matching a real on-disk
+    // open -- the `path` string passed to `apply_pragmas` is independent of the connection's real
+    // backing file, exactly as the production `open_with_readers` call site passes it.
+    let dir = tempdir();
+    let file = dir.join("net.db");
+    let conn = Connection::open(&file).unwrap();
+    apply_pragmas(&conn, "//nfs/share/governance.db", 5000, true).unwrap();
+    let mmap: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mmap, 0, "a real network-style path must disable mmap");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn apply_pragmas_mmap_stays_enabled_for_a_colon_prefixed_lookalike() {
+    // A path starting with `:` (the in-memory-spelling prefix character) must NOT trip the
+    // network-path mmap-disable heuristic even if it also happens to contain `//` -- the `!`
+    // negation on `starts_with(':')` is load-bearing. `is_memory_path` also returns true for this
+    // string (it starts with `:memory:`... no -- it starts with just `:`, not `:memory:`, so route
+    // through the WAL-enabling branch on a real file to exercise the full pragma set).
+    let dir = tempdir();
+    let file = dir.join("colon.db");
+    let conn = Connection::open(&file).unwrap();
+    apply_pragmas(&conn, "://weird/but/not/memory//x", 5000, true).unwrap();
+    let mmap: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        mmap, 268_435_456,
+        "a `:`-prefixed path must keep mmap enabled even though it contains `//`"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn apply_pragmas_writer_only_pragmas_skipped_for_an_in_memory_writer() {
+    // `journal_size_limit`/`wal_autocheckpoint` are writer-only AND memory-skipped: a `:memory:`
+    // writer must never have them explicitly set (WAL doesn't apply to a private in-memory
+    // database in the first place). SQLite's own unset default for `journal_size_limit` is -1.
+    let conn = Connection::open_in_memory().unwrap();
+    apply_pragmas(&conn, ":memory:", 5000, true).unwrap();
+    let limit: i64 = conn
+        .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(
+        limit, 67_108_864,
+        "an in-memory writer must not have the file-only journal_size_limit pragma applied"
+    );
+}
+
+#[test]
+fn store_path_reports_the_exact_configured_path() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    assert_eq!(s.path(), ":memory:");
+
+    let dir = tempdir();
+    let file = dir.join("named.db");
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(s.path(), file.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lock_reader_round_robins_without_ever_indexing_out_of_bounds() {
+    let dir = tempdir();
+    let file = dir.join("readers.db");
+    let s = SqliteStore::open_with_readers(file.to_str().unwrap(), 5000, 2).unwrap();
+    // Far more calls than the reader count (and more than reader_count^2) so an off-by-operator
+    // index (`/` instead of `%`, or unwrapped `+` growth instead of wraparound) would either pick
+    // the wrong connection forever or panic on an out-of-bounds index well before this many calls.
+    for _ in 0..25 {
+        let conn = s.lock_reader();
+        let one: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(one, 1);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
+    // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
+    // schema's own table names (`keys`, `store_meta`) are ALSO named in the legacy-drop list (the
+    // list has to cover every prior schema generation), so if that guard ever admits
+    // `version == SCHEMA_VERSION` (an `==`/`<=` mutant of the comparison), a second migrate() call
+    // on an already-current database would find "legacy" tables (its own current ones) and drop
+    // every table, silently wiping live data.
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_mig", "g")).unwrap();
+    s.migrate()
+        .expect("re-running migrate on a current-version db must succeed");
+    assert!(
+        s.get_key("vk_mig").unwrap().is_some(),
+        "re-running migrate() at the current schema version must not drop live data"
+    );
+}
+
+#[test]
+fn migrate_drops_and_recreates_a_genuinely_older_schema() {
+    // The inverse of the test above: given a database at a version BELOW SCHEMA_VERSION with a
+    // legacy `keys` table shaped incompatibly with the current schema, `migrate()` must actually
+    // drop and recreate it (the `version < SCHEMA_VERSION` guard must admit this case) -- an
+    // inverted comparison (`>` instead of `<`) would leave the incompatible legacy table in place
+    // and the subsequent `put_key` would fail against the wrong column shape.
+    let dir = tempdir();
+    let file = dir.join("legacy.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE keys (id TEXT PRIMARY KEY); \
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
+        .expect("open() must migrate a genuinely older schema, not fail against the legacy shape");
+    s.put_key(&sample_key("vk_legacy", "g")).expect(
+        "the legacy `keys` table must have been dropped and recreated with the current shape",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn secret_form_from_str_round_trips_every_named_form() {
+    assert_eq!(secret_form_from_str("recoverable"), SecretForm::Recoverable);
+    assert_eq!(secret_form_from_str("digest"), SecretForm::Digest);
+    assert_eq!(secret_form_from_str("anything-else"), SecretForm::None);
+}
+
+#[test]
+fn purge_windows_before_purges_past_a_single_chunk_boundary() {
+    // The chunked-delete loop breaks on `changed < 5000` (the subquery LIMIT). With more than one
+    // full chunk's worth of stale rows, an inclusive (`<=`) boundary would stop after the FIRST
+    // full chunk and silently leave the remainder unpurged.
+    let s = SqliteStore::open_in_memory().unwrap();
+    // 2501 distinct windows x 2 rows each (requests-sentinel + one model row) = 5002 rows, one more
+    // than a single 5000-row chunk.
+    for i in 0..2501u64 {
+        s.add_usage("vk_chunk", i, &delta(1, "m", 1, 1)).unwrap();
+    }
+    let purged = s.purge_windows_before(10_000).unwrap();
+    assert_eq!(
+        purged, 5002,
+        "every stale row must be purged across chunk boundaries, not just the first 5000"
+    );
+    assert!(s.get_usage("vk_chunk", 0).unwrap().requests == 0);
+}
+
+#[test]
+fn purge_metering_before_purges_past_a_single_chunk_boundary() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    for i in 0..5001u64 {
+        s.add_metering(&MeteringDelta {
+            key_id: "vk_chunk_m".to_string(),
+            bucket: 1,
+            model: format!("m{i}"),
+            provider: "p".to_string(),
+            tokens_input: 1,
+            tokens_output: 1,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: String::new(),
+            pricing_version: String::new(),
+        })
+        .unwrap();
+    }
+    let purged = s.purge_metering_before("1").unwrap();
+    assert_eq!(
+        purged, 5001,
+        "every stale metering row must be purged across chunk boundaries, not just the first 5000"
+    );
+    assert!(s.list_metering(1).unwrap().is_empty());
+}
+
+#[test]
+fn now_secs_reflects_the_actual_current_time_not_a_constant() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let got = now_secs();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (before..=after).contains(&got),
+        "now_secs() must return the real current unix time ({got}), not a fixed constant \
+         (bracketed by [{before}, {after}])"
+    );
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
 fn tempdir() -> std::path::PathBuf {

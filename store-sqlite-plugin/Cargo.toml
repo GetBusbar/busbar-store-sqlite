@@ -31,3 +31,8 @@ busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
 # behaviorally. `SqliteStore` doesn't expose its inner connection, so the test needs its own. Same
 # version/feature as `busbar-store-sqlite`'s dependency so only one sqlite is ever linked in.
 rusqlite = { version = "0.40.0", features = ["bundled"] }
+# Dev-only: the admin-API install e2e test drives a REAL running busbar process's admin HTTP API
+# (POST /api/v1/admin/plugins, POST /api/v1/admin/keys) — the actual operator install path, not a
+# file-drop proxy for it. Same feature set busbar's own admin test suite uses.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+base64 = "0.22"

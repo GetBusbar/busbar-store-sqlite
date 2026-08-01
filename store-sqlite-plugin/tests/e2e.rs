@@ -31,6 +31,18 @@
 //! question from "does a real end-user install work," and converting it to a full
 //! process-boot-and-capture-stderr harness is a much larger, lower-value lift than the persistence
 //! test's conversion.
+//!
+//! `install_sqlite_plugin_via_admin_api_and_verify_persistence` goes one step further than the
+//! file-drop test above: file-drop proves the plugin loads through the DOCUMENTED discovery
+//! mechanism, but an operator installing a NEW plugin onto a LIVE gateway does it over the real
+//! Admin API (`POST /api/v1/admin/plugins`), never by hand-copying a file onto the host. That test
+//! boots a real busbar process with its admin listener up, installs the plugin over that live HTTP
+//! API, restarts onto `store: sqlite` (the store backend is documented restart-to-apply — see
+//! `admin/v1/json/handlers.rs::restart`'s doc comment — so a fresh boot picking up the
+//! admin-API-installed tarball is the real mechanism, not an invented shortcut), mints a virtual
+//! key + an attached AWS SigV4 credential through THAT live instance's own `POST
+//! /api/v1/admin/keys`, and independently verifies both landed in the real on-disk file with a
+//! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
 use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger};
 use busbar_store_sqlite::SqliteStore;
@@ -304,6 +316,316 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         .tokens_for("gpt-5")
         .expect("model row survives reopen");
     assert_eq!((t.input, t.output), (20, 8));
+}
+
+/// Bind an ephemeral loopback port and immediately drop the listener, handing the bare port number
+/// back for a spawned child process's config. Small bind-then-drop TOCTOU race, same pattern this
+/// monorepo's own plugin e2e suites already use for picking a free port ahead of a subprocess spawn
+/// (e.g. `auth-oidc-plugin/tests/e2e.rs`'s `spawn_https_fixture`), acceptable for a test harness.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
+
+/// Pack the built sqlite plugin cdylib into a real signed-shape tarball (same `busbar-plugin-pack`
+/// tool CI's SIGNOFF step uses, `--allow-unsigned` locally exactly like CI's own unsigned-key
+/// fallback), returning the raw tarball bytes.
+fn pack_sqlite_tarball(
+    pack_bin: &std::path::Path,
+    so_path: &std::path::Path,
+    out: &std::path::Path,
+) -> Vec<u8> {
+    let status = Command::new(pack_bin)
+        .args([
+            "pack",
+            "--lib",
+            so_path.to_str().unwrap(),
+            "--name",
+            "busbar-store-sqlite-plugin",
+            "--alias",
+            "sqlite",
+            "--kind",
+            "store",
+            "--version",
+            "0.0.0-e2e-admin-api",
+            "--publisher",
+            "busbar",
+            "--description",
+            "e2e admin-API install proof",
+            "--license",
+            "Apache-2.0",
+            "--out",
+            out.to_str().unwrap(),
+            "--allow-unsigned",
+        ])
+        .status()
+        .expect("run busbar-plugin-pack");
+    assert!(status.success(), "packing the plugin must succeed");
+    std::fs::read(out).expect("read packed tarball")
+}
+
+/// Poll `GET /api/v1/admin/info` (with the admin token) until it answers 200, or the deadline
+/// passes / the child exits first. Real over-the-wire readiness, not a fixed sleep.
+fn wait_for_admin_ready(
+    client: &reqwest::blocking::Client,
+    admin_addr: &str,
+    token: &str,
+    child: &mut std::process::Child,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Ok(resp) = client
+            .get(format!("http://{admin_addr}/api/v1/admin/info"))
+            .header("x-admin-token", token)
+            .send()
+        {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("busbar exited before the admin API became ready (status: {status})");
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// THE REAL "PROD READY" PROOF (Matthew's bar): the sqlite plugin installed the way a real operator
+/// actually installs it — a `POST /api/v1/admin/plugins` call against a REAL running busbar admin
+/// listener, never file-drop, never a direct `load_store()`/loader call — then EXERCISED through
+/// that same live instance's own admin API (mint a virtual key + an attached AWS SigV4 credential
+/// via `POST /api/v1/admin/keys`), with the write independently verified by opening the real sqlite
+/// file on disk with a SECOND, completely independent connection that never touches the
+/// plugin/ABI/admin-API/loader at all.
+///
+/// Two-boot shape, because `store:` is documented as restart-to-apply (busbar never hot-swaps the
+/// durable governance store on a config reload — see `admin/v1/json/handlers.rs::restart`'s own doc
+/// comment): boot 1 runs with an in-memory store just to reach a live admin listener to install
+/// against; boot 2 (a fresh process over the SAME plugins dir, so it dlopens the EXACT tarball boot
+/// 1's admin API wrote to disk, not a copy this test placed by hand) runs with `store: { module:
+/// sqlite }` and is the one whose admin API mints the key/credential that lands in the real file.
+#[test]
+fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
+    let Some(so_path) = plugin_path() else {
+        eprintln!("skip: store-sqlite-plugin cdylib not built");
+        return;
+    };
+    let (busbar_bin, pack_bin) = build_real_binaries();
+
+    let work = ScratchDir::create("admin-api-install");
+    let plugins_dir = work.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    let db_path = work.join("governance.db");
+    const ADMIN_TOKEN: &str = "e2e-admin-api-token";
+
+    let providers = work.join("providers.yaml");
+    std::fs::write(
+        &providers,
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+    )
+    .unwrap();
+
+    // Shared config skeleton for both boots: only `store:` differs between the two.
+    let write_config = |path: &std::path::Path,
+                        data_port: u16,
+                        admin_port: u16,
+                        store_yaml: &str| {
+        std::fs::write(
+            path,
+            format!(
+                "listen: \"127.0.0.1:{data_port}\"\n\
+                 admin_listen: \"127.0.0.1:{admin_port}\"\n\
+                 {store_yaml}\n\
+                 plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+                 auth:\n  chain: []\n  admin_auth:\n    - admin-tokens: {{ token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
+                 providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+                 models:\n  test-model:\n    provider: mock\n",
+                plugins_dir.display()
+            ),
+        )
+        .unwrap();
+    };
+
+    let client = reqwest::blocking::Client::new();
+
+    // ── BOOT 1: store: memory, just to reach a live admin listener to install against. ──
+    let config1 = work.join("config1.yaml");
+    write_config(
+        &config1,
+        free_port(),
+        free_port(),
+        "store:\n  module: memory\n",
+    );
+    let admin_addr1 = {
+        // Re-read the port we just picked back out of the file we wrote (avoids a second TOCTOU
+        // window between picking the port and writing it).
+        let text = std::fs::read_to_string(&config1).unwrap();
+        text.lines()
+            .find(|l| l.starts_with("admin_listen:"))
+            .unwrap()
+            .trim_start_matches("admin_listen: \"127.0.0.1:")
+            .trim_end_matches('"')
+            .to_string()
+    };
+    let admin_addr1 = format!("127.0.0.1:{admin_addr1}");
+
+    let mut child1 = Command::new(&busbar_bin)
+        .env("BUSBAR_CONFIG", &config1)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("BUSBAR_STATE_FILE", "")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn boot 1 (memory store, admin listener up)");
+    assert!(
+        wait_for_admin_ready(&client, &admin_addr1, ADMIN_TOKEN, &mut child1),
+        "boot 1's admin API must become ready within 15s"
+    );
+
+    // ── REAL ADMIN-API INSTALL: POST the packed sqlite plugin tarball to /api/v1/admin/plugins. ──
+    let tarball_path = work.join("store-sqlite-admin.tar.gz");
+    let tarball = pack_sqlite_tarball(&pack_bin, &so_path, &tarball_path);
+    let file = "store-sqlite-admin.tar.gz";
+    use base64::Engine as _;
+    let install_resp = client
+        .post(format!("http://{admin_addr1}/api/v1/admin/plugins"))
+        .header("x-admin-token", ADMIN_TOKEN)
+        .json(&serde_json::json!({
+            "file": file,
+            "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball),
+        }))
+        .send()
+        .expect("POST /api/v1/admin/plugins");
+    assert_eq!(
+        install_resp.status().as_u16(),
+        201,
+        "the real admin API must accept the sqlite plugin install"
+    );
+    let installed: serde_json::Value = install_resp.json().unwrap();
+    assert_eq!(installed["file"], file);
+    assert_eq!(installed["name"], "busbar-store-sqlite-plugin");
+    assert!(
+        plugins_dir.join(file).exists(),
+        "the admin API install must have written the tarball to the real plugins dir"
+    );
+
+    // Confirm the catalog reports it too (not just the install response).
+    let catalog: serde_json::Value = client
+        .get(format!(
+            "http://{admin_addr1}/api/v1/admin/plugins?type=store"
+        ))
+        .header("x-admin-token", ADMIN_TOKEN)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let listed = catalog["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["target"] == file)
+        .expect("the just-installed sqlite plugin appears in the store catalog");
+    assert_eq!(listed["valid"], true);
+
+    let _ = child1.kill();
+    let _ = child1.wait();
+
+    // ── BOOT 2: store: sqlite, over the SAME plugins dir the admin API wrote into above. `store:`
+    // is restart-to-apply, so a fresh process picking up the freshly-installed tarball is the real
+    // mechanism an operator uses (edit config, restart) — not a hot in-process swap. ──
+    let config2 = work.join("config2.yaml");
+    write_config(
+        &config2,
+        free_port(),
+        free_port(),
+        &format!(
+            "store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n",
+            db_path.display()
+        ),
+    );
+    let admin_addr2 = {
+        let text = std::fs::read_to_string(&config2).unwrap();
+        text.lines()
+            .find(|l| l.starts_with("admin_listen:"))
+            .unwrap()
+            .trim_start_matches("admin_listen: \"127.0.0.1:")
+            .trim_end_matches('"')
+            .to_string()
+    };
+    let admin_addr2 = format!("127.0.0.1:{admin_addr2}");
+
+    let mut child2 = Command::new(&busbar_bin)
+        .env("BUSBAR_CONFIG", &config2)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("BUSBAR_STATE_FILE", "")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn boot 2 (sqlite store, over the admin-API-installed plugin)");
+    assert!(
+        wait_for_admin_ready(&client, &admin_addr2, ADMIN_TOKEN, &mut child2),
+        "boot 2 (real dlopen of the admin-API-installed sqlite plugin, real Store::open/migrate) \
+         must bring the admin API up within 15s"
+    );
+    assert!(
+        db_path.exists(),
+        "boot 2 dlopening the admin-API-installed plugin must have created the real sqlite file"
+    );
+
+    // ── EXERCISE THROUGH THE LIVE ADMIN API: mint a virtual key + an attached AWS SigV4 credential
+    // — the real `POST /api/v1/admin/keys` an operator uses, not a direct store call. ──
+    let mint_resp = client
+        .post(format!("http://{admin_addr2}/api/v1/admin/keys"))
+        .header("x-admin-token", ADMIN_TOKEN)
+        .json(&serde_json::json!({
+            "name": "e2e-admin-api-key",
+            "issue_aws_credential": true,
+        }))
+        .send()
+        .expect("POST /api/v1/admin/keys");
+    assert_eq!(
+        mint_resp.status().as_u16(),
+        201,
+        "minting a key + AWS credential through the live sqlite-backed instance must succeed"
+    );
+    let minted: serde_json::Value = mint_resp.json().unwrap();
+    let key_id = minted["id"].as_str().expect("minted key id").to_string();
+    let access_key_id = minted["aws_access_key_id"]
+        .as_str()
+        .expect("minted AWS access key id")
+        .to_string();
+    assert!(
+        minted["aws_secret_access_key"].as_str().is_some(),
+        "mint response must carry the AWS secret access key once"
+    );
+
+    let _ = child2.kill();
+    let _ = child2.wait();
+
+    // ── INDEPENDENT VERIFICATION: a second, brand-new `SqliteStore::open` on the real file,
+    // bypassing the plugin/ABI/admin-API/loader entirely, must see the exact key + credential the
+    // live admin API just wrote. ──
+    let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
+        .expect("open the real file directly, bypassing the plugin and the admin API");
+    let key = Store::get_key(&direct, &key_id).unwrap().expect(
+        "the virtual key minted over the admin API must be readable directly from the file",
+    );
+    assert_eq!(key.name, "e2e-admin-api-key");
+
+    let creds = Store::list_credentials(&direct, &key_id).unwrap();
+    let cred = creds.iter().find(|c| c.public_id == access_key_id).expect(
+        "the AWS SigV4 credential minted over the admin API must be readable directly \
+             from the file, keyed by the same access-key-id the admin API returned",
+    );
+    assert_eq!(cred.kind, "sigv4");
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
