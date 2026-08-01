@@ -22,9 +22,10 @@ stated separately: **requires busbar 1.5.0+** (the release that ships the
 signed hybrid plugin ABI this crate loads over). Pin both versions
 explicitly in production; do not assume they move together.
 
-All the actual SQLite logic — schema, key/usage/audit persistence,
-mutex-guarded `rusqlite::Connection` handling — lives in the
-`busbar-store-sqlite` `lib` crate in
+All the actual SQLite logic — schema, key/usage/audit persistence, a
+mutex-guarded writer connection plus a small pool of `query_only` reader
+connections (so a long billing report or retention sweep never blocks the
+hot-path usage flush) — lives in the `busbar-store-sqlite` `lib` crate in
 [busbarAI](https://github.com/GetBusbar/busbar). This crate is
 deliberately tiny: it adapts the engine's JSON `open` config into a
 `SqliteStore` and hands the trait object to
