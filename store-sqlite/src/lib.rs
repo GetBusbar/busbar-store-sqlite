@@ -9,7 +9,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -445,14 +446,27 @@ impl SqliteStore {
 // intent (None vs Some([])) round-trips through NULL vs a JSON array; a malformed value (only
 // reachable via a direct out-of-band DB edit, since `migrate()` unconditionally recreates a pre-v5
 // database) reads as the most restrictive grant, never a silent widen.
-fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
-    pools
-        .as_ref()
-        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
+//
+// The wire/DB storage format is unchanged by busbar-api's ScopeRef generalization (still a plain
+// JSON array of bare pool-name strings, or NULL, in the `allowed_pools` TEXT column) — only the
+// Rust-side type at this crate's boundary changed (`Vec<String>` -> `Vec<ScopeRef>`). The
+// conversion happens here, at construction (`ScopeRef::pool(name)`) and at read (`.value`), mirroring
+// `store-postgres`'s `pools_to_storage`/`pools_from_storage`.
+fn pools_to_storage(pools: &Option<Vec<ScopeRef>>) -> Option<String> {
+    pools.as_ref().map(|p| {
+        let names: Vec<&str> = p.iter().map(|s| s.value.as_str()).collect();
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+    })
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
     let stored = stored?;
-    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
+    Some(
+        serde_json::from_str::<Vec<String>>(stored.trim())
+            .unwrap_or_default()
+            .into_iter()
+            .map(ScopeRef::pool)
+            .collect(),
+    )
 }
 fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
     serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
@@ -466,7 +480,7 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         id: r.get(0)?,
         generation_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)?),
+        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)?),
         enabled: r.get::<_, i64>(4)? != 0,
         created_at: r.get::<_, i64>(5)? as u64,
         group: r.get(6)?,
@@ -555,7 +569,7 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
             key.id,
             key.generation_hash,
             key.name,
-            pools_to_storage(&key.allowed_pools),
+            pools_to_storage(&key.allowed_scopes),
             key.enabled as i64,
             key.created_at as i64,
             key.group,

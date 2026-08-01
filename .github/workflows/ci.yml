@@ -10,9 +10,10 @@ on:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@1.5.0-dev
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
     with:
       plugin_crate: busbar-store-sqlite-plugin
       plugin_kind: store
       plugin_alias: sqlite
       service: none
+      busbar_ref: dev

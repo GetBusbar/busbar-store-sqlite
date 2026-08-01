@@ -10,7 +10,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         id: id.to_string(),
         generation_hash: generation.to_string(),
         name: "test".to_string(),
-        allowed_pools: None,
+        allowed_scopes: None,
         enabled: true,
         created_at: 0,
         group: None,
@@ -126,14 +126,14 @@ fn memory_uri_spellings_other_than_the_bare_literal_are_still_single_connection(
 fn allowed_pools_none_vs_empty_round_trip_distinctly() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut all_pools = sample_key("vk_all", "g");
-    all_pools.allowed_pools = None;
+    all_pools.allowed_scopes = None;
     let mut no_pools = sample_key("vk_none", "g");
-    no_pools.allowed_pools = Some(vec![]);
+    no_pools.allowed_scopes = Some(vec![]);
     s.put_key(&all_pools).unwrap();
     s.put_key(&no_pools).unwrap();
-    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_pools, None);
+    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_scopes, None);
     assert_eq!(
-        s.get_key("vk_none").unwrap().unwrap().allowed_pools,
+        s.get_key("vk_none").unwrap().unwrap().allowed_scopes,
         Some(vec![])
     );
 }

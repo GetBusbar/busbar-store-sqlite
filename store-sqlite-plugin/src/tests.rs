@@ -90,7 +90,7 @@ fn explicit_in_memory_db_path_is_honored() {
         id: "vk_adapter_test".into(),
         generation_hash: "h".into(),
         name: "n".into(),
-        allowed_pools: None,
+        allowed_scopes: None,
         enabled: true,
         created_at: 1,
         group: None,
