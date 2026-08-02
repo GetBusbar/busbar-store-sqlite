@@ -39,9 +39,15 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// retention sweep); `usage_metering` leads with `bucket` for the same write-locality reasoning, and
 /// gains `key_group_at_use`/`pricing_version`/`billable_requests`, and renames
 /// `tokens_cache_creation` -> `tokens_cache_write` to match `TierTokens`'s own naming (a drift fixed
-/// core-side in this same redesign). 1.5.0 is UNRELEASED, so each bump is destructive (drop +
-/// recreate), never a migration: a pre-v5 dev database is recreated empty on open.
-const SCHEMA_VERSION: i64 = 5;
+/// core-side in this same redesign). 1.5.0 is UNRELEASED, so each bump up to and including v5 was
+/// destructive (drop + recreate), never a migration: a pre-v5 dev database was recreated empty on
+/// open.
+///
+/// v6: the FIRST real, additive (non-destructive) migration this store has ever needed — a
+/// one-time backfill of `billable_requests` for any row where a v5-era write left it at 0 despite
+/// a nonzero `requests` (see the `version < 6` block in `migrate`, and
+/// `governance::state::hydrate_budgets` in busbarAI core for the boot-time bug this closes).
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -387,11 +393,25 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
-        if version < SCHEMA_VERSION {
+        // Gated on the actual pre-v5 boundary (`< 5`), NOT on `SCHEMA_VERSION` (which moves every
+        // bump): every bump up to and including v5 was destructive by design (1.5.0 was
+        // unreleased, so a pre-v5 dev database is simply wiped and recreated). v6+ are ADDITIVE,
+        // non-destructive migrations (see the `version < 6` backfill just below) — they must
+        // never fall into this drop-and-recreate path, even though `keys`/`store_meta` are named
+        // in the drop list below (the list has to cover every table this schema has EVER used,
+        // including its OWN current names, since a version<5 db could theoretically already carry
+        // a same-named-but-incompatibly-shaped table from an even older generation — see
+        // `migrate_drops_and_recreates_a_genuinely_older_schema`). Gating on `< SCHEMA_VERSION`
+        // instead of `< 5` here was tried first and is WRONG: it makes a real v5 database's own
+        // (correctly-shaped, live) `keys`/`store_meta` tables register as "has_legacy" on the
+        // v5->v6 crossing and wipes them — confirmed by hand, reverting this gate to
+        // `< SCHEMA_VERSION` reproduces exactly that data loss in
+        // `migrate_v5_to_v6_backfills_billable_requests_without_wiping_data`.
+        if version < 5 {
             let has_legacy: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN \
-                     ('usage_counters','virtual_keys','keys','store_meta'))",
+                     ('usage_counters','virtual_keys','aws_credentials','usage_ledger','keys','store_meta'))",
                     [],
                     |r| r.get(0),
                 )
@@ -424,6 +444,35 @@ impl SqliteStore {
             [],
         )
         .store()?;
+        // v5 -> v6, ONE-TIME durable backfill (never repeated, gated on the version crossing —
+        // see governance::state::hydrate_budgets in busbarAI core for the bug this closes). A
+        // pre-v6 row can have `billable_requests=0` for either of two reasons that look
+        // IDENTICAL in the data: (a) it was written by v5 code that never split billable_requests
+        // out from requests (a real legacy gap — v5 added the column but not every code path
+        // populated it correctly from day one), or (b) every request in that window was
+        // legitimately refunded (refund_bucket decrements billable_requests but never requests,
+        // by design). Those two cases are NOT distinguishable from the stored values alone, which
+        // is exactly why this must NOT be a per-boot heuristic (hydrate_budgets no longer applies
+        // one after this migration ships) — it is safe to run this AS A BLANKET, UNCONDITIONAL
+        // backfill exactly once, right now, only because 1.5.0 has never shipped to a real
+        // customer: there is no genuine "currently, legitimately refunded to zero" row in
+        // existence yet that this could incorrectly re-bill. Re-running this same UPDATE
+        // unconditionally at ANY later point (once real refund data exists) would reintroduce the
+        // exact bug it closes — that is why it is gated on `version < 6`, never repeated.
+        if version < 6 {
+            tx.execute(
+                "UPDATE usage_windows SET billable_requests = requests \
+                 WHERE model = '' AND billable_requests = 0 AND requests > 0",
+                [],
+            )
+            .store()?;
+            tx.execute(
+                "UPDATE usage_metering SET billable_requests = requests \
+                 WHERE billable_requests = 0 AND requests > 0",
+                [],
+            )
+            .store()?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
         tx.commit().store()?;

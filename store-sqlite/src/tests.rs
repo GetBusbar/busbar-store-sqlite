@@ -930,6 +930,82 @@ fn migrate_drops_and_recreates_a_genuinely_older_schema() {
 }
 
 #[test]
+fn migrate_v5_to_v6_backfills_billable_requests_without_wiping_data() {
+    // The v5->v6 crossing is the FIRST non-destructive migration this store has ever needed — a
+    // real regression risk `migrate_rerun_at_current_schema_version_does_not_wipe_data`'s own
+    // comment already flags but doesn't itself cover: the legacy-drop block's table-name list
+    // ('keys','store_meta', etc) includes the CURRENT schema's own names, so a naive
+    // `version < SCHEMA_VERSION` bump (5 < 6) would find a real v5 database's OWN 'keys' table and
+    // wipe it, unless the has_legacy check is scoped to pre-v5-ONLY names. Hand-build a real v5
+    // database (current table shapes, PRAGMA user_version=5) with a live key AND a usage_windows
+    // row shaped exactly like the boot-time bug this migration exists to close (billable_requests
+    // stuck at 0 with a real nonzero requests count), then open it through the real store
+    // (triggering migrate()) and assert BOTH that the key survived AND the row was backfilled.
+    let dir = tempdir();
+    let file = dir.join("v5.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
+             VALUES ('vk_v5', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) \
+             VALUES (100, 'vk_v5', '', 7, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
+        .expect("open() must migrate a real v5 database additively, not fail or wipe it");
+    assert!(
+        s.get_key("vk_v5").unwrap().is_some(),
+        "a real v5 key must survive the v5->v6 migration, not be wiped by the legacy-drop path"
+    );
+    let ledger = s.get_usage("vk_v5", 100).unwrap();
+    assert_eq!(ledger.requests, 7, "requests must be untouched");
+    assert_eq!(
+        ledger.billable_requests, 7,
+        "a v5-era row stuck at billable_requests=0 with real requests must be backfilled exactly \
+         once during the v5->v6 crossing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_v5_to_v6_does_not_touch_an_already_nonzero_billable_requests_row() {
+    // The backfill's WHERE clause (`billable_requests = 0 AND requests > 0`) must not touch a row
+    // that already carries a real, independently-tracked billable_requests value — only the
+    // ambiguous zero-with-nonzero-requests shape is a backfill candidate.
+    let dir = tempdir();
+    let file = dir.join("v5_ok.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) \
+             VALUES (200, 'vk_v5b', '', 10, 3)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    let ledger = s.get_usage("vk_v5b", 200).unwrap();
+    assert_eq!(ledger.requests, 10);
+    assert_eq!(
+        ledger.billable_requests, 3,
+        "a row with a real, already-nonzero billable_requests must be left exactly as-is"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn secret_form_from_str_round_trips_every_named_form() {
     assert_eq!(secret_form_from_str("recoverable"), SecretForm::Recoverable);
     assert_eq!(secret_form_from_str("digest"), SecretForm::Digest);
