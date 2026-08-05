@@ -5,7 +5,7 @@
 # This mirrors busbarAI/.github/workflows/release.yml's `store-plugins` job — same 5-target
 # matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
 # BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
-# attestation — just scoped to this one plugin instead of building sqlite/postgres/redis together
+# attestation — just scoped to this one plugin instead of building sqlite/postgres/valkey together
 # in one monorepo job.
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
