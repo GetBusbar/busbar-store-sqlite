@@ -423,6 +423,12 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     std::fs::create_dir_all(&plugins_dir).unwrap();
     let db_path = work.join("governance.db");
     const ADMIN_TOKEN: &str = "e2e-admin-api-token";
+    // S2 KEY-SIGNING SECRET (64 hex chars = 32 raw ed25519 bytes). Required as of core 1.5.1:
+    // busbar no longer auto-generates a signing key, so `POST /api/v1/admin/keys` refuses with
+    // `409 conflict` / `no_signing_key` when `auth.signing_key` is absent. This fixture used to
+    // omit it and got away with it only because the mint path used to self-provision one.
+    const TEST_SIGNING_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let providers = work.join("providers.yaml");
     std::fs::write(
@@ -444,7 +450,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
                  {store_yaml}\n\
                  plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
                  identity-providers:\n  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
-                 auth:\n  chain: []\n  admin_auth: [admin-tokens]\n\
+                 auth:\n  chain: []\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
                  providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
                  models:\n  test-model:\n    provider: mock\n",
                 plugins_dir.display()
@@ -480,6 +486,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("BUSBAR_CONFIG", &config1)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -566,6 +573,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("BUSBAR_CONFIG", &config2)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -592,12 +600,20 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         }))
         .send()
         .expect("POST /api/v1/admin/keys");
+    // The REFUSAL BODY is part of the assertion, not something to go re-derive from core's source
+    // after the fact. A bare `assert_eq!(status, 201)` reported only `left: 409, right: 201`, which
+    // is indistinguishable between at-least-four different admin 409s (`no_signing_key`,
+    // `at_key_cap`, `governance_off`, `idempotency_in_flight`) — the last CI failure cost a full
+    // core-source spelunk to tell them apart. Read the body BEFORE asserting so the message names
+    // the actual condition.
+    let mint_status = mint_resp.status().as_u16();
+    let mint_body = mint_resp.text().expect("read POST /api/v1/admin/keys body");
     assert_eq!(
-        mint_resp.status().as_u16(),
-        201,
-        "minting a key + AWS credential through the live sqlite-backed instance must succeed"
+        mint_status, 201,
+        "minting a key + AWS credential through the live sqlite-backed instance must succeed; \
+         admin API answered {mint_status}: {mint_body}"
     );
-    let minted: serde_json::Value = mint_resp.json().unwrap();
+    let minted: serde_json::Value = serde_json::from_str(&mint_body).unwrap();
     let key_id = minted["id"].as_str().expect("minted key id").to_string();
     let access_key_id = minted["aws_access_key_id"]
         .as_str()
