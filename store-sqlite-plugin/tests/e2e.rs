@@ -396,7 +396,7 @@ fn wait_for_admin_ready(
     }
 }
 
-/// THE REAL "PROD READY" PROOF (Matthew's bar): the sqlite plugin installed the way a real operator
+/// The full install-path proof: the sqlite plugin installed the way a real operator
 /// actually installs it — a `POST /api/v1/admin/plugins` call against a REAL running busbar admin
 /// listener, never file-drop, never a direct `load_store()`/loader call — then EXERCISED through
 /// that same live instance's own admin API (mint a virtual key + an attached AWS SigV4 credential
