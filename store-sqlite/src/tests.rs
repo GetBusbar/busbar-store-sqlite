@@ -1138,27 +1138,66 @@ mod conformance {
     use super::SqliteStore;
     use busbar_plugin_testkit::store_conformance as conf;
 
+    // Each check opens its OWN in-memory database, so it is already an isolated,
+    // empty namespace and `ns`/`seq` only have to be stable.
     fn fresh() -> SqliteStore {
         SqliteStore::open_in_memory().expect("open an empty in-memory store")
     }
 
     #[test]
     fn put_key_does_not_resurrect_a_tombstone() {
-        conf::assert_put_key_does_not_resurrect_a_tombstone(&fresh());
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&fresh(), "conf");
     }
 
     #[test]
     fn delete_key_unknown_id_is_an_error() {
-        conf::assert_delete_key_unknown_id_is_an_error(&fresh());
+        conf::assert_delete_key_unknown_id_is_an_error(&fresh(), "conf");
     }
 
     #[test]
     fn revoke_credential_unknown_id_is_an_error() {
-        conf::assert_revoke_credential_unknown_id_is_an_error(&fresh());
+        conf::assert_revoke_credential_unknown_id_is_an_error(&fresh(), "conf");
     }
 
     #[test]
     fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
-        conf::assert_append_audit_duplicate_seq(&fresh());
+        conf::assert_append_audit_duplicate_seq(&fresh(), 1);
     }
+}
+
+/// An out-of-range `seq`/`ts` is refused rather than silently mangled.
+///
+/// `as i64` wraps a `u64` past `i64::MAX` negative, and `row_to_audit` clamps the negative back to 0
+/// on read, so the stored record can never equal the one written. Left unguarded, appending the
+/// IDENTICAL record twice at such a seq reports "the audit chain has forked" while naming the same
+/// action on both sides — a false alarm on the most alarming message this store can emit. Comparing
+/// the round-tripped form instead would silence that by letting two distinct seqs collapse onto one
+/// row, trading a false alarm for silent loss.
+#[test]
+fn append_audit_refuses_a_seq_it_cannot_store_faithfully() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut rec = AuditRecord {
+        seq: u64::MAX,
+        ts: 1_700_000_000,
+        action: "hook.register".into(),
+        resource: "hook:x".into(),
+        outcome: "applied".into(),
+        principal: "admin".into(),
+        prev_hash: String::new(),
+        hash: "h".into(),
+    };
+    let err = s
+        .append_audit(&rec)
+        .expect_err("a seq past i64::MAX must be refused, not wrapped");
+    assert!(
+        err.0.contains("storable range"),
+        "the refusal must say why: {}",
+        err.0
+    );
+
+    // The boundary itself is storable, and an identical retry there is still the benign Ok path.
+    rec.seq = i64::MAX as u64;
+    s.append_audit(&rec).expect("i64::MAX is in range");
+    s.append_audit(&rec)
+        .expect("an identical retry at the boundary must not read as a forked chain");
 }

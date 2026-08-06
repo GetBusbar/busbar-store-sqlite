@@ -1153,6 +1153,20 @@ impl Store for SqliteStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `as i64` wraps it negative and
+        // `row_to_audit` clamps the negative back to 0 on read, so the record read back is NOT the
+        // record written. An identical retry then compares unequal and is reported as "the audit
+        // chain has forked" — naming the same action on both sides, which is the worst possible page
+        // to hand an operator. Rejected outright. Comparing the round-tripped form instead would
+        // trade that false alarm for silent loss, which is the wrong half to give up. Same guard as
+        // store-postgres, where `clamp` produces the same hazard by a different route.
+        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
+            return Err(StoreError(format!(
+                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
+                 store a record that would not read back as itself",
+                entry.seq, entry.ts
+            )));
+        }
         // FULL sync: the trait's contract for this method is that a hard crash loses ~0 entries,
         // which `synchronous=NORMAL` does not provide under WAL.
         let mut conn = self.lock_writer();
