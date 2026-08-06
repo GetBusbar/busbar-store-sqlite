@@ -1130,3 +1130,35 @@ fn unique_suffix() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
+
+/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
+/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
+/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+mod conformance {
+    use super::SqliteStore;
+    use busbar_plugin_testkit::store_conformance as conf;
+
+    fn fresh() -> SqliteStore {
+        SqliteStore::open_in_memory().expect("open an empty in-memory store")
+    }
+
+    #[test]
+    fn put_key_does_not_resurrect_a_tombstone() {
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&fresh());
+    }
+
+    #[test]
+    fn delete_key_unknown_id_is_an_error() {
+        conf::assert_delete_key_unknown_id_is_an_error(&fresh());
+    }
+
+    #[test]
+    fn revoke_credential_unknown_id_is_an_error() {
+        conf::assert_revoke_credential_unknown_id_is_an_error(&fresh());
+    }
+
+    #[test]
+    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
+        conf::assert_append_audit_duplicate_seq(&fresh());
+    }
+}

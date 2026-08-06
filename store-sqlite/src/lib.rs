@@ -609,13 +609,25 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
     // would silently freeze `keys.updated_at` at the row's original creation time forever, even
     // though this column has no Rust-side reader (KEY_COLS omits it) and exists purely for direct
     // SQL/operator inspection of "when did this key last change".
-    conn.execute(
+    // The `WHERE` on the conflict branch is the TOMBSTONE PRECONDITION (see `Store::put_key`): a
+    // live-shaped write (`excluded.deleted_at IS NULL`) must not overwrite a tombstoned row, since
+    // that reissues an id the contract says is never reissued and revives every token minted before
+    // the delete. Expressed in the statement rather than as a SELECT-then-INSERT so the test and the
+    // write are one atomic operation — a `delete_key` committing between a separate check and this
+    // INSERT would slip straight through, which is exactly how the caller-side checks in core fail.
+    // A write that CARRIES a tombstone is unaffected and still applies.
+    //
+    // When the guard bites, the conflict branch updates nothing and `execute` reports 0 rows, which
+    // is the only signal available here that it fired — hence the row-count check below rather than
+    // a bare `?`.
+    let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
-            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11",
+            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11
+         WHERE excluded.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
         params![
             key.id,
             key.generation_hash,
@@ -632,6 +644,13 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
         ],
     )
     .store()?;
+    if affected == 0 {
+        return Err(StoreError(format!(
+            "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
+             tombstone",
+            key.id
+        )));
+    }
     Ok(())
 }
 
@@ -814,15 +833,31 @@ impl Store for SqliteStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
             let rev = Self::bump_revision(&tx)?;
-            // Idempotent per the trait contract: revoking an already-revoked (or unknown) credential
-            // is not an error — a 0 row count covers both "already revoked" (no-op, correct) and
-            // "unknown id" (also treated as a no-op, matching add_denylist's idempotency posture).
-            tx.execute(
-                "UPDATE credentials SET revoked_at=?2, revoke_reason=?3, updated_at=?2, revision=?4
-                 WHERE id=?1 AND revoked_at IS NULL",
-                params![id, now_secs(), reason, rev],
-            )
-            .store()?;
+            // A 0 row count is AMBIGUOUS: it means either "already revoked" (idempotent, Ok) or
+            // "no such id" (an error). The trait settles those as different outcomes precisely
+            // because collapsing them lets an operator responding to a leak be told the credential
+            // is dead when it is still live. So a 0 count is disambiguated with an EXISTS in the
+            // SAME transaction — outside it, a concurrent insert could make the answer a lie.
+            let affected = tx
+                .execute(
+                    "UPDATE credentials SET revoked_at=?2, revoke_reason=?3, updated_at=?2, revision=?4
+                     WHERE id=?1 AND revoked_at IS NULL",
+                    params![id, now_secs(), reason, rev],
+                )
+                .store()?;
+            if affected == 0 {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=?1)",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .store()?;
+                if !exists {
+                    return Err(StoreError(format!("revoke_credential: unknown id '{id}'")));
+                }
+                // Else: the row exists and was already revoked. Idempotent, per the contract.
+            }
             tx.commit().store()?;
             Ok(())
         })
@@ -1122,7 +1157,10 @@ impl Store for SqliteStore {
         // which `synchronous=NORMAL` does not provide under WAL.
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
-            conn.execute(
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .store()?;
+            let affected = tx.execute(
                 "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(seq) DO NOTHING",
@@ -1132,6 +1170,31 @@ impl Store for SqliteStore {
                 ],
             )
             .store()?;
+            // DO NOTHING keeps the stored record, which is right for ONE of the two ways a `seq`
+            // collides and wrong for the other. Compare them, in the same transaction that just
+            // lost the race, and let the difference decide (see the trait contract):
+            //   identical  -> the write-through retrying after a timeout. Common, benign, Ok.
+            //   different  -> two records claiming one chain position: a forked or tampered log,
+            //                 and the single most important thing an audit store can report.
+            // Dropping the second case silently is what this used to do.
+            if affected == 0 {
+                let stored = tx
+                    .query_row(
+                        "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+                         FROM audit_log WHERE seq=?1",
+                        params![entry.seq as i64],
+                        row_to_audit,
+                    )
+                    .store()?;
+                if &stored != entry {
+                    return Err(StoreError(format!(
+                        "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
+                         has forked (stored action '{}', incoming '{}')",
+                        entry.seq, stored.action, entry.action
+                    )));
+                }
+            }
+            tx.commit().store()?;
             Ok(())
         })
     }
