@@ -425,8 +425,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     const ADMIN_TOKEN: &str = "e2e-admin-api-token";
     // S2 KEY-SIGNING SECRET (64 hex chars = 32 raw ed25519 bytes). Required as of core 1.5.1:
     // busbar no longer auto-generates a signing key, so `POST /api/v1/admin/keys` refuses with
-    // `409 conflict` / `no_signing_key` when `auth.signing_key` is absent. This fixture used to
-    // omit it and got away with it only because the mint path used to self-provision one.
+    // `409 conflict` / `no_signing_key` when `auth.signing_key` is absent.
     const TEST_SIGNING_KEY: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

@@ -751,7 +751,7 @@ fn foreign_keys_cascade_is_real_not_just_the_app_level_delete() {
     );
 }
 
-// ── Mutation-testing regressions (cargo-mutants round 1, store-sqlite/src/lib.rs) ──────────────
+// ── Targeted guards for individual predicates and bounds in store-sqlite/src/lib.rs ────────────
 
 #[test]
 fn is_memory_path_rejects_a_plain_file_path() {
@@ -891,7 +891,7 @@ fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
     // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
     // schema's own table names (`keys`, `store_meta`) are ALSO named in the legacy-drop list (the
     // list has to cover every prior schema generation), so if that guard ever admits
-    // `version == SCHEMA_VERSION` (an `==`/`<=` mutant of the comparison), a second migrate() call
+    // `version == SCHEMA_VERSION` (a `<=` in place of the `<`), a second migrate() call
     // on an already-current database would find "legacy" tables (its own current ones) and drop
     // every table, silently wiping live data.
     let s = SqliteStore::open_in_memory().unwrap();
