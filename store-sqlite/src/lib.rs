@@ -986,6 +986,23 @@ impl Store for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
+            // Count the WINDOWS this batch removes, not the rows. A window is stored as one
+            // reserved `model = ''` sentinel row plus one row per model, so a row count is the
+            // window count multiplied by that window's model cardinality. The contract is "returns
+            // the number of windows purged", and a figure that moves with model cardinality cannot
+            // be reconciled against the retention the caller asked for. Counted before the DELETE,
+            // inside the same transaction, so it matches exactly what this batch removes.
+            let windows_in_batch: u64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM (
+                        SELECT DISTINCT window_start, bucket_id FROM usage_windows
+                        WHERE (window_start, bucket_id, model) IN (
+                            SELECT window_start, bucket_id, model FROM usage_windows
+                            WHERE window_start < ?1 LIMIT 5000))",
+                    params![before as i64],
+                    |r| r.get::<_, i64>(0),
+                )
+                .store()? as u64;
             let changed = tx
                 .execute(
                     "DELETE FROM usage_windows WHERE (window_start, bucket_id, model) IN (
@@ -995,7 +1012,7 @@ impl Store for SqliteStore {
                 )
                 .store()?;
             tx.commit().store()?;
-            total += changed as u64;
+            total += windows_in_batch;
             if changed < 5000 {
                 break;
             }
@@ -1101,8 +1118,11 @@ impl Store for SqliteStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
-        self.lock_writer()
-            .execute(
+        // FULL sync: the trait's contract for this method is that a hard crash loses ~0 entries,
+        // which `synchronous=NORMAL` does not provide under WAL.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            conn.execute(
                 "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(seq) DO NOTHING",
@@ -1112,7 +1132,8 @@ impl Store for SqliteStore {
                 ],
             )
             .store()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
@@ -1139,14 +1160,23 @@ impl Store for SqliteStore {
     }
 
     fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
-        self.lock_writer()
-            .execute(
+        // FULL sync, like every other revocation path. This is a token revocation: the operator is
+        // told the subject is denied, and under WAL with `synchronous=NORMAL` that committed
+        // transaction can be lost to a power cut seconds later, so the token is valid again on
+        // reboot with no error ever having been reported. `delete_key`, `revoke_credential`,
+        // `put_credential`, `put_key_with_credential` and the metering flush all escalate; this one
+        // and `append_audit` did not, against this file's own stated policy of covering
+        // "mint/revoke/rotate/delete".
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            conn.execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES (?1, ?2, ?3)
                  ON CONFLICT(sub) DO UPDATE SET reason = excluded.reason",
                 params![sub, reason, now_secs()],
             )
             .store()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
@@ -1169,7 +1199,7 @@ fn put_credential_inner(
     let changed = tx
         .execute(
             "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,NULL,NULL,?10)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)
              ON CONFLICT(key_id,kind,slot) DO UPDATE SET
                 id=excluded.id, public_id=excluded.public_id, secret=excluded.secret, secret_form=excluded.secret_form,
                 created_at=excluded.created_at, updated_at=excluded.updated_at, expires_at=excluded.expires_at,
@@ -1178,6 +1208,11 @@ fn put_credential_inner(
             params![
                 m.id, m.key_id, m.kind, m.slot as i64, m.public_id, secret.secret,
                 secret_form_to_str(m.secret_form), m.created_at as i64, m.expires_at.map(|v| v as i64), revision,
+                // `updated_at` is its OWN parameter, not a second use of `created_at`'s. Bound to
+                // ?8 for both, the caller's `CredentialMeta::updated_at` was silently discarded and
+                // every credential reported that it was last changed when it was minted. The keys
+                // table was fixed for exactly this and the credentials table was not.
+                m.updated_at as i64,
             ],
         )
         .store()?;

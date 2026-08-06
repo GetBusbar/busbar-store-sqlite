@@ -41,6 +41,33 @@ fn sample_credential(key_id: &str, public_id: &str, slot: u8) -> CredentialSecre
     }
 }
 
+/// `CredentialMeta::updated_at` must round-trip as its own value. Bound to `created_at`'s
+/// placeholder, the caller's value was silently discarded and every credential reported that it was
+/// last changed when it was minted. The keys table carries a dedicated regression test for exactly
+/// this shape; the credentials table had none, and the fixture's `created_at == updated_at == 0`
+/// meant no existing assertion could tell the two apart.
+#[test]
+fn credential_updated_at_round_trips_as_its_own_value() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_credtime", "g")).unwrap();
+    let mut cred = sample_credential("vk_credtime", "AKIA_CREDTIME", 0);
+    cred.meta.created_at = 100;
+    cred.meta.updated_at = 200;
+    s.put_credential(&cred).unwrap();
+
+    let back = s
+        .list_credentials("vk_credtime")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.public_id == "AKIA_CREDTIME")
+        .expect("the minted credential must be listed");
+    assert_eq!(back.created_at, 100, "created_at must round-trip untouched");
+    assert_eq!(
+        back.updated_at, 200,
+        "updated_at must round-trip as its own distinct value, not be overwritten by created_at's"
+    );
+}
+
 fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
     UsageDelta {
         requests,
@@ -541,7 +568,14 @@ fn purge_windows_before_removes_exactly_the_stale_rows() {
     let purged = s.purge_windows_before(200).unwrap();
     // Each add_usage call with one model writes TWO physical rows (the model='' requests/
     // billable_requests sentinel + the one model's token row), so 10 stale windows = 20 rows.
-    assert_eq!(purged, 20, "only the 10 windows with window_start < 200 (20 rows: sentinel + model each) should be purged");
+    // WINDOWS, not rows. This asserted 20 (the row count: one sentinel plus one model row per
+    // window), which encoded the wrong contract as correct. `purge_windows_before` returns "the
+    // number of windows purged", and a figure that scales with each window's model cardinality
+    // cannot be reconciled against the retention the caller asked for.
+    assert_eq!(
+        purged, 10,
+        "the 10 windows with window_start < 200 should be reported as 10 windows purged"
+    );
     // The remaining 5 must still be readable.
     for i in 0..5u64 {
         let ledger = s.get_usage("vk_p", 500 + i).unwrap();
@@ -1025,8 +1059,9 @@ fn purge_windows_before_purges_past_a_single_chunk_boundary() {
     }
     let purged = s.purge_windows_before(10_000).unwrap();
     assert_eq!(
-        purged, 5002,
-        "every stale row must be purged across chunk boundaries, not just the first 5000"
+        purged, 2501,
+        "every stale window must be purged across chunk boundaries, not just the first chunk, and \
+         the figure returned is windows rather than the 5002 underlying rows"
     );
     assert!(s.get_usage("vk_chunk", 0).unwrap().requests == 0);
 }
