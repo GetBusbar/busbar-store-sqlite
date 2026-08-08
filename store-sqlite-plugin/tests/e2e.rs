@@ -100,6 +100,37 @@ fn plugin_path() -> Option<PathBuf> {
     candidate
 }
 
+/// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
+///
+/// busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and exit 1 when
+/// one cannot resolve, rather than only checking the reference's SHAPE. A fixture config that names
+/// a real-looking env var (here, `MOCK_KEY`) then fails `--validate` on any machine that doesn't
+/// happen to have that var set -- which is every CI runner and most dev machines. Hardcoding
+/// `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future one, names
+/// a different variable. Extracting the names generically (same approach `GetBusbar/store-mysql`'s
+/// own `store-mysql-plugin/tests/e2e.rs` already took for this exact change, and the core repo's
+/// `crates/busbar/tests/docs_examples.rs`) keeps the harness working no matter what the fixture
+/// references.
+fn referenced_env_vars(text: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("env:") {
+        let rest = &text[i + 4..];
+        let name: String = rest
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !v.contains(&name) {
+            v.push(name);
+        }
+    }
+    v
+}
+
+/// A placeholder value for a fixture-referenced secret: 64 hex chars, which is valid for
+/// `auth.signing_key` and harmless as any other secret's value.
+const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
 /// The sibling busbarAI checkout's root (same convention this repo already uses for its path deps
 /// in Cargo.toml).
 fn busbarai_root() -> PathBuf {
@@ -200,20 +231,17 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
     )
     .unwrap();
-    std::fs::write(
-        &config,
-        format!(
-            "listen: \"127.0.0.1:0\"\n\
-             store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n\
-             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
-             auth:\n  chain: []\n\
-             providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
-             models:\n  test-model:\n    provider: mock\n",
-            db_path.display(),
-            plugins_dir.display()
-        ),
-    )
-    .unwrap();
+    let config_text = format!(
+        "listen: \"127.0.0.1:0\"\n\
+         store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n\
+         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         auth:\n  chain: []\n\
+         providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+         models:\n  test-model:\n    provider: mock\n",
+        db_path.display(),
+        plugins_dir.display()
+    );
+    std::fs::write(&config, &config_text).unwrap();
 
     // `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by
     // design ("no server, no network, no state, no dlopen" -- crates/busbar/src/main.rs's own
@@ -224,12 +252,19 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     // plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag) is the only
     // thing that actually `dlopen`s the plugin and runs `Store::open`/migration, so that's what
     // proves the persistence claim.
-    let out = Command::new(&busbar_bin)
+    //
+    // `--validate` RESOLVES built-in `env:` secret references (busbar 1.5.3); give every one this
+    // fixture names a placeholder so the gate tests the config's SHAPE, not this machine's
+    // environment. See `referenced_env_vars`'s doc comment for why this is generic, not hardcoded.
+    let mut validate_cmd = Command::new(&busbar_bin);
+    validate_cmd
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .output()
-        .expect("run busbar --validate");
+        .env("BUSBAR_PROVIDERS", &providers);
+    for name in referenced_env_vars(&config_text) {
+        validate_cmd.env(name, SECRET_PLACEHOLDER);
+    }
+    let out = validate_cmd.output().expect("run busbar --validate");
     assert!(
         out.status.success(),
         "busbar --validate must succeed with the file-dropped sqlite plugin: stdout={} stderr={}",
