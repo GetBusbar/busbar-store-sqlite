@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{AuditRecord, ModelTokensDelta, Store, TierTokensDelta, VirtualKey};
+use busbar_api::{
+    AuditRecord, McpCallRecord, ModelTokensDelta, Store, TierTokensDelta, VirtualKey,
+};
 use rusqlite::TransactionBehavior;
 
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
@@ -1200,4 +1202,258 @@ fn append_audit_refuses_a_seq_it_cannot_store_faithfully() {
     s.append_audit(&rec).expect("i64::MAX is in range");
     s.append_audit(&rec)
         .expect("an identical retry at the boundary must not read as a forked chain");
+}
+// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+//
+// The property under test is not "the write returned Ok" — the trait's default `append_mcp_call`
+// returns `Ok(())` and keeps nothing, so a write's return value is worthless as evidence of
+// durability. The only honest way to know a deployment has durable call evidence is to READ IT
+// BACK, and the only honest way to know it survives a deploy is to read it back THROUGH A RESTART.
+
+fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> McpCallRecord {
+    McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// THE TEST THAT MATTERS. A unit test against a live handle proves nothing here: it cannot
+/// distinguish a backend that wrote to disk from one that kept the rows in a HashMap behind the
+/// same trait. So this drops the store entirely — closing every SQLite connection and its WAL —
+/// reopens the same FILE, and verifies the per-principal hash chain still links from the bytes that
+/// came back off disk.
+#[test]
+fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
+    let dir = tempdir();
+    let file = dir.join("calls.db");
+    let path = file.to_str().unwrap().to_string();
+
+    // Write a 3-long chain, then let every connection close.
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.append_mcp_call(&sample_call("vk_a", 1, 100, "", "h1"))
+            .unwrap();
+        s.append_mcp_call(&sample_call("vk_a", 2, 200, "h1", "h2"))
+            .unwrap();
+        s.append_mcp_call(&sample_call("vk_a", 3, 300, "h2", "h3"))
+            .unwrap();
+        drop(s);
+    }
+
+    // A genuinely new store over the same file — nothing carried over in memory.
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let got = reopened.list_mcp_calls("vk_a").unwrap();
+
+    assert_eq!(
+        got.len(),
+        3,
+        "the call log must survive a restart; got {} records back after reopening the file, which \
+         is the accept-and-keep-nothing behaviour this backend exists to replace",
+        got.len()
+    );
+
+    // The chain must LINK, read back off disk — not merely be non-empty.
+    assert_eq!(
+        got[0].prev_hash, "",
+        "seq 1 opens the chain with an empty prev_hash"
+    );
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-principal chain must still link after a restart: seq {} carries prev_hash {:?} \
+             but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Ordering is by seq, and the non-indexed payload must round-trip verbatim too.
+    assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(got[2].tool_digest, "sha256:tool3");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].tool, "srv_read_file");
+    assert_eq!(got[1].pin_generation, 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
+/// seen, so the store must be able to name every principal holding records — across a restart.
+#[test]
+fn mcp_call_principals_are_enumerable_after_a_restart() {
+    let dir = tempdir();
+    let file = dir.join("principals.db");
+    let path = file.to_str().unwrap().to_string();
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.append_mcp_call(&sample_call("vk_a", 1, 100, "", "a1"))
+            .unwrap();
+        s.append_mcp_call(&sample_call("vk_b", 1, 100, "", "b1"))
+            .unwrap();
+        s.append_mcp_call(&sample_call("vk_a", 2, 101, "a1", "a2"))
+            .unwrap();
+        drop(s);
+    }
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let mut principals = reopened.list_mcp_call_principals().unwrap();
+    principals.sort();
+    assert_eq!(
+        principals,
+        vec!["vk_a".to_string(), "vk_b".to_string()],
+        "every principal holding records must be enumerable after a restart, exactly once each"
+    );
+    // A scoped read returns only its own principal's chain — the chain scope is the principal.
+    assert_eq!(reopened.list_mcp_calls("vk_a").unwrap().len(), 2);
+    assert_eq!(reopened.list_mcp_calls("vk_b").unwrap().len(), 1);
+    assert!(
+        reopened
+            .list_mcp_calls("vk_nonexistent")
+            .unwrap()
+            .is_empty(),
+        "a principal with no records reads back empty, not an error"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
+/// not perform is worse than one that reports nothing purged.
+#[test]
+fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.append_mcp_call(&sample_call("vk_a", 1, 100, "", "h1"))
+        .unwrap();
+    s.append_mcp_call(&sample_call("vk_a", 2, 200, "h1", "h2"))
+        .unwrap();
+    s.append_mcp_call(&sample_call("vk_a", 3, 300, "h2", "h3"))
+        .unwrap();
+    s.append_mcp_call(&sample_call("vk_b", 1, 150, "", "b1"))
+        .unwrap();
+
+    // Strictly older than `before`, across every principal. ts=300 and ts=200 stay.
+    let purged = s.purge_mcp_calls_before(200).unwrap();
+    assert_eq!(
+        purged, 2,
+        "purge must return the number of rows it actually removed (ts=100 and ts=150), not a guess"
+    );
+    assert_eq!(
+        s.list_mcp_calls("vk_a")
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+        "the rows at or after the cutoff must remain"
+    );
+    assert!(
+        s.list_mcp_calls("vk_b").unwrap().is_empty(),
+        "a principal whose every row aged out reads back empty"
+    );
+    // `before` is STRICTLY less-than: a row exactly at the cutoff is kept.
+    assert_eq!(
+        s.purge_mcp_calls_before(200).unwrap(),
+        0,
+        "re-running the same purge removes nothing; ts=200 sits exactly at the cutoff and is kept"
+    );
+    // And the count is real: purging past everything clears the rest.
+    assert_eq!(s.purge_mcp_calls_before(1_000).unwrap(), 2);
+    assert!(s.list_mcp_calls("vk_a").unwrap().is_empty());
+}
+
+/// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
+/// settles it: BYTE-IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and
+/// is an error. Overwriting would destroy the second case instead of reporting it.
+#[test]
+fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let rec = sample_call("vk_a", 1, 100, "", "h1");
+    s.append_mcp_call(&rec).unwrap();
+
+    s.append_mcp_call(&rec)
+        .expect("an identical replay is the at-least-once retry and must succeed");
+    assert_eq!(
+        s.list_mcp_calls("vk_a").unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    // Same (principal, seq), different digest — the fork case.
+    let forked = sample_call("vk_a", 1, 100, "", "DIFFERENT");
+    let err = s
+        .append_mcp_call(&forked)
+        .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
+    assert!(
+        !format!("{err}").contains("DIFFERENT"),
+        "the error must not echo stored content back"
+    );
+    assert_eq!(
+        s.list_mcp_calls("vk_a").unwrap()[0].hash,
+        "h1",
+        "the refused fork must not have overwritten the record already on record"
+    );
+
+    // A differing non-indexed payload field is a fork too, not a silent accept.
+    let mut tampered = sample_call("vk_a", 1, 100, "", "h1");
+    tampered.tool = "srv_other_tool".to_string();
+    s.append_mcp_call(&tampered)
+        .expect_err("a payload that differs under an identical digest is a fork and must error");
+}
+
+/// The v6 -> v7 crossing is additive: a real v6 database gains `mcp_calls` and keeps every row it
+/// already had. Regression cover for the legacy-drop path reaching a live database.
+#[test]
+fn migrate_v6_to_v7_adds_the_call_log_without_wiping_data() {
+    let dir = tempdir();
+    let file = dir.join("v6.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("DROP TABLE mcp_calls", []).unwrap();
+        conn.execute(
+            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
+             VALUES ('vk_v6', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
+        .expect("a v6 database must migrate additively to v7");
+    assert!(
+        s.get_key("vk_v6").unwrap().is_some(),
+        "a real v6 key must survive the v6->v7 crossing"
+    );
+    s.append_mcp_call(&sample_call("vk_v6", 1, 10, "", "h1"))
+        .expect("the newly created mcp_calls table must be writable after the migration");
+    assert_eq!(s.list_mcp_calls("vk_v6").unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A persisted record is never REWRITTEN. Enforced by a trigger so it survives an operator opening
+/// the file with the sqlite3 CLI, not merely by the write path being careful.
+#[test]
+fn mcp_calls_rejects_a_direct_update_but_allows_the_retention_delete() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.append_mcp_call(&sample_call("vk_a", 1, 100, "", "h1"))
+        .unwrap();
+    let err = s
+        .lock_writer()
+        .execute(
+            "UPDATE mcp_calls SET hash = 'forged' WHERE principal = 'vk_a'",
+            [],
+        )
+        .expect_err("a direct UPDATE must be refused by the append-only trigger");
+    assert!(format!("{err}").contains("append-only"));
+    // DELETE is deliberately NOT guarded — retention has to be able to do its job.
+    s.lock_writer()
+        .execute("DELETE FROM mcp_calls WHERE principal = 'vk_a'", [])
+        .expect("retention must remain possible; only rewriting is forbidden");
 }
