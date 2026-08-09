@@ -9,8 +9,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta,
-    UsageLedger, VirtualKey,
+    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow, TaskRow,
+    TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,7 +53,17 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// every open) is the entire migration. Nothing is dropped and no existing row is touched: a v6
 /// database crossing to v7 gains an empty table and keeps everything else, which is why there is no
 /// `version < 7` arm in `migrate` to match the `version < 6` one.
-const SCHEMA_VERSION: i64 = 7;
+///
+/// v8: the durable A2A TASK STORE (`tasks`, `task_events`). Additive on the same terms as v7 — two
+/// new tables, no backfill, nothing dropped — so again no `version < 8` arm exists.
+const SCHEMA_VERSION: i64 = 8;
+
+/// The task states that are TERMINAL, and therefore the only ones retention may drop. Named as a
+/// closed set rather than derived by negation on purpose: an unrecognised state token — one a newer
+/// engine emits and this build has never heard of — must read as NOT terminal, so a store compiled
+/// before a state existed cannot delete a task it does not understand. The wrong half to guess on is
+/// the deleting half.
+const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -220,6 +230,65 @@ CREATE TABLE IF NOT EXISTS mcp_calls (
 -- The retention sweep's access path: purge_mcp_calls_before deletes by `ts` across every principal.
 CREATE INDEX IF NOT EXISTS mcp_calls_ts_idx ON mcp_calls (ts);
 
+-- THE DURABLE A2A TASK STORE. An A2A task spans turns, can sit interrupted waiting on a human, and
+-- can outlive the process that started it, so an in-memory task table loses every in-flight task on
+-- restart -- the difference between a resume that is real and one that is nominal.
+--
+-- SHAPE: every field is a REAL COLUMN, unlike mcp_calls's opaque `body`, and the difference is not
+-- inconsistency. A call record carries open-ended narration that no query ever filters on, so it
+-- pays for a blob and saves the columns. A task row is a small fixed state record where every field
+-- is part of what a resume reads back, `state` and `updated_at` are the retention sweep's own
+-- predicates, and there is no field left over to make opaque. A blob here would buy a deserialise
+-- per read and nothing else.
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id         TEXT NOT NULL PRIMARY KEY,
+    context_id      TEXT NOT NULL,
+    principal       TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    artifact_cursor INTEGER NOT NULL,
+    push_callback   TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+) STRICT;
+-- The retention sweep's access path (purge_tasks_before filters on state + updated_at), and the
+-- boot rehydrate's (which reads every row and partitions on state).
+CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks (state, updated_at);
+
+-- PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
+-- tasks are concurrent and long-lived: a global chain would serialise every task transition behind
+-- one append and would make one task's provenance unverifiable without possessing every other
+-- tenant's events.
+--
+-- The chain columns -- seq, prev_hash, hash -- are REAL columns for the same reason they are in
+-- mcp_calls: the engine establishes durability by reading the chain back and verifying it, and a
+-- digest reachable only by decoding a blob can be neither constrained nor indexed. This store NEVER
+-- computes or recomputes a digest; it persists what it was handed and returns it verbatim.
+--
+-- The cascade on task deletion is load-bearing: `purge_tasks_before` is the ONLY retention method
+-- the contract gives this data, so a purge that left the events behind would leave `task_events`
+-- with no bound anywhere in the trait. It is a TRIGGER rather than a foreign key, deliberately. A
+-- real FK would also impose an ORDER on the writes -- no event could be appended before its task row
+-- existed -- and the engine is under no such obligation: a `task.submitted` event and the first
+-- `put_task` are two independent write-throughs. A trigger gives the cascade without inventing an
+-- ordering constraint the contract never stated, and unlike `foreign_keys` it is not a per-connection
+-- pragma that defaults OFF in the sqlite3 CLI.
+CREATE TABLE IF NOT EXISTS task_events (
+    task_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    ts         INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    principal  TEXT NOT NULL,
+    agent_id   TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    prev_hash  TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    PRIMARY KEY (task_id, seq)
+) STRICT;
+
 -- Pragma-independent integrity triggers: survive an operator opening the file with the sqlite3 CLI
 -- (where foreign_keys defaults OFF) or a build with SQLITE_OMIT_FOREIGN_KEY.
 CREATE TRIGGER IF NOT EXISTS keys_guard_hard_delete BEFORE DELETE ON keys FOR EACH ROW
@@ -238,6 +307,11 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 -- different properties, and only the second one is an integrity claim.
 CREATE TRIGGER IF NOT EXISTS mcp_calls_no_update BEFORE UPDATE ON mcp_calls
   BEGIN SELECT RAISE(ABORT, 'mcp_calls is append-only; a persisted call record is never rewritten'); END;
+-- task_events follows its task out of the database. There is deliberately no no-update trigger to
+-- match mcp_calls's: the task-event contract says a store MUST UPSERT on (task_id, seq) -- a
+-- write-through is idempotent on replay -- so forbidding the rewrite here would forbid the contract.
+CREATE TRIGGER IF NOT EXISTS tasks_cascade_events AFTER DELETE ON tasks FOR EACH ROW
+  BEGIN DELETE FROM task_events WHERE task_id = OLD.task_id; END;
 ";
 
 /// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
@@ -1396,6 +1470,207 @@ impl Store for SqliteStore {
             .store()?;
         Ok(removed as u64)
     }
+
+    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
+        // Refused rather than mangled, for the reason `append_audit` refuses its own out-of-range
+        // seq: `as i64` wraps a `u64` past `i64::MAX` negative and the read clamps it back, so the
+        // row read back would not be the row written — and here the value that silently changes is
+        // the ARTIFACT CURSOR, i.e. how much of a stream has been relayed. A wrapped cursor either
+        // replays delivered artifacts or skips undelivered ones, and does it without an error ever
+        // having been reported.
+        let cursor = as_storable_i64("put_task", "artifact_cursor", task.artifact_cursor)?;
+        let created = as_storable_i64("put_task", "created_at", task.created_at)?;
+        let updated = as_storable_i64("put_task", "updated_at", task.updated_at)?;
+        // FULL sync. The trait's own framing is that this is the difference between a resume that
+        // is real and one that is nominal, and a task state transition acknowledged to a caller and
+        // then lost to a power cut a second later is exactly the failure the durability exists to
+        // stop — the same reasoning that escalates `append_audit` and the revocation paths.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second
+            // write for one task must replace the row, never append a second one for the same id.
+            conn.execute(
+                "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id, \
+                 artifact_cursor, push_callback, created_at, updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(task_id) DO UPDATE SET \
+                    context_id=excluded.context_id, principal=excluded.principal, \
+                    direction=excluded.direction, state=excluded.state, agent_id=excluded.agent_id, \
+                    artifact_cursor=excluded.artifact_cursor, \
+                    push_callback=excluded.push_callback, created_at=excluded.created_at, \
+                    updated_at=excluded.updated_at",
+                params![
+                    task.task_id,
+                    task.context_id,
+                    task.principal,
+                    task.direction,
+                    task.state,
+                    task.agent_id,
+                    cursor,
+                    task.push_callback,
+                    created,
+                    updated,
+                ],
+            )
+            .store()?;
+            Ok(())
+        })
+    }
+
+    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
+        // No principal filter, deliberately: the contract puts the caller-scoping check engine-side,
+        // because an authorization check living in the backend is one an unauthorized reader
+        // bypasses by configuring a different backend.
+        let conn = self.lock_reader();
+        conn.query_row(
+            "SELECT task_id, context_id, principal, direction, state, agent_id, artifact_cursor, \
+             push_callback, created_at, updated_at FROM tasks WHERE task_id = ?1",
+            [task_id],
+            row_to_task,
+        )
+        .optional()
+        .store()
+    }
+
+    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
+        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
+        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
+        // store that pre-filtered for any one of those would break the other two.
+        let conn = self.lock_reader();
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, context_id, principal, direction, state, agent_id, \
+                 artifact_cursor, push_callback, created_at, updated_at FROM tasks ORDER BY task_id",
+            )
+            .store()?;
+        let rows = stmt.query_map([], row_to_task).store()?;
+        rows.collect::<Result<Vec<_>, _>>().store()
+    }
+
+    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
+        // TERMINAL ONLY, and strictly older than the cutoff. An interrupted task waiting on a human
+        // is exactly the row that legitimately sits still for a long time; compacting it is losing
+        // the work, not reclaiming space. The IN list is the closed terminal set, so a state token
+        // this build does not recognise is never dropped.
+        //
+        // `execute` returns the rows actually removed, so the count reported is one performed. The
+        // task's provenance chain goes with it via the tasks_cascade_events trigger.
+        let placeholders = (1..=TERMINAL_TASK_STATES.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM tasks WHERE updated_at < ?1 AND state IN ({placeholders})");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(i64::try_from(before).unwrap_or(i64::MAX))];
+        for s in TERMINAL_TASK_STATES {
+            args.push(Box::new(s));
+        }
+        let removed = self
+            .lock_writer()
+            .execute(&sql, rusqlite::params_from_iter(args.iter()))
+            .store()?;
+        Ok(removed as u64)
+    }
+
+    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
+        let seq = as_storable_i64("append_task_event", "seq", event.seq)?;
+        let ts = as_storable_i64("append_task_event", "ts", event.ts)?;
+        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
+        // `append_mcp_call`'s: that one treats an occupied slot holding a different record as a fork
+        // and refuses it, while this one is specified to upsert so that the engine's write-through
+        // is idempotent on replay — "rejecting or duplicating a replayed seq breaks the chain the
+        // engine will verify on read". Copying the call log's fork check here would be wrong in a
+        // way that looks right.
+        //
+        // FULL sync for the same reason `put_task` uses it: this is the tamper-evidence record of a
+        // transition, and a chain with a hole where a crash landed is a chain that fails to verify.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            conn.execute(
+                "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id, \
+                 state, request_id, prev_hash, hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(task_id, seq) DO UPDATE SET \
+                    ts=excluded.ts, kind=excluded.kind, context_id=excluded.context_id, \
+                    principal=excluded.principal, agent_id=excluded.agent_id, state=excluded.state, \
+                    request_id=excluded.request_id, prev_hash=excluded.prev_hash, \
+                    hash=excluded.hash",
+                params![
+                    event.task_id,
+                    seq,
+                    ts,
+                    event.kind,
+                    event.context_id,
+                    event.principal,
+                    event.agent_id,
+                    event.state,
+                    event.request_id,
+                    event.prev_hash,
+                    event.hash,
+                ],
+            )
+            .store()?;
+            Ok(())
+        })
+    }
+
+    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
+        // Oldest-first by seq — the order the engine's chain verifier reads, and the scope is the
+        // one task, because the chain is per-task.
+        let conn = self.lock_reader();
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, \
+                 request_id, prev_hash, hash FROM task_events WHERE task_id = ?1 ORDER BY seq",
+            )
+            .store()?;
+        let rows = stmt.query_map([task_id], row_to_task_event).store()?;
+        rows.collect::<Result<Vec<_>, _>>().store()
+    }
+}
+
+/// Reject a `u64` that SQLite's signed 64-bit integer cannot hold, naming the method and the field.
+/// `as i64` would wrap it negative and the read would clamp it back to something else again, so the
+/// row read back would not be the row written — and nothing would ever have reported an error. The
+/// same guard `append_audit` applies to its own `seq`/`ts`, factored out because the task store has
+/// five such fields across two methods.
+fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
+    i64::try_from(v).map_err(|_| {
+        StoreError(format!(
+            "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
+             that would not read back as itself"
+        ))
+    })
+}
+
+fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
+    Ok(TaskRow {
+        task_id: r.get(0)?,
+        context_id: r.get(1)?,
+        principal: r.get(2)?,
+        direction: r.get(3)?,
+        state: r.get(4)?,
+        agent_id: r.get(5)?,
+        artifact_cursor: r.get::<_, i64>(6)?.max(0) as u64,
+        push_callback: r.get(7)?,
+        created_at: r.get::<_, i64>(8)?.max(0) as u64,
+        updated_at: r.get::<_, i64>(9)?.max(0) as u64,
+    })
+}
+
+fn row_to_task_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEventRow> {
+    Ok(TaskEventRow {
+        task_id: r.get(0)?,
+        seq: r.get::<_, i64>(1)?.max(0) as u64,
+        ts: r.get::<_, i64>(2)?.max(0) as u64,
+        kind: r.get(3)?,
+        context_id: r.get(4)?,
+        principal: r.get(5)?,
+        agent_id: r.get(6)?,
+        state: r.get(7)?,
+        request_id: r.get(8)?,
+        prev_hash: r.get(9)?,
+        hash: r.get(10)?,
+    })
 }
 
 /// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,

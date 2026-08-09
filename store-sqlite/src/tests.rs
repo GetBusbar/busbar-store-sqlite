@@ -3,7 +3,8 @@
 
 use super::*;
 use busbar_api::{
-    AuditRecord, McpCallRecord, ModelTokensDelta, Store, TierTokensDelta, VirtualKey,
+    AuditRecord, McpCallRecord, ModelTokensDelta, Store, TaskEventRow, TaskRow, TierTokensDelta,
+    VirtualKey,
 };
 use rusqlite::TransactionBehavior;
 
@@ -1456,4 +1457,408 @@ fn mcp_calls_rejects_a_direct_update_but_allows_the_retention_delete() {
     s.lock_writer()
         .execute("DELETE FROM mcp_calls WHERE principal = 'vk_a'", [])
         .expect("retention must remain possible; only rewriting is forbidden");
+}
+
+// ── THE DURABLE A2A TASK STORE ───────────────────────────────────────────────────────────────
+//
+// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
+// outlive the process that started it. So the property under test is not "put_task returned Ok" —
+// the trait's default `put_task` returns `Ok(())` and keeps nothing, and `get_task` answers `None`
+// for everything, which is a backend that accepts every in-flight task and loses all of them on the
+// next deploy. The only honest proof is to READ THE TASK BACK THROUGH A RESTART.
+
+fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
+    TaskRow {
+        task_id: task_id.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 7,
+        push_callback: "https://example.test/push".to_string(),
+        created_at: 100,
+        updated_at,
+    }
+}
+
+fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
+    TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        // Saturating: the out-of-range test deliberately passes `u64::MAX` as `seq`, and a helper
+        // that panicked on its own arithmetic would hide the behaviour under test.
+        ts: seq.saturating_add(100),
+        kind: kind.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// THE TEST THAT MATTERS, and it is deliberately not a unit test against a live handle: a live
+/// handle cannot tell a backend that wrote to disk from one keeping a HashMap behind the same trait,
+/// and it cannot tell either of those from the trait's accept-and-keep-nothing defaults if the
+/// defaults happen to be exercised through the same handle that "wrote". So this DROPS the store —
+/// closing every SQLite connection and its WAL — reopens the same FILE, and reads the task back off
+/// disk. Against the unimplemented state it fails on the very first assertion.
+#[test]
+fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
+    let dir = tempdir();
+    let file = dir.join("tasks.db");
+    let path = file.to_str().unwrap().to_string();
+
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.put_task(&sample_task("t-1", "working", 200)).unwrap();
+        // The write-through on a state transition REPLACES the row rather than appending a second
+        // one — an interrupted task waiting on a human is what a restart has to find.
+        let mut interrupted = sample_task("t-1", "input-required", 300);
+        interrupted.artifact_cursor = 12;
+        s.put_task(&interrupted).unwrap();
+        s.put_task(&sample_task("t-2", "submitted", 210)).unwrap();
+        drop(s);
+    }
+
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let got = reopened.get_task("t-1").unwrap().expect(
+        "an in-flight task must survive a restart; got None back after reopening the file, \
+             which is the accept-and-keep-nothing default this backend exists to replace",
+    );
+
+    // Every field a resume reads has to come back verbatim — not merely a row with the right id.
+    assert_eq!(got.state, "input-required", "the LAST state must win");
+    assert_eq!(
+        got.artifact_cursor, 12,
+        "the artifact cursor is where a resubscribe resumes; a stale one replays or loses the gap"
+    );
+    assert_eq!(
+        got.context_id, "ctx-t-1",
+        "the resume key is the context id"
+    );
+    assert_eq!(got.principal, "vk_a");
+    assert_eq!(got.direction, "inbound");
+    assert_eq!(got.agent_id, "planner");
+    assert_eq!(got.push_callback, "https://example.test/push");
+    assert_eq!(got.created_at, 100);
+    assert_eq!(got.updated_at, 300);
+
+    // UPSERT, not append: two writes for one task_id leave ONE row.
+    let mut all = reopened.list_tasks().unwrap();
+    all.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    assert_eq!(
+        all.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
+        vec!["t-1", "t-2"],
+        "put_task upserts by task_id; a second write for the same id must replace, never append"
+    );
+
+    assert!(
+        reopened.get_task("t-nonexistent").unwrap().is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
+/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
+/// pre-filtered for any one of those would break the other two. Pinned across a restart because the
+/// boot rehydrate is precisely the caller that only ever sees the post-restart answer.
+#[test]
+fn list_tasks_returns_every_row_including_terminal_ones_after_a_restart() {
+    let dir = tempdir();
+    let file = dir.join("list.db");
+    let path = file.to_str().unwrap().to_string();
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.put_task(&sample_task("t-active", "working", 200))
+            .unwrap();
+        s.put_task(&sample_task("t-waiting", "input-required", 201))
+            .unwrap();
+        s.put_task(&sample_task("t-done", "completed", 202))
+            .unwrap();
+        s.put_task(&sample_task("t-failed", "failed", 203)).unwrap();
+        drop(s);
+    }
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let mut ids = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["t-active", "t-done", "t-failed", "t-waiting"],
+        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a restart"
+    );
+}
+
+/// The per-task provenance chain, read back off disk. Per-TASK rather than one global chain, so the
+/// scope of a read is one task and the links have to hold within it.
+#[test]
+fn a_task_event_chain_survives_a_restart_and_still_links() {
+    let dir = tempdir();
+    let file = dir.join("events.db");
+    let path = file.to_str().unwrap().to_string();
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.append_task_event(&sample_event("t-1", 1, "task.submitted", "", "e1"))
+            .unwrap();
+        s.append_task_event(&sample_event("t-1", 2, "task.working", "e1", "e2"))
+            .unwrap();
+        s.append_task_event(&sample_event("t-1", 3, "task.interrupted", "e2", "e3"))
+            .unwrap();
+        // A second task's chain is independent — it must not leak into the first one's read.
+        s.append_task_event(&sample_event("t-2", 1, "task.submitted", "", "f1"))
+            .unwrap();
+        drop(s);
+    }
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let got = reopened.list_task_events("t-1").unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "the provenance chain must survive a restart; got {} events back after reopening the file, \
+         which is the accept-and-keep-nothing default this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "oldest-first by seq, which is the order the chain verifier reads"
+    );
+    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-task chain must still link after a restart: seq {} carries prev_hash {:?} but \
+             seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every field round-trips, including the join key that is deliberately NOT chained.
+    assert_eq!(got[2].kind, "task.interrupted");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].context_id, "ctx-t-1");
+    assert_eq!(got[1].principal, "vk_a");
+    assert_eq!(got[1].agent_id, "planner");
+    assert_eq!(got[1].state, "working");
+    assert_eq!(got[1].ts, 102);
+    // The scope of a read is one task.
+    assert_eq!(reopened.list_task_events("t-2").unwrap().len(), 1);
+    assert!(
+        reopened.list_task_events("t-unknown").unwrap().is_empty(),
+        "a task with no events reads back empty, not an error"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS
+/// from `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a
+/// way that looks right: the contract says a store "must upsert on that pair — the write-through is
+/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
+/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
+/// corrected one.
+#[test]
+fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let e = sample_event("t-1", 1, "task.submitted", "", "e1");
+    s.append_task_event(&e).unwrap();
+    s.append_task_event(&e)
+        .expect("an identical replay must succeed, not be rejected as a fork");
+    assert_eq!(
+        s.list_task_events("t-1").unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    // A rewritten event at the same seq REPLACES, per the contract's "must upsert on that pair".
+    let mut corrected = sample_event("t-1", 1, "task.submitted", "", "e1-corrected");
+    corrected.state = "submitted".to_string();
+    s.append_task_event(&corrected).unwrap();
+    let got = s.list_task_events("t-1").unwrap();
+    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
+    assert_eq!(got[0].hash, "e1-corrected");
+    assert_eq!(got[0].state, "submitted");
+}
+
+/// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
+/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
+/// sits still for a long time; compacting it is losing the work, not reclaiming space.
+#[test]
+fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_task(&sample_task("t-old-done", "completed", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-failed", "failed", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-canceled", "canceled", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-rejected", "rejected", 100))
+        .unwrap();
+    // Old, and NOT terminal — never dropped, no matter how old.
+    s.put_task(&sample_task("t-old-waiting", "input-required", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-auth", "auth-required", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-working", "working", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-old-submitted", "submitted", 100))
+        .unwrap();
+    // Terminal but at the cutoff exactly, and terminal but newer — both kept.
+    s.put_task(&sample_task("t-at-cutoff", "completed", 200))
+        .unwrap();
+    s.put_task(&sample_task("t-new-done", "completed", 300))
+        .unwrap();
+
+    let purged = s.purge_tasks_before(200).unwrap();
+    assert_eq!(
+        purged, 4,
+        "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
+         actually performed rather than a guess"
+    );
+    let mut left = s
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "t-at-cutoff",
+            "t-new-done",
+            "t-old-auth",
+            "t-old-submitted",
+            "t-old-waiting",
+            "t-old-working",
+        ],
+        "an active or interrupted task is never dropped by retention, and `before` is strictly \
+         less-than so a row exactly at the cutoff is kept"
+    );
+    assert_eq!(
+        s.purge_tasks_before(200).unwrap(),
+        0,
+        "re-running the same purge removes nothing"
+    );
+}
+
+/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
+/// purging a task left its provenance behind, `task_events` would grow without any bound the
+/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
+/// and drops nothing belonging to any other task.
+#[test]
+fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_task(&sample_task("t-gone", "completed", 100))
+        .unwrap();
+    s.put_task(&sample_task("t-stays", "working", 100)).unwrap();
+    s.append_task_event(&sample_event("t-gone", 1, "task.submitted", "", "g1"))
+        .unwrap();
+    s.append_task_event(&sample_event("t-gone", 2, "task.completed", "g1", "g2"))
+        .unwrap();
+    s.append_task_event(&sample_event("t-stays", 1, "task.submitted", "", "s1"))
+        .unwrap();
+
+    assert_eq!(s.purge_tasks_before(200).unwrap(), 1);
+    assert!(
+        s.list_task_events("t-gone").unwrap().is_empty(),
+        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
+         contract offers no other way to purge them"
+    );
+    assert_eq!(
+        s.list_task_events("t-stays").unwrap().len(),
+        1,
+        "another task's chain must be untouched by that purge"
+    );
+}
+
+/// A `seq`/`ts`/`artifact_cursor` past `i64::MAX` cannot be stored faithfully — `as i64` wraps it
+/// negative and the read clamps back — so the row read back would not be the row written. Refused
+/// outright, exactly as `append_audit` refuses it, rather than silently mangled.
+#[test]
+fn the_task_store_refuses_values_it_cannot_store_faithfully() {
+    let s = SqliteStore::open_in_memory().unwrap();
+
+    let mut t = sample_task("t-1", "working", 200);
+    t.artifact_cursor = u64::MAX;
+    let err = s
+        .put_task(&t)
+        .expect_err("an artifact cursor past i64::MAX must be refused, not wrapped");
+    assert!(
+        err.0.contains("storable range"),
+        "the refusal must say why: {}",
+        err.0
+    );
+    assert!(
+        s.get_task("t-1").unwrap().is_none(),
+        "a refused write must leave nothing behind"
+    );
+
+    let mut e = sample_event("t-1", u64::MAX, "task.submitted", "", "e1");
+    assert!(s
+        .append_task_event(&e)
+        .expect_err("a seq past i64::MAX must be refused")
+        .0
+        .contains("storable range"));
+    e.seq = 1;
+    e.ts = u64::MAX;
+    assert!(s
+        .append_task_event(&e)
+        .expect_err("a ts past i64::MAX must be refused")
+        .0
+        .contains("storable range"));
+
+    // The boundary itself is storable and round-trips exactly.
+    t.artifact_cursor = i64::MAX as u64;
+    s.put_task(&t).expect("i64::MAX is in range");
+    assert_eq!(
+        s.get_task("t-1").unwrap().unwrap().artifact_cursor,
+        i64::MAX as u64
+    );
+}
+
+/// The v7 -> v8 crossing is additive: a real v7 database gains `tasks` and `task_events` and keeps
+/// every row it already had. Regression cover for the pre-v5 drop-and-recreate path reaching a live
+/// database on a version bump it has no business touching.
+#[test]
+fn migrate_v7_to_v8_adds_the_task_store_without_wiping_data() {
+    let dir = tempdir();
+    let file = dir.join("v7.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("DROP TRIGGER tasks_cascade_events", [])
+            .unwrap();
+        conn.execute("DROP TABLE task_events", []).unwrap();
+        conn.execute("DROP TABLE tasks", []).unwrap();
+        conn.execute(
+            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
+             VALUES ('vk_v7', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
+        .expect("a v7 database must migrate additively to v8");
+    assert!(
+        s.get_key("vk_v7").unwrap().is_some(),
+        "a real v7 key must survive the v7->v8 crossing"
+    );
+    s.put_task(&sample_task("t-1", "working", 200))
+        .expect("the newly created tasks table must be writable after the migration");
+    s.append_task_event(&sample_event("t-1", 1, "task.submitted", "", "e1"))
+        .expect("the newly created task_events table must be writable after the migration");
+    assert!(s.get_task("t-1").unwrap().is_some());
+    assert_eq!(s.list_task_events("t-1").unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }
