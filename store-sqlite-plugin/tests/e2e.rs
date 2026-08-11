@@ -44,7 +44,9 @@
 //! /api/v1/admin/keys`, and independently verifies both landed in the real on-disk file with a
 //! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
-use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger};
+use busbar_api::{
+    McpCallRecord, ModelTokens, Store, TaskEventRow, TaskRow, TierTokens, UsageLedger,
+};
 use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
 use std::process::Command;
@@ -721,4 +723,215 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
         !bogus_dir.exists(),
         "a failed open must not have created the parent directory or file"
     );
+}
+
+/// THE DURABILITY PROOF FOR THE TEN TASK / CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// Every other test of these methods in this repo calls `SqliteStore` DIRECTLY, in-process, and none
+/// of them can see the failure that actually matters in production. `busbar_api::Store` DEFAULTS all
+/// ten of `put_task`/`get_task`/`list_tasks`/`purge_tasks_before`/`append_task_event`/
+/// `list_task_events`/`append_mcp_call`/`list_mcp_calls`/`list_mcp_call_principals`/
+/// `purge_mcp_calls_before` to accept-and-keep-nothing, so a plugin seam that does not RELAY them
+/// silently substitutes those defaults: every write returns `Ok`, every read answers empty, and a
+/// deployment running this backend as a plugin — which is the ONLY way it ever runs — loses every
+/// in-flight A2A task and every tool-call record while reporting success.
+///
+/// So this test goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the packed
+/// cdylib, the real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three tasks across two
+/// states, three events on one task and one on another, three call records for one principal and
+/// one for a second), DROPS the handle — which unloads the library — then `dlopen`s AGAIN over the
+/// same file and reads everything back. A single-row round trip would not distinguish a relayed
+/// method from a lucky default; a multi-row one over a restart cannot be faked by either.
+///
+/// EXPECT THIS TEST TO BE RED until the engine-side ABI relay for these ten methods is on the
+/// busbar ref this repo builds against (`busbar-plugin-abi`'s `StoreRequest`/`StoreResponse`
+/// variants, the SDK dispatch and the `DynStore` overrides). THAT IS THE POINT: red here is the
+/// truthful report that durable tasks do not yet work through the only path that ships, and the
+/// alternative — no coverage at all — is how the seam stayed silently broken.
+#[test]
+fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
+    let Some(path) = plugin_path() else {
+        eprintln!("skip: store-sqlite-plugin cdylib not built (run cargo test/build first)");
+        return;
+    };
+    let scratch = ScratchDir::create("abi-durable");
+    let db_path = scratch.join("tasks.db");
+    let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
+
+    let task = |id: &str, state: &str, updated_at: u64| TaskRow {
+        task_id: id.to_string(),
+        context_id: format!("ctx-{id}"),
+        principal: "vk_abi".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 7,
+        push_callback: "https://example.test/push".to_string(),
+        created_at: 1_000,
+        updated_at,
+    };
+    let event = |task_id: &str, seq: u64, prev: &str, hash: &str| TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        ts: 1_000 + seq,
+        kind: "task.working".to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_abi".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts: 2_000 + seq,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = busbar_plugin_loader::load_store(&path, &cfg)
+            .expect("the sqlite plugin must load over the real ABI");
+        for (id, state, updated) in [
+            ("t_alpha", "working", 10_u64),
+            ("t_beta", "input-required", 20),
+            ("t_gamma", "completed", 30),
+        ] {
+            store.put_task(&task(id, state, updated)).expect("put_task");
+        }
+        for (seq, prev, hash) in [(1_u64, "", "e1"), (2, "e1", "e2"), (3, "e2", "e3")] {
+            store
+                .append_task_event(&event("t_alpha", seq, prev, hash))
+                .expect("append_task_event");
+        }
+        store
+            .append_task_event(&event("t_beta", 1, "", "b1"))
+            .expect("append_task_event");
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_mcp_call(&call("vk_abi", seq, prev, hash))
+                .expect("append_mcp_call");
+        }
+        store
+            .append_mcp_call(&call("vk_other", 1, "", "o1"))
+            .expect("append_mcp_call");
+        // Dropping the boxed store drops the loader's `Library` handle: the dylib is UNLOADED, so
+        // nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file.
+    let store = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("the sqlite plugin must load again over the real ABI");
+
+    let tasks = store.list_tasks().expect("list_tasks");
+    assert_eq!(
+        tasks.len(),
+        3,
+        "all three tasks must survive the unload/reload over the plugin ABI; got {} back, which is \
+         the accept-and-keep-nothing shape of the trait default that an unrelayed seam substitutes",
+        tasks.len()
+    );
+    let beta = store
+        .get_task("t_beta")
+        .expect("get_task")
+        .expect("the interrupted task must be readable by id after a reload");
+    assert_eq!(beta.state, "input-required");
+    assert_eq!(
+        beta.artifact_cursor, 7,
+        "the artifact cursor must round-trip"
+    );
+    assert_eq!(beta.push_callback, "https://example.test/push");
+    assert_eq!(beta.context_id, "ctx-t_beta");
+
+    let events = store.list_task_events("t_alpha").expect("list_task_events");
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-task provenance chain must come back oldest-first and complete"
+    );
+    for w in events.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    assert_eq!(
+        store
+            .list_task_events("t_beta")
+            .expect("list_task_events")
+            .len(),
+        1,
+        "one task's events must not leak into another's chain"
+    );
+
+    let calls = store.list_mcp_calls("vk_abi").expect("list_mcp_calls");
+    assert_eq!(
+        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-principal call chain must survive the reload in chain order"
+    );
+    assert_eq!(calls[2].tool_digest, "sha256:tool3");
+    assert_eq!(calls[2].request_id, "req-3");
+    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(
+        store
+            .list_mcp_calls("vk_other")
+            .expect("list_mcp_calls")
+            .len(),
+        1,
+        "one principal's chain must not carry another's records"
+    );
+    let mut principals = store
+        .list_mcp_call_principals()
+        .expect("list_mcp_call_principals");
+    principals.sort();
+    assert_eq!(
+        principals,
+        vec!["vk_abi".to_string(), "vk_other".to_string()],
+        "the boot enumeration must name every principal holding records, exactly once each"
+    );
+
+    // Retention crosses the ABI too, count and all — and both purges are checked for the number
+    // they ACTUALLY removed, because a relay that dropped the return value would read as 0.
+    assert_eq!(
+        store.purge_mcp_calls_before(2_002).expect("purge"),
+        2,
+        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls("vk_abi")
+            .expect("list_mcp_calls")
+            .len(),
+        2
+    );
+    assert!(store
+        .list_mcp_calls("vk_other")
+        .expect("list_mcp_calls")
+        .is_empty());
+    assert_eq!(
+        store.purge_tasks_before(25).expect("purge"),
+        0,
+        "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
+         swept no matter how old"
+    );
+    assert_eq!(
+        store.purge_tasks_before(31).expect("purge"),
+        1,
+        "the one completed task at updated_at 30 is the only row retention may drop"
+    );
+    assert_eq!(store.list_tasks().expect("list_tasks").len(), 2);
 }
