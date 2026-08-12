@@ -83,23 +83,105 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Locate the built `busbar-store-sqlite-plugin` cdylib in the target dir (mirrors the loader's own
-/// `sqlite_plugin_path` helper in the monorepo).
-fn plugin_path() -> Option<PathBuf> {
-    let candidate = (|| {
-        let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
-        let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
-        let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
-        let candidate = profile_dir.join(&name);
-        candidate.exists().then_some(candidate)
-    })();
-    if candidate.is_none() && std::env::var_os("CI").is_some() {
-        panic!(
-            "the store-sqlite-plugin cdylib is not built under CI: `cargo test` must build it. \
-             Refusing to silently skip the only over-the-ABI coverage of the durable sqlite store path."
-        );
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks in `target/<profile>/deps/`, NOT `target/<profile>/`, and that distinction is the
+/// whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml — so `deps/libbusbar_store_sqlite_plugin.dylib`
+/// is by construction up to date with the source tree being tested). It only *uplifts* a copy to
+/// `target/<profile>/` for `cargo build`, NEVER for `cargo test`. So the old lookup in
+/// `target/<profile>/` read an artifact that nothing in the test's dependency graph ever refreshes:
+/// whatever some earlier `cargo build` happened to leave there, from any commit, or nothing at all.
+///
+/// Both failure modes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the test used to `return` with a "skip:" line and report GREEN, which is
+///     how `cargo test --workspace` on a fresh clone reported success with ZERO over-the-ABI
+///     coverage of the ten task/call-log methods.
+///   * STALE artifact -> a cdylib older than the ABI relay answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none
+///     of them task methods, so `put_task` took the accept-and-keep-nothing trait default). RED on
+///     a stale artifact is indistinguishable from RED on the real bug; and an artifact that happens
+///     to be NEWER than a regression reports GREEN while the shipped ABI is broken.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: put the cdylib in the graph so the test cannot judge a stale one.
+/// Here the plugin's lib IS this package, so the graph edge already exists — what was missing was
+/// looking at the artifact that edge produces.
+///
+/// Panics rather than skipping. A missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report is a failure, not a silent pass.
+/// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib.
+fn newest_source_mtime() -> std::time::SystemTime {
+    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, newest);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    if m > *newest {
+                        *newest = m;
+                    }
+                }
+            }
+        }
     }
-    candidate
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the plugin crate always sits under the workspace root");
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
+        let src = e.path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut newest);
+        }
+    }
+    newest
+}
+
+fn plugin_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/e2e-<hash>
+    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
+    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+    let fresh = deps_dir.join(&name);
+    assert!(
+        fresh.exists(),
+        "the store-sqlite-plugin cdylib is not at {}, where cargo emits it for the same build that \
+         produced this test binary. Refusing to fall back to target/<profile>/ (an artifact only \
+         `cargo build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed \
+         plugin ABI reads as green.",
+        fresh.display()
+    );
+    // FRESHNESS, ASSERTED — not assumed. Under `cargo test` the artifact above is rebuilt by the
+    // same graph that built this binary (proven: delete it, re-run, cargo re-emits it). But this
+    // test binary can also be executed DIRECTLY out of `deps/`, where nothing rebuilds anything,
+    // and a stale cdylib there produces empty reads — indistinguishable from the unrelayed-ABI
+    // defect. So compare it against the sources and fail with a message that says STALE ARTIFACT,
+    // explicitly NOT a durability verdict.
+    let built = std::fs::metadata(&fresh)
+        .and_then(|m| m.modified())
+        .expect("cdylib mtime");
+    let newest_src = newest_source_mtime();
+    assert!(
+        built >= newest_src,
+        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
+         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
+         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
+         `cargo test`, which rebuilds it) and re-run.",
+        fresh.display(),
+        "busbar-store-sqlite-plugin"
+    );
+    fresh
 }
 
 /// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
@@ -176,10 +258,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 /// full close + reopen, using an independent connection that never touches the plugin/ABI/loader.
 #[test]
 fn load_and_exercise_sqlite_plugin_via_file_drop() {
-    let Some(so_path) = plugin_path() else {
-        eprintln!("skip: store-sqlite-plugin cdylib not built");
-        return;
-    };
+    let so_path = plugin_path();
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -449,10 +528,7 @@ fn wait_for_admin_ready(
 /// sqlite }` and is the one whose admin API mints the key/credential that lands in the real file.
 #[test]
 fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
-    let Some(so_path) = plugin_path() else {
-        eprintln!("skip: store-sqlite-plugin cdylib not built");
-        return;
-    };
+    let so_path = plugin_path();
     let (busbar_bin, pack_bin) = build_real_binaries();
 
     let work = ScratchDir::create("admin-api-install");
@@ -686,10 +762,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
 /// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
-    let Some(path) = plugin_path() else {
-        eprintln!("skip: store-sqlite-plugin cdylib not built (run cargo test/build first)");
-        return;
-    };
+    let path = plugin_path();
 
     // Malformed JSON: the plugin's own `open()` config parsing must reject it, surfaced intact
     // across the ABI.
@@ -750,10 +823,7 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
 /// alternative — no coverage at all — is how the seam stayed silently broken.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
-    let Some(path) = plugin_path() else {
-        eprintln!("skip: store-sqlite-plugin cdylib not built (run cargo test/build first)");
-        return;
-    };
+    let path = plugin_path();
     let scratch = ScratchDir::create("abi-durable");
     let db_path = scratch.join("tasks.db");
     let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
