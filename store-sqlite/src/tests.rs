@@ -3,8 +3,8 @@
 
 use super::*;
 use busbar_api::{
-    AuditRecord, McpCallRecord, ModelTokensDelta, Store, TaskEventRow, TaskRow, TierTokensDelta,
-    VirtualKey,
+    AuditRecord, McpCallRecord, McpDemotionRow, ModelTokensDelta, Store, TaskEventRow, TaskRow,
+    TierTokensDelta, VirtualKey,
 };
 use rusqlite::TransactionBehavior;
 
@@ -1860,5 +1860,283 @@ fn migrate_v7_to_v8_adds_the_task_store_without_wiping_data() {
         .expect("the newly created task_events table must be writable after the migration");
     assert!(s.get_task("t-1").unwrap().is_some());
     assert_eq!(s.list_task_events("t-1").unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
+//
+// Both of these are security state, and both had the same shape of hole before this: the trait
+// defaults them to accept-and-keep-nothing, so a backend that implements neither compiles, ships
+// and reports every write successful while discarding it. What that costs is exactly the two
+// properties the engine added them for — a quarantined upstream that gets its approval back at the
+// next restart, and a single-use human approval that a second node redeems again — so every case
+// below reads the state back through a REOPENED file rather than through the handle that wrote it.
+
+fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
+    McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at,
+    }
+}
+
+/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
+/// observation, so a process that has taken no observation has nothing to derive it from and serves
+/// the upstream against the digest the operator approved — which means a restart hands a quarantined
+/// upstream its approval back unless this row is on disk. Written, dropped, reopened, read back.
+#[test]
+fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
+    let dir = tempdir();
+    let file = dir.join("demotions.db");
+    let path = file.to_str().unwrap().to_string();
+
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        s.put_mcp_demotion(&demotion("payments", "tool-drift", 1_700_000_000))
+            .unwrap();
+        // UPSERT by `server`: a second demotion of one upstream replaces the row rather than
+        // standing a rival one beside it, so a read cannot come back holding two answers.
+        s.put_mcp_demotion(&demotion("payments", "digest-mismatch", 1_700_000_100))
+            .unwrap();
+        s.put_mcp_demotion(&demotion("search", "tool-drift", 1_700_000_200))
+            .unwrap();
+        drop(s);
+    }
+
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    let mut rows = reopened.list_mcp_demotions().unwrap();
+    rows.sort_by(|a, b| a.server.cmp(&b.server));
+    assert_eq!(
+        rows,
+        vec![
+            demotion("payments", "digest-mismatch", 1_700_000_100),
+            demotion("search", "tool-drift", 1_700_000_200),
+        ],
+        "a recorded demotion must be in force before the first request is served after a restart; \
+         an empty or stale answer here is a quarantined upstream handed its approval back, which is \
+         the accept-and-keep-nothing default this backend exists to replace"
+    );
+
+    // CLEARED on a later agreeing observation, and the clear is durable too — a quarantine the
+    // operator has already worked must not be re-established by the next restart.
+    reopened.clear_mcp_demotion("payments").unwrap();
+    reopened
+        .clear_mcp_demotion("never-demoted")
+        .expect("clearing a row that is not there is a no-op, not an error");
+    drop(reopened);
+
+    let again = SqliteStore::open(&path, 5000).unwrap();
+    assert_eq!(
+        again.list_mcp_demotions().unwrap(),
+        vec![demotion("search", "tool-drift", 1_700_000_200)],
+        "the clear must survive the restart as well, and must take exactly one upstream with it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN EMPTY LIST IS THE PRE-EXISTING DECLARATIVE BEHAVIOUR, and the trait is explicit that it must
+/// stay so: a server with no row here is a server nobody has demoted, which is a different fact from
+/// one that drifted. A store that answered "demoted" for the absence would quarantine every
+/// declaratively-approved deployment at boot.
+#[test]
+fn a_store_with_no_demotions_reads_back_empty_rather_than_failing() {
+    let dir = tempdir();
+    let file = dir.join("no-demotions.db");
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    assert!(s.list_mcp_demotions().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
+/// bytes on its second presentation exactly as on its first; only a record that the first happened
+/// tells them apart. Held in RAM that record dies with the process while the approval it records is
+/// still openable, so this drops the store, reopens the FILE, and asks again.
+#[test]
+fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
+    let dir = tempdir();
+    let file = dir.join("askstate.db");
+    let path = file.to_str().unwrap().to_string();
+    let now = 1_700_000_000u64;
+    let expires = now + 900;
+
+    {
+        let s = SqliteStore::open(&path, 5000).unwrap();
+        assert!(
+            s.redeem_ask_state("nonce-a", expires, now).unwrap(),
+            "the FIRST redemption is the one that must proceed, or nothing below is about single use"
+        );
+        drop(s);
+    }
+
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    assert!(
+        !reopened.redeem_ask_state("nonce-a", expires, now + 1).unwrap(),
+        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
+         is the point of it — so the only thing that changed is that the process which recorded the \
+         redemption is gone. On a tool an operator gated because it moves money, that second \
+         redemption is the whole defect the gate exists to stop"
+    );
+
+    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
+    // above and would have deleted the feature.
+    assert!(
+        reopened
+            .redeem_ask_state("nonce-b", expires, now + 2)
+            .unwrap(),
+        "a different approval is not the one that was spent; refusing it would make the ledger a \
+         blanket refusal of every confirmation after the first"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TWO HANDLES ON ONE FILE ARE TWO NODES OF A FLEET. They share the deployment's signing key, so
+/// they share the seal — every check but this one passes on both — and the ledger is the only thing
+/// standing between one operator confirmation and one execution per node.
+#[test]
+fn a_second_handle_on_the_same_file_cannot_redeem_what_the_first_spent() {
+    let dir = tempdir();
+    let file = dir.join("fleet.db");
+    let path = file.to_str().unwrap().to_string();
+    let node_a = SqliteStore::open(&path, 5000).unwrap();
+    let node_b = SqliteStore::open(&path, 5000).unwrap();
+    let now = 1_700_000_000u64;
+
+    assert!(node_a
+        .redeem_ask_state("nonce-fleet", now + 900, now)
+        .unwrap());
+    assert!(
+        !node_b
+            .redeem_ask_state("nonce-fleet", now + 900, now)
+            .unwrap(),
+        "a second node of the same deployment redeemed an approval the first already spent, which \
+         is one confirmation executing once per node"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case: two redemptions in flight at once are
+/// what a read-then-write check answers "first" to twice. Exactly one of N racing threads may win.
+#[test]
+fn exactly_one_of_many_racing_redemptions_wins() {
+    let dir = tempdir();
+    let file = dir.join("race.db");
+    let path = file.to_str().unwrap().to_string();
+    let now = 1_700_000_000u64;
+    let store = std::sync::Arc::new(SqliteStore::open(&path, 5000).unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+    let winners: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .redeem_ask_state("nonce-race", now + 900, now)
+                        .unwrap() as usize
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    assert_eq!(
+        winners, 1,
+        "exactly one redemption of one approval may be the first; {winners} threads were each told \
+         they were, which is a test-and-set that is really a read followed by a write"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW. `now` is handed to every redemption so the
+/// backend can drop what has lapsed as part of the same call — an entry recording an approval that
+/// can no longer be opened protects nothing, and a table that only grows is its own outage.
+#[test]
+fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
+    let dir = tempdir();
+    let file = dir.join("evict.db");
+    let path = file.to_str().unwrap().to_string();
+    let now = 1_700_000_000u64;
+
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    assert!(s.redeem_ask_state("short-lived", now + 10, now).unwrap());
+    assert!(s.redeem_ask_state("long-lived", now + 10_000, now).unwrap());
+
+    // A redemption well past the first entry's expiry: the sweep runs inside the same call.
+    let later = now + 11;
+    assert!(s.redeem_ask_state("another", later + 900, later).unwrap());
+    let rows: i64 = s
+        .lock_reader()
+        .query_row("SELECT COUNT(*) FROM spent_ask_states", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "the lapsed entry must be evicted by the sweep the redemption carries, leaving only the \
+         approvals still openable"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// REFUSED RATHER THAN MANGLED, and here the reason is sharper than it is for a task cursor: `as
+/// i64` wraps a `u64` past `i64::MAX` negative, and a wrapped `now` sweeps the whole ledger before
+/// inserting — which answers "first redemption" to a replay. The failure has to be an error.
+#[test]
+fn the_ledger_refuses_values_it_cannot_store_faithfully() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    assert!(
+        s.redeem_ask_state("n", u64::MAX, 1_700_000_000).is_err(),
+        "an unstorable expires_at must be an error, never a silent 'first redemption'"
+    );
+    assert!(
+        s.redeem_ask_state("n", 1_700_000_900, u64::MAX).is_err(),
+        "an unstorable now must be an error: clamped to i64::MAX it would evict the entire ledger \
+         and then report every replay as a first redemption"
+    );
+    assert!(
+        s.put_mcp_demotion(&demotion("srv", "tool-drift", u64::MAX))
+            .is_err(),
+        "an unstorable recorded_at must be an error rather than a row that does not read back as \
+         itself"
+    );
+    // And the in-range boundary still stores.
+    assert!(s
+        .redeem_ask_state("boundary", i64::MAX as u64, 1_700_000_000)
+        .unwrap());
+}
+
+/// The v8 -> v9 crossing is additive: a real v8 database gains the two trust-state tables and keeps
+/// every row it already had. Same regression cover the v7 -> v8 crossing carries — the pre-v5
+/// drop-and-recreate path has no business touching a live database on a version bump.
+#[test]
+fn migrate_v8_to_v9_adds_the_trust_state_tables_without_wiping_data() {
+    let dir = tempdir();
+    let file = dir.join("v8.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("DROP TABLE spent_ask_states", []).unwrap();
+        conn.execute("DROP TABLE mcp_demotions", []).unwrap();
+        conn.execute(
+            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
+             VALUES ('vk_v8', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
+        .expect("a v8 database must migrate additively to v9");
+    assert!(
+        s.get_key("vk_v8").unwrap().is_some(),
+        "a real v8 key must survive the v8->v9 crossing"
+    );
+    s.put_mcp_demotion(&demotion("srv", "tool-drift", 1_700_000_000))
+        .expect("the newly created mcp_demotions table must be writable after the migration");
+    assert!(s
+        .redeem_ask_state("n", 1_700_000_900, 1_700_000_000)
+        .unwrap());
+    assert_eq!(s.list_mcp_demotions().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -45,7 +45,8 @@
 //! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
 use busbar_api::{
-    McpCallRecord, ModelTokens, Store, TaskEventRow, TaskRow, TierTokens, UsageLedger,
+    McpCallRecord, McpDemotionRow, ModelTokens, Store, TaskEventRow, TaskRow, TierTokens,
+    UsageLedger,
 };
 use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
@@ -1006,4 +1007,120 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
         "the one completed task at updated_at 30 is the only row retention may drop"
     );
     assert_eq!(store.list_tasks().expect("list_tasks").len(), 2);
+}
+
+/// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// Same reasoning as the task/call-log test above, and a sharper cost. `busbar_api::Store` defaults
+/// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
+/// `redeem_ask_state` to `Ok(true)` — "this call is the first redemption" — so a seam that does not
+/// RELAY them substitutes exactly two security failures, both of them silent and both green:
+///
+///   * a demotion is written, reported successful and DISCARDED, so a restart hands a quarantined
+///     upstream the operator's approval back; and
+///   * every redeemer of one single-use approval is told it is the first, so the confirm-once tool
+///     an operator gated because it moves money executes once per node and once per restart.
+///
+/// This backend only ever runs as a plugin, so in-process tests against `SqliteStore` cannot see
+/// either. This one goes through `busbar_plugin_loader::load_store`: a real `dlopen`, the real C
+/// ABI, the real `DynStore`. TWO CONCURRENT LOADS of one file are the fleet — the ledger has to
+/// refuse the second node — and a drop-and-reload is the restart.
+#[test]
+fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    let path = plugin_path();
+    let scratch = ScratchDir::create("abi-trust-state");
+    let db_path = scratch.join("trust.db");
+    let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
+
+    let demotion = |server: &str, reason: &str, at: u64| McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at: at,
+    };
+    let now = 1_700_000_000u64;
+
+    {
+        // BOOT 1 — a real dlopen; every call below crosses the C ABI.
+        let store = busbar_plugin_loader::load_store(&path, &cfg)
+            .expect("the sqlite plugin must load over the real ABI");
+        store
+            .put_mcp_demotion(&demotion("payments", "tool-drift", now))
+            .expect("put_mcp_demotion");
+        store
+            .put_mcp_demotion(&demotion("payments", "digest-mismatch", now + 10))
+            .expect("the upsert path crosses the ABI too");
+        store
+            .put_mcp_demotion(&demotion("search", "tool-drift", now + 20))
+            .expect("put_mcp_demotion");
+        store
+            .put_mcp_demotion(&demotion("mail", "tool-drift", now + 30))
+            .expect("put_mcp_demotion");
+        store
+            .clear_mcp_demotion("mail")
+            .expect("a later agreeing observation clears the quarantine");
+
+        assert!(
+            store
+                .redeem_ask_state("nonce-abi", now + 900, now)
+                .expect("redeem_ask_state"),
+            "the FIRST redemption must be answered `true`, or nothing below is about single use"
+        );
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file. The library was unloaded, so
+    // nothing this process still holds can be answering these reads out of RAM.
+    let store = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("the sqlite plugin must load again over the real ABI");
+
+    let mut rows = store.list_mcp_demotions().expect("list_mcp_demotions");
+    rows.sort_by(|a, b| a.server.cmp(&b.server));
+    assert_eq!(
+        rows,
+        vec![
+            demotion("payments", "digest-mismatch", now + 10),
+            demotion("search", "tool-drift", now + 20),
+        ],
+        "the boot read must put every recorded quarantine back in force before the first request is \
+         served — upserted to the LATEST reason, and without the one a later observation cleared. \
+         An empty answer here is the trait default an unrelayed seam substitutes, and it means a \
+         restart hands a demoted upstream the operator's approval back"
+    );
+
+    assert!(
+        !store
+            .redeem_ask_state("nonce-abi", now + 900, now + 1)
+            .expect("redeem_ask_state"),
+        "a restart handed a spent approval back over the plugin ABI. The approval has not lapsed — \
+         outliving a restart is the point of it — so the only thing that changed is that the \
+         process which recorded the redemption is gone"
+    );
+
+    // THE FLEET. A second, simultaneous dlopen of the same cdylib over the same file is what a
+    // second node of one deployment is: it shares the signing key, so it shares the seal, and every
+    // check but this one passes on both.
+    let node_b = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("a second node loads the same plugin against the same store");
+    assert!(
+        store
+            .redeem_ask_state("nonce-fleet", now + 900, now + 2)
+            .expect("redeem_ask_state"),
+        "node A's first redemption of a fresh approval must proceed"
+    );
+    assert!(
+        !node_b
+            .redeem_ask_state("nonce-fleet", now + 900, now + 3)
+            .expect("redeem_ask_state"),
+        "a second node redeemed an approval the first already spent, which is one operator \
+         confirmation executing once per node"
+    );
+    // THE CONTROL: a ledger that refused everything would satisfy both cases above and would have
+    // deleted the feature.
+    assert!(
+        node_b
+            .redeem_ask_state("nonce-distinct", now + 900, now + 4)
+            .expect("redeem_ask_state"),
+        "a freshly minted approval is not the one that was spent; refusing it would make the shared \
+         ledger a blanket refusal of every confirmation after the first"
+    );
 }

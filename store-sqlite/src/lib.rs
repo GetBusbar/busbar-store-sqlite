@@ -8,9 +8,9 @@
 //! Depends only on the `busbar-api` contract (plus rusqlite), never on the engine.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow, TaskRow,
-    TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
+    MeteringRow, ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow,
+    TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,7 +56,12 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 ///
 /// v8: the durable A2A TASK STORE (`tasks`, `task_events`). Additive on the same terms as v7 — two
 /// new tables, no backfill, nothing dropped — so again no `version < 8` arm exists.
-const SCHEMA_VERSION: i64 = 8;
+///
+/// v9: the durable TRUST STATE (`mcp_demotions`, `spent_ask_states`) — the recorded quarantine of an
+/// upstream that drifted from what the operator approved, and the ledger that makes a single-use
+/// human approval single-use across a restart and across a fleet. Additive on the same terms as v7
+/// and v8 — two new tables, no backfill, nothing dropped — so there is no `version < 9` arm either.
+const SCHEMA_VERSION: i64 = 9;
 
 /// The task states that are TERMINAL, and therefore the only ones retention may drop. Named as a
 /// closed set rather than derived by negation on purpose: an unrecognised state token — one a newer
@@ -287,6 +292,39 @@ CREATE TABLE IF NOT EXISTS task_events (
     prev_hash  TEXT NOT NULL,
     hash       TEXT NOT NULL,
     PRIMARY KEY (task_id, seq)
+) STRICT;
+
+-- THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it is
+-- currently serving disagrees with what the operator approved. That decision is derived in memory
+-- from a LIVE OBSERVATION, and a process that has taken no observation has nothing to derive it
+-- from -- a server nobody has looked at serves against the digest the operator wrote down, which is
+-- the declarative-approval behaviour every deployment without a live refresh depends on. Those two
+-- facts together are why this table exists: without it a restart hands a quarantined upstream its
+-- approval back until the next unattended sweep looks again.
+--
+-- ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
+-- demotion of one server replaces the row rather than standing a rival one beside it. Carries no
+-- secret: `reason` is an engine-chosen word for an operator to read, never caller text.
+CREATE TABLE IF NOT EXISTS mcp_demotions (
+    server      TEXT NOT NULL PRIMARY KEY,
+    reason      TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+) STRICT;
+
+-- THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once tool
+-- execute once, and the seal itself cannot carry that property: the second presentation of a
+-- redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD THAT THE
+-- FIRST HAPPENED tells them apart, and in process memory that record dies with the process and is
+-- never shared with a second node -- while two nodes of one deployment share the signing key, and
+-- therefore share the seal. Here it is one ledger for the whole deployment.
+--
+-- No index beyond the primary key, and none is wanted: every read is a point lookup on `nonce` (the
+-- INSERT's own conflict check), and the only scan is the eviction sweep, which visits a table
+-- bounded by one approval-validity window. `expires_at` is what that sweep goes by -- an entry
+-- recording an approval that can no longer be opened protects nothing.
+CREATE TABLE IF NOT EXISTS spent_ask_states (
+    nonce      TEXT NOT NULL PRIMARY KEY,
+    expires_at INTEGER NOT NULL
 ) STRICT;
 
 -- Pragma-independent integrity triggers: survive an operator opening the file with the sqlite3 CLI
@@ -1625,6 +1663,107 @@ impl Store for SqliteStore {
             .store()?;
         let rows = stmt.query_map([task_id], row_to_task_event).store()?;
         rows.collect::<Result<Vec<_>, _>>().store()
+    }
+
+    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
+        let recorded = as_storable_i64("put_mcp_demotion", "recorded_at", row.recorded_at)?;
+        // FULL sync, for the reason `put_task` uses it and then some: this row IS the quarantine.
+        // Acknowledged and then lost to a power cut, it is an upstream the engine decided it could
+        // no longer trust that comes back up holding the operator's approval.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            // UPSERT BY server, as the trait requires: a second write for one upstream replaces the
+            // row rather than appending a rival one, so the boot read cannot come back holding two
+            // answers about one server.
+            conn.execute(
+                "INSERT INTO mcp_demotions (server, reason, recorded_at) VALUES (?1,?2,?3) \
+                 ON CONFLICT(server) DO UPDATE SET \
+                    reason=excluded.reason, recorded_at=excluded.recorded_at",
+                params![row.server, row.reason, recorded],
+            )
+            .store()?;
+            Ok(())
+        })
+    }
+
+    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
+        // The boot read. An EMPTY answer means "no upstream is recorded as demoted" and never "we
+        // could not tell" — a read failure is returned as an error, because a server with no row is
+        // a server nobody demoted, which is a different fact from a server that drifted, and
+        // conflating them would quarantine every declaratively-approved deployment at boot.
+        let conn = self.lock_reader();
+        let mut stmt = conn
+            .prepare("SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server")
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(McpDemotionRow {
+                    server: r.get(0)?,
+                    reason: r.get(1)?,
+                    recorded_at: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })
+            .store()?;
+        rows.collect::<Result<Vec<_>, _>>().store()
+    }
+
+    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
+        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
+        // observation that agrees with the approval rather than tracking whether it had demoted, so
+        // the overwhelmingly common call is one against no row at all. FULL sync for the same reason
+        // the write has it, and the mirror of it: a clear lost to a power cut re-establishes a
+        // quarantine the operator has already worked.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            conn.execute("DELETE FROM mcp_demotions WHERE server = ?1", [server])
+                .store()?;
+            Ok(())
+        })
+    }
+
+    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+        // REFUSED rather than clamped, and this is not the same judgement call `purge_mcp_calls_
+        // before` makes when it clamps its cutoff. A `now` clamped to `i64::MAX` would sweep the
+        // ENTIRE ledger and then report the insert as a first redemption — i.e. an out-of-range
+        // argument would silently reopen every spent approval in the deployment. The only safe
+        // answer to a value this store cannot hold faithfully is an error, which the engine's call
+        // site turns into a REFUSED redemption.
+        let expires = as_storable_i64("redeem_ask_state", "expires_at", expires_at)?;
+        let now_i = as_storable_i64("redeem_ask_state", "now", now)?;
+
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            // ONE transaction over the sweep and the test-and-set. BEGIN IMMEDIATE takes the write
+            // lock up front (as every write path in this file does), so two redemptions of one
+            // approval — two threads here, or two nodes on one file — serialise rather than
+            // interleave. Splitting the lookup from the insert is precisely the read-then-write race
+            // this method is specified NOT to be: both readers would see no row and both would be
+            // told they were first.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .store()?;
+            // The eviction sweep, carried by the redemption itself: an entry whose approval can no
+            // longer be opened protects nothing, so the table is bounded by one validity window
+            // rather than growing forever. STRICTLY less-than, so an entry expiring exactly at `now`
+            // is kept — the same boundary convention every retention method here uses.
+            tx.execute(
+                "DELETE FROM spent_ask_states WHERE expires_at < ?1",
+                [now_i],
+            )
+            .store()?;
+            // THE TEST AND SET, as ONE statement. `execute` returns the rows actually inserted, so
+            // 1 means this call is the one that recorded the redemption and 0 means the row was
+            // already there — the answer is read off what the database did, never off a prior read.
+            let inserted = tx
+                .execute(
+                    "INSERT INTO spent_ask_states (nonce, expires_at) VALUES (?1,?2) \
+                     ON CONFLICT(nonce) DO NOTHING",
+                    params![nonce, expires],
+                )
+                .store()?;
+            tx.commit().store()?;
+            Ok(inserted == 1)
+        })
     }
 }
 
