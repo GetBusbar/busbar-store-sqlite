@@ -16,8 +16,8 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the C ABI delivery; rlib so the u
 # real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into busbarAI
 # — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet; once it
 # ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
-busbar-api = { path = "../../busbarAI/crates/api" }
-busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
+busbar-api = { path = "../../busbar/crates/api" }
+busbar-plugin-sdk = { path = "../../busbar/crates/plugin-sdk" }
 busbar-store-sqlite = { path = "../store-sqlite" }
 serde_json = "1"
 
@@ -25,7 +25,7 @@ serde_json = "1"
 # INTERIM local path dep into busbarAI, same rationale as above — dev-only. The end-to-end test loads
 # the built cdylib over the real loader ABI seam, so it needs the real loader — never shipped in the
 # plugin artifact itself.
-busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
+busbar-plugin-loader = { path = "../../busbar/crates/plugin-loader" }
 # Dev-only: the `busy_timeout_ms_is_actually_applied` unit test opens a second, independent
 # connection to the SAME sqlite file to hold a lock and observe the plugin's configured busy_timeout
 # behaviorally. `SqliteStore` doesn't expose its inner connection, so the test needs its own. Same
