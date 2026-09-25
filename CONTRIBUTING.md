@@ -14,7 +14,7 @@ to build, test, and submit changes.
 ## Development setup
 
 `store-sqlite` is a Rust `cdylib` plugin. You need a recent stable toolchain
-(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
+(`rustup` recommended), and — until [busbar](https://github.com/GetBusbar/busbar)
 ships publicly — a sibling checkout of it at `../busbar`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
 README's [Dependencies](README.md#dependencies) section for the exact layout;
@@ -45,7 +45,7 @@ JSON `open` config into a `SqliteStore` and hands the trait object to
 which emits the C ABI symbols the loader resolves. The actual schema and
 persistence logic lives in the `busbar-store-sqlite` library crate this plugin
 wraps, in the `store-sqlite/` directory of THIS repository. Most substantive
-changes belong here, not in the `busbarAI` monorepo.
+changes belong here, not in the `busbar` monorepo.
 
 ## Commit & PR conventions
 

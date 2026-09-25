@@ -2,9 +2,9 @@
 #
 # This repo brings 100% of what it needs: the real SQLite governance-store logic (store-sqlite) and
 # the thin dlopen ABI adapter that packages it as a busbar plugin (store-sqlite-plugin) both live
-# here, as a same-repo Cargo workspace — not split across this repo and busbarAI. Only busbar-api/
+# here, as a same-repo Cargo workspace — not split across this repo and busbar. Only busbar-api/
 # busbar-plugin-sdk (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a
-# sibling busbarAI checkout, since those are core-engine contracts every plugin depends on the same way.
+# sibling busbar checkout, since those are core-engine contracts every plugin depends on the same way.
 [workspace]
 resolver = "2"
 members = [

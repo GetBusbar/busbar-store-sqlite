@@ -2,7 +2,7 @@
 # supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
 # THIS repo's own GitHub Release.
 #
-# This mirrors busbarAI/.github/workflows/release.yml's `store-plugins` job — same 5-target
+# This mirrors busbar/.github/workflows/release.yml's `store-plugins` job — same 5-target
 # matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
 # BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
 # attestation — just scoped to this one plugin instead of building sqlite/postgres/valkey together
@@ -115,7 +115,7 @@ jobs:
   # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
   # first-party against the PUBLIC key embedded in busbar's own release binaries. If that secret
   # isn't provisioned on this repo, falls back to an UNSIGNED tarball (loadable only under
-  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbarAI's own
+  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbar's own
   # release.yml documents (TODO(release-keys)).
   store-plugin:
     needs: create-release
@@ -175,7 +175,7 @@ jobs:
 
       - name: Build busbar-plugin-pack (from the sibling busbar checkout)
         working-directory: busbar
-        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-pack
+        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-sdk --features pack --bin busbar-plugin-pack
         shell: bash
 
       - name: Package + sign the plugin tarball
@@ -190,7 +190,7 @@ jobs:
           [ -x "$pack" ] || pack="busbar/target/${target}/release/busbar-plugin-pack.exe"
           unsigned_flag=""
           if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
-            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbar's release.yml TODO(release-keys) seam."
             unsigned_flag="--allow-unsigned"
           fi
           lib="store-sqlite/target/${target}/release/${{ matrix.libprefix }}busbar_store_sqlite_plugin.${{ matrix.libext }}"
