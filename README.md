@@ -19,34 +19,50 @@ built library into busbar's plugins folder, set
 
 This plugin is versioned **independently of busbar** — `v1.0.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: **requires busbar 1.5.0+** (the release that ships the
-signed hybrid plugin ABI this crate loads over). Pin both versions
-explicitly in production; do not assume they move together.
+stated separately: **requires busbar 1.6.0+** — the release whose store
+interface this crate implements (the kind-tagged plane-record verbs that
+replaced the per-protocol task/MCP methods, and the 1.6.0 key, usage and
+metering record shapes). Pin both versions explicitly in production; do
+not assume they move together.
+
+## Upgrading an existing database
+
+Opening a database written by an earlier release upgrades it in place,
+forward-only, in one transaction (schema v6 — the v1.0.x releases — or
+later, to v10). Nothing an operator already has is dropped: keys,
+credentials, tombstones, usage and metering counts, the audit log and the
+denylist all read back exactly as before, and existing metering rows are
+attributed to the opening rate card. Back the file up before the first
+boot on the new version — there is no downgrade path, and an older plugin
+build must not be pointed at an upgraded file.
 
 All the actual SQLite logic — schema, key/usage/audit persistence, a
 mutex-guarded writer connection plus a small pool of `query_only` reader
 connections (so a long billing report or retention sweep never blocks the
 hot-path usage flush) — lives in the `busbar-store-sqlite` `lib` crate in
-[busbarAI](https://github.com/GetBusbar/busbar). This crate is
+this repository's `store-sqlite/` directory. This crate is
 deliberately tiny: it adapts the engine's JSON `open` config into a
 `SqliteStore` and hands the trait object to
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
 which emits the six `extern "C"` symbols the loader resolves. (A custom
 build can also link `busbar-store-sqlite` statically instead of using
-this dynamic wrapper — see busbarAI's plugin docs.)
+this dynamic wrapper — see busbar's plugin docs.)
 
 ## What it is for
 
 - The **default durable store** for busbar's governance data: virtual
-  keys, usage ledgers, and the durable audit log — single-node,
-  file-backed, zero external dependencies (SQLite is bundled).
+  keys, credentials, usage and metering ledgers, the durable audit log,
+  and every plane's durable records (A2A tasks and their provenance
+  chains, the MCP call log and demotions, single-use approval tokens,
+  push-callback capabilities, and any record kind a plane declares) —
+  single-node, file-backed, zero external dependencies (SQLite is bundled).
 - The reference `kind: store` plugin: a minimal example of adapting an
   engine-agnostic storage backend to the plugin C ABI.
 
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly —
+until [busbar](https://github.com/GetBusbar/busbar) ships publicly —
 a sibling checkout of `busbar` at `../busbar` (see
 [Dependencies](#dependencies) below).
 
@@ -62,8 +78,8 @@ cargo fmt --all -- --check
 This crate depends on `busbar-api`, `busbar-store-sqlite`, and
 `busbar-plugin-sdk` (and, as a dev-dependency for the end-to-end test,
 `busbar-plugin-loader`) from the
-[busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
-busbarAI is not yet public, `Cargo.toml` points at these as **local path
+[busbar](https://github.com/GetBusbar/busbar) monorepo. Because
+busbar is not yet public, `Cargo.toml` points at these as **local path
 dependencies** (`../busbar/crates/...`), which means this repo expects
 to be checked out as a sibling of `busbar`:
 
@@ -73,7 +89,7 @@ some-parent-dir/
 └── store-sqlite/
 ```
 
-This is an interim measure — once busbarAI ships publicly, these should
+This is an interim measure — once busbar ships publicly, these should
 become git (pinned rev/tag) or crates.io dependencies instead. Grep
 `Cargo.toml` for the `INTERIM` comments when doing that migration.
 
@@ -82,7 +98,7 @@ become git (pinned rev/tag) or crates.io dependencies instead. Grep
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
 [`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
-in busbarAI for the full reference. In short:
+in busbar for the full reference. In short:
 
 ```sh
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
@@ -154,8 +170,12 @@ directory) fails cleanly across the ABI rather than panicking or
 silently succeeding.
 
 Build under `cargo test` (which builds the cdylib as part of the test
-run) so the e2e test finds the library; it self-skips with a message if
-the cdylib isn't present.
+run) so the e2e test finds the library; it fails, rather than skipping,
+if the cdylib isn't present or is older than the sources.
+
+The upgrade path is tested against real database files the previous
+code wrote (`store-sqlite/tests/fixtures/`, with the programs that wrote
+them beside them).
 
 ## License
 
