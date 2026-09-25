@@ -13,8 +13,8 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the C ABI delivery; rlib so the u
 
 [dependencies]
 # busbar-store-sqlite is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
-# real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into busbarAI
-# — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet; once it
+# real logic lives here, not in busbar). Only busbar-api/busbar-plugin-sdk still reach into busbar
+# — INTERIM local path dependencies into a sibling checkout, since busbar isn't public yet; once it
 # ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
 busbar-api = { path = "../../busbar/crates/api" }
 busbar-plugin-sdk = { path = "../../busbar/crates/plugin-sdk" }
@@ -22,7 +22,7 @@ busbar-store-sqlite = { path = "../store-sqlite" }
 serde_json = "1"
 
 [dev-dependencies]
-# INTERIM local path dep into busbarAI, same rationale as above — dev-only. The end-to-end test loads
+# INTERIM local path dep into busbar, same rationale as above — dev-only. The end-to-end test loads
 # the built cdylib over the real loader ABI seam, so it needs the real loader — never shipped in the
 # plugin artifact itself.
 busbar-plugin-loader = { path = "../../busbar/crates/plugin-loader" }
