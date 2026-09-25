@@ -45,8 +45,8 @@
 //! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
 use busbar_api::{
-    McpCallRecord, McpDemotionRow, ModelTokens, Store, TaskEventRow, TaskRow, TierTokens,
-    UsageLedger,
+    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, Store, UsageLedger, UNIT_INPUT,
+    UNIT_OUTPUT,
 };
 use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
@@ -220,7 +220,7 @@ const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000
 
 /// The sibling busbar checkout's root (same convention this repo already uses for its path deps
 /// in Cargo.toml).
-fn busbarai_root() -> PathBuf {
+fn busbar_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../busbar")
         .canonicalize()
@@ -231,26 +231,42 @@ fn busbarai_root() -> PathBuf {
 /// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    let root = busbarai_root();
-    let status = Command::new("cargo")
-        .args([
+    let root = busbar_root();
+    // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-sdk` (busbar 1.6.0 folded
+    // the standalone pack crate into the SDK), built exactly the way plugin-ci.yml builds it.
+    for args in [
+        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
             "build",
             "--release",
             "-p",
-            "busbar",
-            "-p",
+            "busbar-plugin-sdk",
+            "--features",
+            "pack",
+            "--bin",
             "busbar-plugin-pack",
-        ])
-        .current_dir(&root)
-        .status()
-        .expect("run cargo build for busbar + busbar-plugin-pack");
-    assert!(
-        status.success(),
-        "building the real busbar + busbar-plugin-pack binaries must succeed"
-    );
+        ][..],
+    ] {
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(&root)
+            .status()
+            .expect("run cargo build for busbar + busbar-plugin-pack");
+        assert!(
+            status.success(),
+            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
+        );
+    }
+    // The nested `cargo build` inherits this process's environment, so a `CARGO_TARGET_DIR` set for
+    // the outer `cargo test` redirects it too; look where it actually put the binaries, or this
+    // runs whatever stale `busbar` an earlier build left under the checkout's own `target/`.
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
     (
-        root.join("target/release/busbar"),
-        root.join("target/release/busbar-plugin-pack"),
+        target.join("release/busbar"),
+        target.join("release/busbar-plugin-pack"),
     )
 }
 
@@ -360,10 +376,18 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     // plugin + config, and poll for the real sqlite file to appear -- the only genuine proof that
     // boot actually dlopened the plugin and called Store::open (which creates/migrates the file)
     // before ever handling a request.
-    let mut child = Command::new(&busbar_bin)
+    //
+    // busbar 1.6.0 refuses to BOOT (not only to validate) when a provider credential cannot resolve
+    // (BUSBAR-9007), so the real boot needs the same placeholders `--validate` got above.
+    let mut boot_cmd = Command::new(&busbar_bin);
+    boot_cmd
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
+        .env("BUSBAR_STATE_FILE", ""); // disable the state-snapshot file; not under test here
+    for name in referenced_env_vars(&config_text) {
+        boot_cmd.env(name, SECRET_PLACEHOLDER);
+    }
+    let mut child = boot_cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -409,12 +433,9 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         billable_requests: 5,
         models: vec![ModelTokens {
             model: "gpt-5".into(),
-            tokens: TierTokens {
-                input: 20,
-                output: 8,
-                cache_read: 0,
-                cache_write: 0,
-            },
+            usage_units: [(UNIT_INPUT.to_string(), 20), (UNIT_OUTPUT.to_string(), 8)]
+                .into_iter()
+                .collect(),
         }],
     };
     {
@@ -432,9 +453,11 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         "usage written through one real connection must survive a full close + reopen of the same file"
     );
     let t = usage
-        .tokens_for("gpt-5")
+        .models
+        .iter()
+        .find(|m| m.model == "gpt-5")
         .expect("model row survives reopen");
-    assert_eq!((t.input, t.output), (20, 8));
+    assert_eq!((t.tier(UNIT_INPUT), t.tier(UNIT_OUTPUT)), (20, 8));
 }
 
 /// Bind an ephemeral loopback port and immediately drop the listener, handing the bare port number
@@ -602,6 +625,8 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+        // busbar 1.6.0 refuses to boot on an unresolvable provider credential (BUSBAR-9007).
+        .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -689,6 +714,8 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+        // busbar 1.6.0 refuses to boot on an unresolvable provider credential (BUSBAR-9007).
+        .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -801,29 +828,33 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
     );
 }
 
-/// THE DURABILITY PROOF FOR THE TEN TASK / CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+/// Encode a stand-in plane row as the opaque `PlaneRecord::body` the planes send (`serde_json`).
+/// The store never decodes it; these tests do, to prove it came back verbatim.
+fn body(v: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&v).unwrap()
+}
+
+fn decode(b: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(b).expect("a body the store returned must be the body it was given")
+}
+
+/// THE DURABILITY PROOF FOR THE PLANE-RECORD VERBS, OVER THE REAL PLUGIN PATH.
 ///
-/// Every other test of these methods in this repo calls `SqliteStore` DIRECTLY, in-process, and none
-/// of them can see the failure that actually matters in production. `busbar_api::Store` DEFAULTS all
-/// ten of `put_task`/`get_task`/`list_tasks`/`purge_tasks_before`/`append_task_event`/
-/// `list_task_events`/`append_mcp_call`/`list_mcp_calls`/`list_mcp_call_principals`/
-/// `purge_mcp_calls_before` to accept-and-keep-nothing, so a plugin seam that does not RELAY them
+/// busbar 1.6.0 carries every durable plane record — an A2A task and its provenance chain, the MCP
+/// per-call log — through eight kind-tagged verbs (`upsert_plane_record`, `append_plane_record`,
+/// `list_plane_records`, `list_plane_record_parents`, `purge_plane_records_before`, …), all of which
+/// `busbar_api::Store` DEFAULTS to accept-and-keep-nothing. A plugin seam that does not RELAY them
 /// silently substitutes those defaults: every write returns `Ok`, every read answers empty, and a
 /// deployment running this backend as a plugin — which is the ONLY way it ever runs — loses every
-/// in-flight A2A task and every tool-call record while reporting success.
+/// in-flight task and every tool-call record while reporting success. Tests of `SqliteStore` called
+/// directly, in-process, cannot see that.
 ///
-/// So this test goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the packed
-/// cdylib, the real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three tasks across two
-/// states, three events on one task and one on another, three call records for one principal and
-/// one for a second), DROPS the handle — which unloads the library — then `dlopen`s AGAIN over the
-/// same file and reads everything back. A single-row round trip would not distinguish a relayed
-/// method from a lucky default; a multi-row one over a restart cannot be faked by either.
-///
-/// EXPECT THIS TEST TO BE RED until the engine-side ABI relay for these ten methods is on the
-/// busbar ref this repo builds against (`busbar-plugin-abi`'s `StoreRequest`/`StoreResponse`
-/// variants, the SDK dispatch and the `DynStore` overrides). THAT IS THE POINT: red here is the
-/// truthful report that durable tasks do not yet work through the only path that ships, and the
-/// alternative — no coverage at all — is how the seam stayed silently broken.
+/// So this test goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the cdylib, the
+/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three tasks across two states, three
+/// events on one task and one on another, three call records for one principal and one for a
+/// second), DROPS the handle — which unloads the library — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A single-row round trip would not distinguish a relayed verb from a
+/// lucky default; a multi-row one over a restart cannot be faked by either.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -831,73 +862,86 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     let db_path = scratch.join("tasks.db");
     let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
 
-    let task = |id: &str, state: &str, updated_at: u64| TaskRow {
-        task_id: id.to_string(),
-        context_id: format!("ctx-{id}"),
-        principal: "vk_abi".to_string(),
-        direction: "inbound".to_string(),
-        state: state.to_string(),
-        agent_id: "planner".to_string(),
-        artifact_cursor: 7,
-        push_callback: "https://example.test/push".to_string(),
-        created_at: 1_000,
-        updated_at,
+    let task = |id: &str, state: &str, updated_at: u64, terminal: bool| PlaneRecord {
+        kind: "task".into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts: updated_at,
+        disposition: if terminal {
+            PlaneDisposition::Terminal
+        } else {
+            PlaneDisposition::Active
+        },
+        body: body(serde_json::json!({
+            "task_id": id, "context_id": format!("ctx-{id}"), "principal": "vk_abi",
+            "direction": "inbound", "state": state, "agent_id": "planner", "artifact_cursor": 7,
+            "push_callback": "https://example.test/push", "created_at": 1_000, "updated_at": updated_at,
+        })),
     };
-    let event = |task_id: &str, seq: u64, prev: &str, hash: &str| TaskEventRow {
-        task_id: task_id.to_string(),
+    let event = |task_id: &str, seq: u64, prev: &str, hash: &str| PlaneRecord {
+        kind: "task_event".into(),
+        id: task_id.into(),
+        parent: Some(task_id.into()),
         seq,
         ts: 1_000 + seq,
-        kind: "task.working".to_string(),
-        context_id: format!("ctx-{task_id}"),
-        principal: "vk_abi".to_string(),
-        agent_id: "planner".to_string(),
-        state: "working".to_string(),
-        request_id: format!("req-{seq}"),
-        prev_hash: prev.to_string(),
-        hash: hash.to_string(),
+        disposition: PlaneDisposition::Active,
+        body: body(serde_json::json!({
+            "task_id": task_id, "seq": seq, "ts": 1_000 + seq, "kind": "task.working",
+            "context_id": format!("ctx-{task_id}"), "principal": "vk_abi", "agent_id": "planner",
+            "state": "working", "request_id": format!("req-{seq}"), "prev_hash": prev, "hash": hash,
+        })),
     };
-    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
-        principal: principal.to_string(),
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| PlaneRecord {
+        kind: "call".into(),
+        id: principal.into(),
+        parent: Some(principal.into()),
         seq,
         ts: 2_000 + seq,
-        server: "srv".to_string(),
-        tool: "srv_read_file".to_string(),
-        outcome: "dispatched".to_string(),
-        reason: String::new(),
-        tool_digest: format!("sha256:tool{seq}"),
-        pin_generation: 3,
-        request_id: format!("req-{seq}"),
-        prev_hash: prev.to_string(),
-        hash: hash.to_string(),
+        disposition: PlaneDisposition::Active,
+        body: body(serde_json::json!({
+            "seq": seq, "prev_hash": prev, "hash": hash,
+            "content": format!("sha256:tool{seq}|req-{seq}"),
+        })),
     };
+    let parent = |p: &str| PlaneSelector::Parent(p.to_string());
 
     {
         // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the sqlite plugin must load over the real ABI");
-        for (id, state, updated) in [
-            ("t_alpha", "working", 10_u64),
-            ("t_beta", "input-required", 20),
-            ("t_gamma", "completed", 30),
+        for (id, state, updated, terminal) in [
+            ("t_alpha", "working", 10_u64, false),
+            ("t_beta", "input-required", 20, false),
+            ("t_gamma", "completed", 30, true),
         ] {
-            store.put_task(&task(id, state, updated)).expect("put_task");
+            store
+                .upsert_plane_record(&task(id, state, updated, terminal))
+                .expect("upsert_plane_record");
         }
         for (seq, prev, hash) in [(1_u64, "", "e1"), (2, "e1", "e2"), (3, "e2", "e3")] {
             store
-                .append_task_event(&event("t_alpha", seq, prev, hash))
-                .expect("append_task_event");
+                .append_plane_record(&event("t_alpha", seq, prev, hash))
+                .expect("append_plane_record");
         }
         store
-            .append_task_event(&event("t_beta", 1, "", "b1"))
-            .expect("append_task_event");
+            .append_plane_record(&event("t_beta", 1, "", "b1"))
+            .expect("append_plane_record");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_mcp_call(&call("vk_abi", seq, prev, hash))
-                .expect("append_mcp_call");
+                .append_plane_record(&call("vk_abi", seq, prev, hash))
+                .expect("append_plane_record");
         }
         store
-            .append_mcp_call(&call("vk_other", 1, "", "o1"))
-            .expect("append_mcp_call");
+            .append_plane_record(&call("vk_other", 1, "", "o1"))
+            .expect("append_plane_record");
+        // A fork crosses the ABI as an error, not as the default's silent Ok.
+        assert!(
+            store
+                .append_plane_record(&call("vk_other", 1, "", "FORK"))
+                .is_err(),
+            "a different record at an occupied chain position must be refused over the ABI too"
+        );
         // Dropping the boxed store drops the loader's `Library` handle: the dylib is UNLOADED, so
         // nothing this process still holds can be answering the reads below.
         drop(store);
@@ -907,7 +951,9 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     let store = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("the sqlite plugin must load again over the real ABI");
 
-    let tasks = store.list_tasks().expect("list_tasks");
+    let tasks = store
+        .list_plane_records("task", &PlaneSelector::All)
+        .expect("list_plane_records");
     assert_eq!(
         tasks.len(),
         3,
@@ -915,64 +961,77 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
          the accept-and-keep-nothing shape of the trait default that an unrelayed seam substitutes",
         tasks.len()
     );
-    let beta = store
-        .get_task("t_beta")
-        .expect("get_task")
-        .expect("the interrupted task must be readable by id after a reload");
-    assert_eq!(beta.state, "input-required");
+    let beta = decode(
+        &store
+            .get_plane_record("task", "t_beta")
+            .expect("get_plane_record")
+            .expect("the interrupted task must be readable by id after a reload"),
+    );
+    assert_eq!(beta["state"], "input-required");
     assert_eq!(
-        beta.artifact_cursor, 7,
+        beta["artifact_cursor"], 7,
         "the artifact cursor must round-trip"
     );
-    assert_eq!(beta.push_callback, "https://example.test/push");
-    assert_eq!(beta.context_id, "ctx-t_beta");
+    assert_eq!(beta["push_callback"], "https://example.test/push");
+    assert_eq!(beta["context_id"], "ctx-t_beta");
 
-    let events = store.list_task_events("t_alpha").expect("list_task_events");
+    let events: Vec<serde_json::Value> = store
+        .list_plane_records("task_event", &parent("t_alpha"))
+        .expect("list_plane_records")
+        .iter()
+        .map(|b| decode(b))
+        .collect();
     assert_eq!(
-        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "the per-task provenance chain must come back oldest-first and complete"
     );
     for w in events.windows(2) {
         assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
-             persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+            w[1]["prev_hash"], w[0]["hash"],
+            "the chain must still link after the reload"
         );
     }
     assert_eq!(
         store
-            .list_task_events("t_beta")
-            .expect("list_task_events")
+            .list_plane_records("task_event", &parent("t_beta"))
+            .expect("list_plane_records")
             .len(),
         1,
         "one task's events must not leak into another's chain"
     );
 
-    let calls = store.list_mcp_calls("vk_abi").expect("list_mcp_calls");
+    let calls: Vec<serde_json::Value> = store
+        .list_plane_records("call", &parent("vk_abi"))
+        .expect("list_plane_records")
+        .iter()
+        .map(|b| decode(b))
+        .collect();
     assert_eq!(
-        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        calls
+            .iter()
+            .map(|c| c["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "the per-principal call chain must survive the reload in chain order"
     );
-    assert_eq!(calls[2].tool_digest, "sha256:tool3");
-    assert_eq!(calls[2].request_id, "req-3");
-    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(calls[2]["content"], "sha256:tool3|req-3");
+    assert_eq!(
+        decode(
+            &store
+                .list_plane_records("call", &parent("vk_other"))
+                .expect("list_plane_records")[0]
+        )["hash"],
+        "o1",
+        "one principal's chain must not carry another's records, and a refused fork wrote nothing"
+    );
     assert_eq!(
         store
-            .list_mcp_calls("vk_other")
-            .expect("list_mcp_calls")
-            .len(),
-        1,
-        "one principal's chain must not carry another's records"
-    );
-    let mut principals = store
-        .list_mcp_call_principals()
-        .expect("list_mcp_call_principals");
-    principals.sort();
-    assert_eq!(
-        principals,
+            .list_plane_record_parents("call")
+            .expect("list_plane_record_parents"),
         vec!["vk_abi".to_string(), "vk_other".to_string()],
         "the boot enumeration must name every principal holding records, exactly once each"
     );
@@ -980,51 +1039,60 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     // Retention crosses the ABI too, count and all — and both purges are checked for the number
     // they ACTUALLY removed, because a relay that dropped the return value would read as 0.
     assert_eq!(
-        store.purge_mcp_calls_before(2_002).expect("purge"),
+        store
+            .purge_plane_records_before("call", 2_002)
+            .expect("purge"),
         2,
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
     );
     assert_eq!(
         store
-            .list_mcp_calls("vk_abi")
-            .expect("list_mcp_calls")
+            .list_plane_records("call", &parent("vk_abi"))
+            .expect("list_plane_records")
             .len(),
         2
     );
     assert!(store
-        .list_mcp_calls("vk_other")
-        .expect("list_mcp_calls")
+        .list_plane_records("call", &parent("vk_other"))
+        .expect("list_plane_records")
         .is_empty());
     assert_eq!(
-        store.purge_tasks_before(25).expect("purge"),
+        store
+            .purge_plane_records_before("task", 25)
+            .expect("purge"),
         0,
         "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
          swept no matter how old"
     );
     assert_eq!(
-        store.purge_tasks_before(31).expect("purge"),
+        store.purge_plane_records_before("task", 31).expect("purge"),
         1,
         "the one completed task at updated_at 30 is the only row retention may drop"
     );
-    assert_eq!(store.list_tasks().expect("list_tasks").len(), 2);
+    assert_eq!(
+        store
+            .list_plane_records("task", &PlaneSelector::All)
+            .expect("list_plane_records")
+            .len(),
+        2
+    );
 }
 
-/// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
+/// THE DURABILITY PROOF FOR THE TRUST STATE, OVER THE REAL PLUGIN PATH.
 ///
 /// Same reasoning as the task/call-log test above, and a sharper cost. `busbar_api::Store` defaults
-/// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
-/// `redeem_ask_state` to `Ok(true)` — "this call is the first redemption" — so a seam that does not
-/// RELAY them substitutes exactly two security failures, both of them silent and both green:
+/// the plane verbs to accept-and-keep-nothing, `redeem_plane_token` to `false` and
+/// `plane_token_live` to `false`, so a seam that does not RELAY them substitutes silent failures:
 ///
 ///   * a demotion is written, reported successful and DISCARDED, so a restart hands a quarantined
-///     upstream the operator's approval back; and
-///   * every redeemer of one single-use approval is told it is the first, so the confirm-once tool
-///     an operator gated because it moves money executes once per node and once per restart.
+///     upstream the operator's approval back;
+///   * every single-use approval is refused — or, on a relay that answered its own `true`, every
+///     redeemer is told it is the first, so the confirm-once tool executes once per node; and
+///   * every push callback is refused, or a finished task's token keeps working.
 ///
-/// This backend only ever runs as a plugin, so in-process tests against `SqliteStore` cannot see
-/// either. This one goes through `busbar_plugin_loader::load_store`: a real `dlopen`, the real C
-/// ABI, the real `DynStore`. TWO CONCURRENT LOADS of one file are the fleet — the ledger has to
-/// refuse the second node — and a drop-and-reload is the restart.
+/// This goes through `busbar_plugin_loader::load_store`: a real `dlopen`, the real C ABI, the real
+/// `DynStore`. TWO CONCURRENT LOADS of one file are the fleet — the ledger has to refuse the second
+/// node — and a drop-and-reload is the restart.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1032,10 +1100,23 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let db_path = scratch.join("trust.db");
     let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
 
-    let demotion = |server: &str, reason: &str, at: u64| McpDemotionRow {
-        server: server.to_string(),
-        reason: reason.to_string(),
-        recorded_at: at,
+    let demotion = |server: &str, reason: &str, at: u64| PlaneRecord {
+        kind: "demotion".into(),
+        id: server.into(),
+        parent: None,
+        seq: 0,
+        ts: at,
+        disposition: PlaneDisposition::Active,
+        body: body(serde_json::json!({ "server": server, "reason": reason, "recorded_at": at })),
+    };
+    let push = |disposition| PlaneRecord {
+        kind: "push_config".into(),
+        id: "cb-token".into(),
+        parent: None,
+        seq: 0,
+        ts: 1,
+        disposition,
+        body: body(serde_json::json!({ "url": "https://example.test/cb" })),
     };
     let now = 1_700_000_000u64;
 
@@ -1043,26 +1124,28 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         // BOOT 1 — a real dlopen; every call below crosses the C ABI.
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the sqlite plugin must load over the real ABI");
+        for (server, reason, at) in [
+            ("payments", "tool-drift", now),
+            // The upsert path crosses the ABI too.
+            ("payments", "digest-mismatch", now + 10),
+            ("search", "tool-drift", now + 20),
+            ("mail", "tool-drift", now + 30),
+        ] {
+            store
+                .upsert_plane_record(&demotion(server, reason, at))
+                .expect("upsert_plane_record");
+        }
         store
-            .put_mcp_demotion(&demotion("payments", "tool-drift", now))
-            .expect("put_mcp_demotion");
-        store
-            .put_mcp_demotion(&demotion("payments", "digest-mismatch", now + 10))
-            .expect("the upsert path crosses the ABI too");
-        store
-            .put_mcp_demotion(&demotion("search", "tool-drift", now + 20))
-            .expect("put_mcp_demotion");
-        store
-            .put_mcp_demotion(&demotion("mail", "tool-drift", now + 30))
-            .expect("put_mcp_demotion");
-        store
-            .clear_mcp_demotion("mail")
+            .delete_plane_record("demotion", "mail")
             .expect("a later agreeing observation clears the quarantine");
+        store
+            .upsert_plane_record(&push(PlaneDisposition::Active))
+            .expect("upsert_plane_record");
 
         assert!(
             store
-                .redeem_ask_state("nonce-abi", now + 900, now)
-                .expect("redeem_ask_state"),
+                .redeem_plane_token("approval", "nonce-abi", now + 900, now)
+                .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
         drop(store);
@@ -1073,27 +1156,48 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let store = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("the sqlite plugin must load again over the real ABI");
 
-    let mut rows = store.list_mcp_demotions().expect("list_mcp_demotions");
-    rows.sort_by(|a, b| a.server.cmp(&b.server));
+    let mut rows: Vec<serde_json::Value> = store
+        .list_plane_records("demotion", &PlaneSelector::All)
+        .expect("list_plane_records")
+        .iter()
+        .map(|b| decode(b))
+        .collect();
+    rows.sort_by(|a, b| a["server"].as_str().cmp(&b["server"].as_str()));
     assert_eq!(
         rows,
         vec![
-            demotion("payments", "digest-mismatch", now + 10),
-            demotion("search", "tool-drift", now + 20),
+            serde_json::json!({ "server": "payments", "reason": "digest-mismatch", "recorded_at": now + 10 }),
+            serde_json::json!({ "server": "search", "reason": "tool-drift", "recorded_at": now + 20 }),
         ],
         "the boot read must put every recorded quarantine back in force before the first request is \
          served — upserted to the LATEST reason, and without the one a later observation cleared. \
-         An empty answer here is the trait default an unrelayed seam substitutes, and it means a \
-         restart hands a demoted upstream the operator's approval back"
+         An empty answer here is the trait default an unrelayed seam substitutes"
     );
 
     assert!(
         !store
-            .redeem_ask_state("nonce-abi", now + 900, now + 1)
-            .expect("redeem_ask_state"),
-        "a restart handed a spent approval back over the plugin ABI. The approval has not lapsed — \
-         outliving a restart is the point of it — so the only thing that changed is that the \
-         process which recorded the redemption is gone"
+            .redeem_plane_token("approval", "nonce-abi", now + 900, now + 1)
+            .expect("redeem_plane_token"),
+        "a restart handed a spent approval back over the plugin ABI"
+    );
+
+    // The multi-use callback capability: live across the reload, spends nothing, dies with its task.
+    for _ in 0..2 {
+        assert!(
+            store
+                .plane_token_live("push_config", "cb-token", now + 900, now)
+                .expect("plane_token_live"),
+            "a live callback token must answer live over the ABI, every time it is asked"
+        );
+    }
+    store
+        .upsert_plane_record(&push(PlaneDisposition::Terminal))
+        .expect("upsert_plane_record");
+    assert!(
+        !store
+            .plane_token_live("push_config", "cb-token", now + 900, now)
+            .expect("plane_token_live"),
+        "the write that made the task terminal must revoke its callback token"
     );
 
     // THE FLEET. A second, simultaneous dlopen of the same cdylib over the same file is what a
@@ -1103,14 +1207,14 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .expect("a second node loads the same plugin against the same store");
     assert!(
         store
-            .redeem_ask_state("nonce-fleet", now + 900, now + 2)
-            .expect("redeem_ask_state"),
+            .redeem_plane_token("approval", "nonce-fleet", now + 900, now + 2)
+            .expect("redeem_plane_token"),
         "node A's first redemption of a fresh approval must proceed"
     );
     assert!(
         !node_b
-            .redeem_ask_state("nonce-fleet", now + 900, now + 3)
-            .expect("redeem_ask_state"),
+            .redeem_plane_token("approval", "nonce-fleet", now + 900, now + 3)
+            .expect("redeem_plane_token"),
         "a second node redeemed an approval the first already spent, which is one operator \
          confirmation executing once per node"
     );
@@ -1118,8 +1222,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // deleted the feature.
     assert!(
         node_b
-            .redeem_ask_state("nonce-distinct", now + 900, now + 4)
-            .expect("redeem_ask_state"),
+            .redeem_plane_token("approval", "nonce-distinct", now + 900, now + 4)
+            .expect("redeem_plane_token"),
         "a freshly minted approval is not the one that was spent; refusing it would make the shared \
          ledger a blanket refusal of every confirmation after the first"
     );

@@ -9,14 +9,16 @@ description = "The SQLite backend for busbar's durable governance store: impleme
 license = "Apache-2.0"
 
 [dependencies]
-# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
+# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
+# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
 # dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-sqlite-plugin.
 busbar-api = { path = "../../busbar/crates/api" }
 # `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all —
-# same as the busbarAI in-tree crate this was extracted from.
+# same as the busbar in-tree crate this was extracted from.
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde_json = "1"
+# `derive` for the v10 migration's legacy row encoders (and the conformance suite's stand-in bodies).
+serde = { version = "1", features = ["derive"] }
 
 # NO DEV-DEPENDENCIES. The `Store` contract conformance suite used to arrive here as
 # `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a

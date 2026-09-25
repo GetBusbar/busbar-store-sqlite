@@ -8,9 +8,10 @@
 //! Depends only on the `busbar-api` contract (plus rusqlite), never on the engine.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
-    MeteringRow, ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow,
-    TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
+    PlaneDisposition, PlaneRecord, PlaneSelector, ScopeRef, SecretForm, Store, StoreError,
+    StoreResult, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
+    UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +47,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// v6: the FIRST real, additive (non-destructive) migration this store has ever needed — a
 /// one-time backfill of `billable_requests` for any row where a v5-era write left it at 0 despite
 /// a nonzero `requests` (see the `version < 6` block in `migrate`, and
-/// `governance::state::hydrate_budgets` in busbarAI core for the boot-time bug this closes).
+/// `governance::state::hydrate_budgets` in busbar core for the boot-time bug this closes).
 ///
 /// v7: the durable MCP TOOL-CALL LOG (`mcp_calls`). PURELY ADDITIVE and needs no backfill block —
 /// the table is new, so `SCHEMA`'s own `CREATE TABLE IF NOT EXISTS` (executed unconditionally on
@@ -61,10 +62,35 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// upstream that drifted from what the operator approved, and the ledger that makes a single-use
 /// human approval single-use across a restart and across a fleet. Additive on the same terms as v7
 /// and v8 — two new tables, no backfill, nothing dropped — so there is no `version < 9` arm either.
-const SCHEMA_VERSION: i64 = 9;
+///
+/// v10 (busbar 1.6.0): the store contract replaced its fourteen protocol-named methods
+/// (`put_task`, `append_mcp_call`, `redeem_ask_state`, …) with eight KIND-TAGGED verbs over an opaque
+/// `PlaneRecord` envelope, and three record shapes grew. The crossing is FORWARD-ONLY and keeps every
+/// byte an operator already has:
+/// - `plane_records` / `plane_tokens` are the new neutral tables every kind lives in (additive).
+/// - the v8/v9 typed tables (`tasks`, `task_events`, `mcp_demotions`, `spent_ask_states`) are COPIED
+///   into them as the exact bodies the 1.6.0 planes decode, then dropped — see
+///   `migrate_legacy_plane_tables`. `mcp_calls` is the one exception: the 1.6.0 call body is a
+///   framed digest stream the engine seals and no backend can reconstruct, so its rows are LEFT IN
+///   PLACE, unread, rather than destroyed or forged (busbar ships no `call` migration either).
+/// - `keys` gains `scope_grants` (the non-pool scope kinds, which the pool-only column used to
+///   silently turn into POOL grants), `idp_subject`, `binding_mode` and `minted_by` — nullable
+///   `ADD COLUMN`s, so every existing row reads back exactly as before.
+/// - `usage_metering` gains `priced_from_ms` INTO ITS PRIMARY KEY (a rate-card edit splits the day's
+///   cell), which SQLite can only do by rebuilding the table: every existing row is copied across at
+///   `priced_from_ms = 0`, the opening card's instant, which is the reading the contract gives an
+///   undated row.
+/// - the open (non-reserved) usage units of both ledgers get their own tables
+///   (`usage_window_units`, `usage_metering_units`); the reserved four stay in the columns they
+///   always lived in, so no existing count moves.
+///
+/// Versions 7-9 were never released (the last release, v1.0.6, is schema v6), but a dev database at
+/// any of them upgrades the same way; `tests/fixtures/` pins both a real v6 and a real v9 file.
+const SCHEMA_VERSION: i64 = 10;
 
-/// The task states that are TERMINAL, and therefore the only ones retention may drop. Named as a
-/// closed set rather than derived by negation on purpose: an unrecognised state token — one a newer
+/// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
+/// sidecar on a task row copied out of the legacy typed `tasks` table (a live 1.6.0 engine sets it
+/// itself on every write). Named as a closed set rather than derived by negation on purpose: an unrecognised state token — one a newer
 /// engine emits and this build has never heard of — must read as NOT terminal, so a store compiled
 /// before a state existed cannot delete a task it does not understand. The wrong half to guess on is
 /// the deleting half.
@@ -184,9 +210,38 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     tokens_output      INTEGER NOT NULL DEFAULT 0,
     tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
     tokens_cache_write INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model)
+    -- The instant the price this cell accrued under started (v10). Part of the key: a rate-card edit
+    -- mid-day SPLITS the day's cell so each half prices at the card it was earned under. 0 = the
+    -- opening card, which is what every pre-v10 row reads as.
+    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS um_key_bucket_idx ON usage_metering (key_id, bucket);
+
+-- The OPEN usage units (v10): every ledgered class the four reserved token columns do not hold, by
+-- name (a plane's `tool_calls`, a rerank's search units, a session count, ...). One row per unit so
+-- an accrual is an atomic `count = count + delta` UPSERT exactly like the columns, rather than a
+-- read-modify-write of a JSON blob. The reserved four never appear here: they stay in the columns
+-- they have always lived in.
+CREATE TABLE IF NOT EXISTS usage_window_units (
+    window_start INTEGER NOT NULL,
+    bucket_id    TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    unit         TEXT NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (window_start, bucket_id, model, unit)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS usage_metering_units (
+    bucket         TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    unit           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, unit)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS audit_log (
     seq       INTEGER PRIMARY KEY,
@@ -200,132 +255,45 @@ CREATE TABLE IF NOT EXISTS audit_log (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS audit_resource_seq_idx ON audit_log (resource, seq);
 
--- The DURABLE MCP TOOL-CALL LOG. A DIFFERENT POPULATION from audit_log, kept in its own table on
--- purpose: audit_log is the low-rate admin MUTATION log whose engine-side working set is a bounded
--- ring, while a tool call is data-plane traffic at request rate. Pouring one into the other means a
--- busy afternoon of tool calls evicts every admin row from the ring, so the question of who changed
--- a registration becomes unanswerable exactly when an incident makes somebody ask.
+-- THE NEUTRAL PLANE-RECORD TABLE (v10). Every durable record a plane keeps -- an A2A task and its
+-- provenance chain, the MCP per-call log, a demotion, a push-callback config, and any kind a future
+-- plane declares -- is one row here, tagged by `kind`. The store never decodes `body`: it is the
+-- plane's own serialized row, persisted and returned verbatim. Everything the store has to key,
+-- order or sweep on is a TYPED sidecar column instead, which is what lets retention honour a
+-- per-kind contract without reading the body.
 --
--- The chain is scoped to the PRINCIPAL, which is why (principal, seq) is the primary key and not a
--- global counter: a global chain would serialise every caller's tool calls behind one append, and
--- would make one caller's evidence unverifiable without possessing every other caller's rows.
---
--- SHAPE: opaque `body` + only the columns a query actually needs. `principal` and `ts` are the index
--- columns (scoped read, and the retention sweep's age key). The CHAIN COLUMNS -- seq, prev_hash,
--- hash -- are REAL columns rather than being buried in `body`, because the engine establishes
--- durability by READING THE CHAIN BACK and verifying it; a digest reachable only by decoding an
--- opaque blob forces a deserialise per verify and cannot be constrained or indexed by the database.
--- `body` carries exactly the fields no query filters on. The store NEVER computes or recomputes a
--- digest -- it persists what it was handed, verbatim, and returns it verbatim.
-CREATE TABLE IF NOT EXISTS mcp_calls (
-    principal  TEXT NOT NULL,
-    seq        INTEGER NOT NULL,
-    ts         INTEGER NOT NULL,
-    prev_hash  TEXT NOT NULL,
-    hash       TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    -- Carried now, written by nothing yet, and that is deliberate: adding a column to a populated
-    -- table later is a rewrite, whereas carrying it from the first migration is free. `version` is
-    -- the compare-and-swap slot an optimistic-concurrency write would test; `expires_at` is the
-    -- per-row sweep deadline. Retention today goes by `ts` (see purge_mcp_calls_before).
-    expires_at INTEGER,
-    version    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (principal, seq)
-) STRICT;
--- The retention sweep's access path: purge_mcp_calls_before deletes by `ts` across every principal.
-CREATE INDEX IF NOT EXISTS mcp_calls_ts_idx ON mcp_calls (ts);
+-- IDENTITY. `identity` is the record's `parent` when it has one (an appended chain position is
+-- `(kind, parent, seq)`), else its own `id` at `seq` 0 (an upserted top-level record). `id` and
+-- `parent` are kept verbatim beside it so nothing is lost in the keying.
+CREATE TABLE IF NOT EXISTS plane_records (
+    kind        TEXT NOT NULL,
+    identity    TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    id          TEXT NOT NULL,
+    parent      TEXT,
+    ts          INTEGER NOT NULL,
+    disposition TEXT NOT NULL,
+    body        BLOB NOT NULL,
+    CONSTRAINT plane_disposition CHECK (disposition IN ('active','terminal')),
+    PRIMARY KEY (kind, identity, seq)
+) STRICT, WITHOUT ROWID;
+-- The retention sweep's access path (`purge_plane_records_before` filters on kind + ts), and the
+-- parent enumeration's (`list_plane_record_parents`) and a parent's scan's.
+CREATE INDEX IF NOT EXISTS plane_records_kind_ts_idx ON plane_records (kind, ts);
+CREATE INDEX IF NOT EXISTS plane_records_kind_parent_idx ON plane_records (kind, parent, seq);
 
--- THE DURABLE A2A TASK STORE. An A2A task spans turns, can sit interrupted waiting on a human, and
--- can outlive the process that started it, so an in-memory task table loses every in-flight task on
--- restart -- the difference between a resume that is real and one that is nominal.
---
--- SHAPE: every field is a REAL COLUMN, unlike mcp_calls's opaque `body`, and the difference is not
--- inconsistency. A call record carries open-ended narration that no query ever filters on, so it
--- pays for a blob and saves the columns. A task row is a small fixed state record where every field
--- is part of what a resume reads back, `state` and `updated_at` are the retention sweep's own
--- predicates, and there is no field left over to make opaque. A blob here would buy a deserialise
--- per read and nothing else.
-CREATE TABLE IF NOT EXISTS tasks (
-    task_id         TEXT NOT NULL PRIMARY KEY,
-    context_id      TEXT NOT NULL,
-    principal       TEXT NOT NULL,
-    direction       TEXT NOT NULL,
-    state           TEXT NOT NULL,
-    agent_id        TEXT NOT NULL,
-    artifact_cursor INTEGER NOT NULL,
-    push_callback   TEXT NOT NULL,
-    created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL
-) STRICT;
--- The retention sweep's access path (purge_tasks_before filters on state + updated_at), and the
--- boot rehydrate's (which reads every row and partitions on state).
-CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks (state, updated_at);
-
--- PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
--- tasks are concurrent and long-lived: a global chain would serialise every task transition behind
--- one append and would make one task's provenance unverifiable without possessing every other
--- tenant's events.
---
--- The chain columns -- seq, prev_hash, hash -- are REAL columns for the same reason they are in
--- mcp_calls: the engine establishes durability by reading the chain back and verifying it, and a
--- digest reachable only by decoding a blob can be neither constrained nor indexed. This store NEVER
--- computes or recomputes a digest; it persists what it was handed and returns it verbatim.
---
--- The cascade on task deletion is load-bearing: `purge_tasks_before` is the ONLY retention method
--- the contract gives this data, so a purge that left the events behind would leave `task_events`
--- with no bound anywhere in the trait. It is a TRIGGER rather than a foreign key, deliberately. A
--- real FK would also impose an ORDER on the writes -- no event could be appended before its task row
--- existed -- and the engine is under no such obligation: a `task.submitted` event and the first
--- `put_task` are two independent write-throughs. A trigger gives the cascade without inventing an
--- ordering constraint the contract never stated, and unlike `foreign_keys` it is not a per-connection
--- pragma that defaults OFF in the sqlite3 CLI.
-CREATE TABLE IF NOT EXISTS task_events (
-    task_id    TEXT NOT NULL,
-    seq        INTEGER NOT NULL,
-    ts         INTEGER NOT NULL,
+-- THE SINGLE-USE TOKEN LEDGER (v10), for every kind (`ask` is the MCP confirm-once approval). A
+-- sealed single-use grant is byte-identical on its second presentation, so only a RECORD THAT THE
+-- FIRST HAPPENED tells them apart -- and one shared by every node of the deployment, not held in one
+-- process's memory. Every read is a point lookup on the key (the INSERT's own conflict check), and
+-- the only scan is the eviction sweep, bounded by one validity window: an entry recording a grant
+-- that can no longer be presented protects nothing.
+CREATE TABLE IF NOT EXISTS plane_tokens (
     kind       TEXT NOT NULL,
-    context_id TEXT NOT NULL,
-    principal  TEXT NOT NULL,
-    agent_id   TEXT NOT NULL,
-    state      TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    prev_hash  TEXT NOT NULL,
-    hash       TEXT NOT NULL,
-    PRIMARY KEY (task_id, seq)
-) STRICT;
-
--- THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it is
--- currently serving disagrees with what the operator approved. That decision is derived in memory
--- from a LIVE OBSERVATION, and a process that has taken no observation has nothing to derive it
--- from -- a server nobody has looked at serves against the digest the operator wrote down, which is
--- the declarative-approval behaviour every deployment without a live refresh depends on. Those two
--- facts together are why this table exists: without it a restart hands a quarantined upstream its
--- approval back until the next unattended sweep looks again.
---
--- ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
--- demotion of one server replaces the row rather than standing a rival one beside it. Carries no
--- secret: `reason` is an engine-chosen word for an operator to read, never caller text.
-CREATE TABLE IF NOT EXISTS mcp_demotions (
-    server      TEXT NOT NULL PRIMARY KEY,
-    reason      TEXT NOT NULL,
-    recorded_at INTEGER NOT NULL
-) STRICT;
-
--- THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once tool
--- execute once, and the seal itself cannot carry that property: the second presentation of a
--- redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD THAT THE
--- FIRST HAPPENED tells them apart, and in process memory that record dies with the process and is
--- never shared with a second node -- while two nodes of one deployment share the signing key, and
--- therefore share the seal. Here it is one ledger for the whole deployment.
---
--- No index beyond the primary key, and none is wanted: every read is a point lookup on `nonce` (the
--- INSERT's own conflict check), and the only scan is the eviction sweep, which visits a table
--- bounded by one approval-validity window. `expires_at` is what that sweep goes by -- an entry
--- recording an approval that can no longer be opened protects nothing.
-CREATE TABLE IF NOT EXISTS spent_ask_states (
-    nonce      TEXT NOT NULL PRIMARY KEY,
-    expires_at INTEGER NOT NULL
-) STRICT;
+    token      TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, token)
+) STRICT, WITHOUT ROWID;
 
 -- Pragma-independent integrity triggers: survive an operator opening the file with the sqlite3 CLI
 -- (where foreign_keys defaults OFF) or a build with SQLITE_OMIT_FOREIGN_KEY.
@@ -338,18 +306,15 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
--- mcp_calls is append-only in the sense that MATTERS: a persisted record is never REWRITTEN, so a
--- stored digest can never be quietly restated. There is deliberately NO no-delete counterpart (as
--- audit_log has), because this table has a retention sweep and a blanket delete guard would make
--- purge_mcp_calls_before impossible to honour -- bounded retention and never-rewritten are
--- different properties, and only the second one is an integrity claim.
-CREATE TRIGGER IF NOT EXISTS mcp_calls_no_update BEFORE UPDATE ON mcp_calls
-  BEGIN SELECT RAISE(ABORT, 'mcp_calls is append-only; a persisted call record is never rewritten'); END;
--- task_events follows its task out of the database. There is deliberately no no-update trigger to
--- match mcp_calls's: the task-event contract says a store MUST UPSERT on (task_id, seq) -- a
--- write-through is idempotent on replay -- so forbidding the rewrite here would forbid the contract.
-CREATE TRIGGER IF NOT EXISTS tasks_cascade_events AFTER DELETE ON tasks FOR EACH ROW
-  BEGIN DELETE FROM task_events WHERE task_id = OLD.task_id; END;
+-- An APPENDED chain position (a row with a parent: a task event, a call record) is never REWRITTEN,
+-- so a stored digest can never be quietly restated -- the append verb refuses a different record at
+-- an occupied position, and this makes the same true for anything that opens the file directly.
+-- There is deliberately NO no-delete counterpart (as audit_log has): these rows have a retention
+-- sweep, and bounded retention and never-rewritten are different properties -- only the second one
+-- is an integrity claim. Upserted top-level records (parent NULL) are updated in place by design.
+CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plane_records
+  WHEN OLD.parent IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ";
 
 /// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
@@ -598,6 +563,15 @@ impl SqliteStore {
                 .store()?;
             }
         }
+        // v10: `usage_metering` gains `priced_from_ms` in its PRIMARY KEY. Keyed on the column's
+        // absence rather than on `version` so a re-run after any partial state is a no-op, and run
+        // BEFORE `SCHEMA` so the `CREATE TABLE IF NOT EXISTS` below finds the rebuilt table and the
+        // index/trigger `SCHEMA` (re)creates land on it.
+        if table_exists(&tx, "usage_metering")?
+            && !column_exists(&tx, "usage_metering", "priced_from_ms")?
+        {
+            rebuild_usage_metering_for_v10(&tx)?;
+        }
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
             "INSERT INTO store_revision (id, revision) VALUES (0, 0) ON CONFLICT(id) DO NOTHING",
@@ -605,7 +579,7 @@ impl SqliteStore {
         )
         .store()?;
         // v5 -> v6, ONE-TIME durable backfill (never repeated, gated on the version crossing —
-        // see governance::state::hydrate_budgets in busbarAI core for the bug this closes). A
+        // see governance::state::hydrate_budgets in busbar core for the bug this closes). A
         // pre-v6 row can have `billable_requests=0` for either of two reasons that look
         // IDENTICAL in the data: (a) it was written by v5 code that never split billable_requests
         // out from requests (a real legacy gap — v5 added the column but not every code path
@@ -633,6 +607,11 @@ impl SqliteStore {
             )
             .store()?;
         }
+        // v10: the additive `keys` columns, then the legacy typed plane tables into the neutral
+        // ones. Both are idempotent by construction (column/table existence), so they need no
+        // version gate and a fresh database passes straight through them.
+        add_v10_key_columns(&tx)?;
+        migrate_legacy_plane_tables(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
         tx.commit().store()?;
@@ -653,31 +632,392 @@ impl SqliteStore {
     }
 }
 
-// `allowed_pools` / `labels` JSON (de)serialization — storage shape unchanged from the
-// pre-ScopeRef-generalization store: C6 intent (None vs Some([])) round-trips through NULL vs a
-// JSON array of bare pool-name strings; a malformed value (only reachable via a direct
-// out-of-band DB edit, since `migrate()` unconditionally recreates a pre-v5 database) reads as
-// the most restrictive grant, never a silent widen. Only the in-memory Rust type changed
-// (Option<Vec<String>> -> Option<Vec<ScopeRef>>) — every entry is `kind: "pool"` by construction,
-// since "pool" is the only registered scope kind today, matching busbar_api's own
-// allowed_scopes_wire serde shim. The conversion happens here, at construction
-// (`ScopeRef::pool(name)`) and at read (`.value`), mirroring `store-postgres`'s
-// `pools_to_storage`/`pools_from_storage`.
-fn pools_to_storage(scopes: &Option<Vec<ScopeRef>>) -> Option<String> {
-    scopes.as_ref().map(|list| {
-        let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
-        serde_json::to_string(&bare).unwrap_or_else(|_| "[]".to_string())
-    })
+/// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
+/// Every other unit name is an OPEN unit and lives in `usage_window_units`.
+const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
+
+/// The OPEN (non-reserved) entries of a name-keyed usage map — the ones the token columns do not hold.
+fn open_units<V>(
+    units: &std::collections::BTreeMap<String, V>,
+) -> impl Iterator<Item = (&String, &V)> {
+    units
+        .iter()
+        .filter(|(k, _)| !RESERVED_COLUMNS.contains(&k.as_str()))
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
-    let stored = stored?;
-    Some(
-        serde_json::from_str::<Vec<String>>(stored.trim())
-            .unwrap_or_default()
-            .into_iter()
-            .map(ScopeRef::pool)
-            .collect(),
+
+fn table_exists(tx: &rusqlite::Connection, table: &str) -> StoreResult<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |r| r.get(0),
     )
+    .store()
+}
+
+fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> StoreResult<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        params![table, column],
+        |r| r.get(0),
+    )
+    .store()
+}
+
+/// Rebuild a pre-v10 `usage_metering` with `priced_from_ms` in its primary key — the one change in
+/// this migration SQLite cannot make in place. Every row is copied at `priced_from_ms = 0`, the
+/// OPENING card's instant, which is exactly how the contract says an undated row reads (see
+/// `MeteringDelta::priced_from_ms`); no count is touched.
+///
+/// The column list below must stay identical to `usage_metering` in [`SCHEMA`];
+/// `migrated_tables_match_a_fresh_schema` holds the two together.
+///
+/// `keys_guard_hard_delete` names `usage_metering` in its body, and SQLite's `ALTER TABLE ... RENAME`
+/// re-parses every trigger in the schema and refuses to proceed while one references a table that
+/// does not exist — which is the state between the DROP and the RENAME. So the trigger is dropped
+/// first; `SCHEMA`, executed immediately after this, recreates it against the rebuilt table. All of
+/// it runs inside `migrate`'s single transaction: a crash anywhere leaves the v9 table intact.
+fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> StoreResult<()> {
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS keys_guard_hard_delete;
+         CREATE TABLE usage_metering_v10 (
+             bucket             TEXT NOT NULL,
+             key_id             TEXT NOT NULL,
+             provider           TEXT NOT NULL,
+             model              TEXT NOT NULL,
+             key_group_at_use   TEXT NOT NULL DEFAULT '',
+             pricing_version    TEXT NOT NULL DEFAULT '',
+             requests           INTEGER NOT NULL DEFAULT 0,
+             billable_requests  INTEGER NOT NULL DEFAULT 0,
+             tokens_input       INTEGER NOT NULL DEFAULT 0,
+             tokens_output      INTEGER NOT NULL DEFAULT 0,
+             tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+             tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+             priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms)
+         ) STRICT, WITHOUT ROWID;
+         INSERT INTO usage_metering_v10 (bucket, key_id, provider, model, key_group_at_use,
+             pricing_version, requests, billable_requests, tokens_input, tokens_output,
+             tokens_cache_read, tokens_cache_write, priced_from_ms)
+           SELECT bucket, key_id, provider, model, key_group_at_use, pricing_version, requests,
+             billable_requests, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, 0
+           FROM usage_metering;
+         DROP TABLE usage_metering;
+         ALTER TABLE usage_metering_v10 RENAME TO usage_metering;",
+    )
+    .store()
+}
+
+/// The v10 `keys` columns. Nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as it did:
+/// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
+/// attribution fields, which is what the contract says a key minted before them carries.
+fn add_v10_key_columns(tx: &rusqlite::Connection) -> StoreResult<()> {
+    const COLUMNS: [(&str, &str); 4] = [
+        // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
+        // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
+        // grant. See `scopes_to_storage` for why pools keep their own column.
+        (
+            "scope_grants",
+            "TEXT CONSTRAINT keys_scope_grants_json CHECK (scope_grants IS NULL OR \
+             (json_valid(scope_grants) AND json_type(scope_grants)='object'))",
+        ),
+        ("idp_subject", "TEXT"),
+        ("binding_mode", "TEXT"),
+        ("minted_by", "TEXT"),
+    ];
+    for (name, decl) in COLUMNS {
+        if !column_exists(tx, "keys", name)? {
+            tx.execute_batch(&format!("ALTER TABLE keys ADD COLUMN {name} {decl}"))
+                .store()?;
+        }
+    }
+    Ok(())
+}
+
+/// The legacy (v8/v9) typed plane rows, re-encoded as the opaque bodies the 1.6.0 planes decode. These
+/// structs are the ONLY place this crate names a plane's row shape, and they exist for one reason: to
+/// carry a pre-v10 database's rows across the crossing. The field names and order are the plane
+/// crates' own (`busbar-a2a`'s `TaskRow`/`TaskEventRow`, `busbar-mcp`'s `McpDemotionRow`), which
+/// serialize with `serde_json` exactly as these do.
+mod legacy {
+    #[derive(serde::Serialize)]
+    pub(super) struct TaskBody {
+        pub task_id: String,
+        pub context_id: String,
+        pub principal: String,
+        pub direction: String,
+        pub state: String,
+        pub agent_id: String,
+        pub artifact_cursor: u64,
+        pub push_callback: String,
+        pub created_at: u64,
+        pub updated_at: u64,
+    }
+
+    /// No `digest_version`: a row persisted before that field existed carries none, and the plane
+    /// reads its absence as the framing those rows were sealed under. Writing one here would claim a
+    /// framing the stored `hash` was never computed with.
+    #[derive(serde::Serialize)]
+    pub(super) struct TaskEventBody {
+        pub task_id: String,
+        pub seq: u64,
+        pub ts: u64,
+        pub kind: String,
+        pub context_id: String,
+        pub principal: String,
+        pub agent_id: String,
+        pub state: String,
+        pub request_id: String,
+        pub prev_hash: String,
+        pub hash: String,
+    }
+
+    #[derive(serde::Serialize)]
+    pub(super) struct DemotionBody {
+        pub server: String,
+        pub reason: String,
+        pub recorded_at: u64,
+    }
+}
+
+/// Copy the v8/v9 typed plane tables into `plane_records`/`plane_tokens`, then drop them — all inside
+/// `migrate`'s transaction, so a crash leaves the typed tables untouched and the next open re-runs
+/// this. Each table is handled only if it exists, which is what makes this a no-op on a fresh or a
+/// v6 database and on a second open.
+///
+/// `ON CONFLICT DO NOTHING` on every insert: a neutral row that is already there is newer than any
+/// legacy row could be, and is never overwritten by one.
+///
+/// `mcp_calls` is deliberately NOT migrated, and NOT dropped. The 1.6.0 `call` body is a framed
+/// digest stream the engine seals itself; a backend re-encoding a typed row into it would be forging
+/// the chain the engine verifies, and busbar ships no `call` migration either. The rows stay where
+/// they are, unread, so no evidence is destroyed by an upgrade.
+fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> StoreResult<()> {
+    let insert_record = |kind: &str,
+                         identity: &str,
+                         seq: i64,
+                         id: &str,
+                         parent: Option<&str>,
+                         ts: i64,
+                         terminal: bool,
+                         body: Vec<u8>|
+     -> StoreResult<()> {
+        tx.execute(
+            "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(kind, identity, seq) DO NOTHING",
+            params![
+                kind,
+                identity,
+                seq,
+                id,
+                parent,
+                ts,
+                if terminal { "terminal" } else { "active" },
+                body
+            ],
+        )
+        .store()?;
+        Ok(())
+    };
+    let u = |v: i64| v.max(0) as u64;
+
+    if table_exists(tx, "task_events")? {
+        let mut stmt = tx
+            .prepare(
+                "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, request_id, \
+                 prev_hash, hash FROM task_events",
+            )
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(legacy::TaskEventBody {
+                    task_id: r.get(0)?,
+                    seq: u(r.get(1)?),
+                    ts: u(r.get(2)?),
+                    kind: r.get(3)?,
+                    context_id: r.get(4)?,
+                    principal: r.get(5)?,
+                    agent_id: r.get(6)?,
+                    state: r.get(7)?,
+                    request_id: r.get(8)?,
+                    prev_hash: r.get(9)?,
+                    hash: r.get(10)?,
+                })
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        drop(stmt);
+        for e in rows {
+            insert_record(
+                "task_event",
+                &e.task_id,
+                e.seq as i64,
+                &e.task_id,
+                Some(&e.task_id),
+                e.ts as i64,
+                false,
+                encode(&e)?,
+            )?;
+        }
+        tx.execute_batch("DROP TABLE task_events").store()?;
+    }
+
+    if table_exists(tx, "tasks")? {
+        let mut stmt = tx
+            .prepare(
+                "SELECT task_id, context_id, principal, direction, state, agent_id, \
+                 artifact_cursor, push_callback, created_at, updated_at FROM tasks",
+            )
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(legacy::TaskBody {
+                    task_id: r.get(0)?,
+                    context_id: r.get(1)?,
+                    principal: r.get(2)?,
+                    direction: r.get(3)?,
+                    state: r.get(4)?,
+                    agent_id: r.get(5)?,
+                    artifact_cursor: u(r.get(6)?),
+                    push_callback: r.get(7)?,
+                    created_at: u(r.get(8)?),
+                    updated_at: u(r.get(9)?),
+                })
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        drop(stmt);
+        for t in rows {
+            let terminal = TERMINAL_TASK_STATES.contains(&t.state.as_str());
+            insert_record(
+                "task",
+                &t.task_id,
+                0,
+                &t.task_id,
+                None,
+                t.updated_at as i64,
+                terminal,
+                encode(&t)?,
+            )?;
+        }
+        // Takes the `tasks_cascade_events` trigger with it; the cascade now lives in
+        // `purge_plane_records_before`.
+        tx.execute_batch("DROP TABLE tasks").store()?;
+    }
+
+    if table_exists(tx, "mcp_demotions")? {
+        let mut stmt = tx
+            .prepare("SELECT server, reason, recorded_at FROM mcp_demotions")
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(legacy::DemotionBody {
+                    server: r.get(0)?,
+                    reason: r.get(1)?,
+                    recorded_at: u(r.get(2)?),
+                })
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        drop(stmt);
+        for d in rows {
+            insert_record(
+                "demotion",
+                &d.server,
+                0,
+                &d.server,
+                None,
+                d.recorded_at as i64,
+                false,
+                encode(&d)?,
+            )?;
+        }
+        tx.execute_batch("DROP TABLE mcp_demotions").store()?;
+    }
+
+    if table_exists(tx, "spent_ask_states")? {
+        // The 1.6.0 MCP plane redeems its confirm-once grants under the `approval` record schema.
+        tx.execute_batch(
+            "INSERT INTO plane_tokens (kind, token, expires_at) \
+               SELECT 'approval', nonce, expires_at FROM spent_ask_states WHERE true \
+               ON CONFLICT(kind, token) DO NOTHING;
+             DROP TABLE spent_ask_states;",
+        )
+        .store()?;
+    }
+    Ok(())
+}
+
+/// `serde_json`-encode one legacy row into the opaque body the plane decodes.
+fn encode<T: serde::Serialize>(row: &T) -> StoreResult<Vec<u8>> {
+    serde_json::to_vec(row)
+        .map_err(|e| StoreError(format!("v10 migration: encode a legacy plane row: {e}")))
+}
+
+// `allowed_scopes` storage. The in-memory grant is `Option<Vec<ScopeRef>>`; on disk it is split by
+// kind exactly the way the contract's own wire shape splits it:
+// - `allowed_pools` holds the `pool` values as a JSON array of bare strings. NULL = the grant was
+//   OMITTED at mint = every scope of every kind; a JSON array (including '[]') = an explicit,
+//   exhaustive grant. This column's shape is unchanged since v5, so a pre-v10 row means what it
+//   always meant (C6: None vs Some([]) must never collapse into each other).
+// - `scope_grants` (v10) holds every OTHER kind as `{kind: [value, ...]}`, NULL when there is none.
+//   Before it existed, a non-pool grant written here had its kind thrown away and came back as a POOL
+//   grant — a lost MCP grant and a pool-access widening at once.
+// An explicit grant always writes `allowed_pools` (possibly '[]'), so `Some([mcp_server x])` never
+// reads back as the omitted-grant wildcard.
+type ScopeColumns = (Option<String>, Option<String>);
+
+fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
+    let Some(list) = scopes else {
+        return (None, None);
+    };
+    let mut pools: Vec<&str> = Vec::new();
+    let mut other: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for s in list {
+        if s.kind == "pool" {
+            pools.push(&s.value);
+        } else {
+            other.entry(&s.kind).or_default().push(&s.value);
+        }
+    }
+    let pools = serde_json::to_string(&pools).unwrap_or_else(|_| "[]".to_string());
+    let other = (!other.is_empty()).then(|| serde_json::to_string(&other).unwrap_or_default());
+    (Some(pools), other)
+}
+
+// A malformed value (reachable only by an out-of-band edit of the file) reads as the most restrictive
+// grant, never a silent widen: an unparseable `allowed_pools` is the empty set, and an unparseable
+// `scope_grants` adds nothing.
+fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<Vec<ScopeRef>> {
+    let other: std::collections::BTreeMap<String, Vec<String>> = other
+        .as_deref()
+        .map(|o| serde_json::from_str(o.trim()).unwrap_or_default())
+        .unwrap_or_default();
+    if pools.is_none() && other.is_empty() {
+        return None;
+    }
+    let mut list: Vec<ScopeRef> = pools
+        .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        .map(ScopeRef::pool)
+        .collect();
+    for (kind, values) in other {
+        // The key crosses back to the engine as JSON, and the contract serializes a non-pool kind
+        // only if it is registered in THIS process. The engine registers every installed plane's kinds
+        // in its own process at boot; a plugin process never sees that call. Every kind stored here
+        // came in on a key the engine itself serialized, i.e. a kind the engine had registered, so
+        // registering it on the way back out is restating the engine's own registration, never
+        // widening it.
+        busbar_api::register_scope_kind(&kind);
+        list.extend(values.into_iter().map(|value| ScopeRef {
+            kind: kind.clone(),
+            value,
+        }));
+    }
+    Some(list)
 }
 fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
     serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
@@ -691,7 +1031,7 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         id: r.get(0)?,
         generation_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)?),
+        allowed_scopes: scopes_from_storage(r.get(3)?, r.get(11)?),
         enabled: r.get::<_, i64>(4)? != 0,
         created_at: r.get::<_, i64>(5)? as u64,
         group: r.get(6)?,
@@ -699,11 +1039,14 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         expires_at: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         deleted_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         revision: r.get::<_, i64>(10)?.max(0) as u64,
+        idp_subject: r.get(12)?,
+        binding_mode: r.get(13)?,
+        minted_by: r.get(14)?,
     })
 }
 
-const KEY_COLS: &str =
-    "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision";
+const KEY_COLS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
+     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by";
 
 fn secret_form_to_str(f: SecretForm) -> &'static str {
     match f {
@@ -780,19 +1123,23 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
     // When the guard bites, the conflict branch updates nothing and `execute` reports 0 rows, which
     // is the only signal available here that it fired — hence the row-count check below rather than
     // a bare `?`.
+    let (allowed_pools, scope_grants) = scopes_to_storage(&key.allowed_scopes);
     let affected = conn.execute(
-        "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11)
+        "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
+                           scope_grants,idp_subject,binding_mode,minted_by)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
-            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11
+            expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11,
+            scope_grants=excluded.scope_grants, idp_subject=excluded.idp_subject,
+            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by
          WHERE excluded.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
         params![
             key.id,
             key.generation_hash,
             key.name,
-            pools_to_storage(&key.allowed_scopes),
+            allowed_pools,
             key.enabled as i64,
             key.created_at as i64,
             key.group,
@@ -801,6 +1148,10 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
             key.deleted_at.map(|v| v as i64),
             revision,
             now_secs(),
+            scope_grants,
+            key.idp_subject,
+            key.binding_mode,
+            key.minted_by,
         ],
     )
     .store()?;
@@ -1060,22 +1411,58 @@ impl Store for SqliteStore {
                  FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model != '' ORDER BY model",
             )
             .store()?;
-        let models = stmt
+        let mut models = stmt
             .query_map(params![window_start as i64, bucket_id], |r| {
-                let u = |v: i64| v.max(0) as u64;
+                let mut units = std::collections::BTreeMap::new();
+                for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
+                    let v = r.get::<_, i64>(i + 1)?.max(0) as u64;
+                    // The reserved four share one map with every open unit now, and a column cannot
+                    // tell "never counted" from "counted to zero" — so a zero reads as absent, which
+                    // is how `ModelTokens` itself reads an absent key (`tier()` → 0).
+                    if v != 0 {
+                        units.insert(unit.to_string(), v);
+                    }
+                }
                 Ok(ModelTokens {
                     model: r.get(0)?,
-                    tokens: TierTokens {
-                        input: u(r.get(1)?),
-                        output: u(r.get(2)?),
-                        cache_read: u(r.get(3)?),
-                        cache_write: u(r.get(4)?),
-                    },
+                    usage_units: units,
                 })
             })
             .store()?
             .collect::<Result<Vec<_>, _>>()
             .store()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT model, unit, count FROM usage_window_units
+                 WHERE window_start=?1 AND bucket_id=?2 ORDER BY model, unit",
+            )
+            .store()?;
+        let opens = stmt
+            .query_map(params![window_start as i64, bucket_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        for (model, unit, count) in opens {
+            // Every open-unit row is written beside its model's row (put_usage/add_usage), so the
+            // model is always already listed; the fallback only keeps an out-of-band edit readable.
+            let at = match models.iter().position(|m| m.model == model) {
+                Some(at) => at,
+                None => {
+                    models.push(ModelTokens {
+                        model,
+                        ..Default::default()
+                    });
+                    models.len() - 1
+                }
+            };
+            models[at].usage_units.insert(unit, count);
+        }
         Ok(UsageLedger {
             requests: requests.max(0) as u64,
             billable_requests: billable_requests.max(0) as u64,
@@ -1098,6 +1485,11 @@ impl Store for SqliteStore {
             params![window_start as i64, bucket_id],
         )
         .store()?;
+        tx.execute(
+            "DELETE FROM usage_window_units WHERE window_start=?1 AND bucket_id=?2",
+            params![window_start as i64, bucket_id],
+        )
+        .store()?;
         let req = i64::try_from(ledger.requests).unwrap_or(i64::MAX);
         let bil = i64::try_from(ledger.billable_requests).unwrap_or(i64::MAX);
         // requests/billable_requests ALWAYS live on the model='' sentinel row, unconditionally — not
@@ -1111,6 +1503,7 @@ impl Store for SqliteStore {
             "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
             params![window_start as i64, bucket_id, req, bil],
         ).store()?;
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         for m in &ledger.models {
             tx.execute(
                 "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
@@ -1118,12 +1511,20 @@ impl Store for SqliteStore {
                  VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
                 params![
                     window_start as i64, bucket_id, m.model,
-                    i64::try_from(m.tokens.input).unwrap_or(i64::MAX),
-                    i64::try_from(m.tokens.output).unwrap_or(i64::MAX),
-                    i64::try_from(m.tokens.cache_read).unwrap_or(i64::MAX),
-                    i64::try_from(m.tokens.cache_write).unwrap_or(i64::MAX),
+                    clamp(m.tier(UNIT_INPUT)),
+                    clamp(m.tier(UNIT_OUTPUT)),
+                    clamp(m.tier(UNIT_CACHE_READ)),
+                    clamp(m.tier(UNIT_CACHE_WRITE)),
                 ],
             ).store()?;
+            for (unit, count) in open_units(&m.usage_units) {
+                tx.execute(
+                    "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![window_start as i64, bucket_id, m.model, unit, clamp(*count)],
+                )
+                .store()?;
+            }
         }
         tx.commit().store()?;
         Ok(())
@@ -1138,7 +1539,7 @@ impl Store for SqliteStore {
         // unconditionally on model='', regardless of whether this particular delta touched any
         // models (a rejected/errored request can add to `requests` while reaching zero models).
         // `prepare_cached`, not `execute`/`prepare`: this fires once per admitted request (the
-        // hottest write path in the crate), and these two statement texts never vary — caching
+        // hottest write path in the crate), and these statement texts never vary — caching
         // avoids paying SQLite's parse+plan cost on every single request.
         tx.prepare_cached(
             "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
@@ -1150,6 +1551,7 @@ impl Store for SqliteStore {
         .execute(params![window_start as i64, bucket_id, delta.requests, delta.billable_requests])
         .store()?;
         for m in &delta.models {
+            let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
             tx.prepare_cached(
                 "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
@@ -1163,9 +1565,22 @@ impl Store for SqliteStore {
             .store()?
             .execute(params![
                 window_start as i64, bucket_id, m.model,
-                m.tokens.input, m.tokens.output, m.tokens.cache_read, m.tokens.cache_write,
+                d(UNIT_INPUT), d(UNIT_OUTPUT), d(UNIT_CACHE_READ), d(UNIT_CACHE_WRITE),
             ])
             .store()?;
+            // Every open unit accumulates the same way the reserved columns do: one atomic
+            // UPSERT per unit, floored at 0 (a refund never drives a durable counter negative).
+            for (unit, d) in open_units(&m.usage_units) {
+                tx.prepare_cached(
+                    "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
+                     VALUES (?1,?2,?3,?4,MAX(0,?5))
+                     ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
+                        count = MAX(0, count + ?5)",
+                )
+                .store()?
+                .execute(params![window_start as i64, bucket_id, m.model, unit, d])
+                .store()?;
+            }
         }
         tx.commit().store()?;
         Ok(())
@@ -1212,6 +1627,22 @@ impl Store for SqliteStore {
                 break;
             }
         }
+        // The same windows' open-unit rows, chunked the same way. Not counted: a window is counted
+        // once, off its `usage_windows` rows above, however many units it carried.
+        loop {
+            let changed = self
+                .lock_writer()
+                .execute(
+                    "DELETE FROM usage_window_units WHERE (window_start, bucket_id, model, unit) IN (
+                        SELECT window_start, bucket_id, model, unit FROM usage_window_units
+                        WHERE window_start < ?1 LIMIT 5000)",
+                    params![before as i64],
+                )
+                .store()?;
+            if changed < 5000 {
+                break;
+            }
+        }
         Ok(total)
     }
 
@@ -1225,8 +1656,8 @@ impl Store for SqliteStore {
                     .store()?;
                 let changed = tx
                     .execute(
-                        "DELETE FROM usage_metering WHERE (bucket, key_id, provider, model) IN (
-                            SELECT bucket, key_id, provider, model FROM usage_metering
+                        "DELETE FROM usage_metering WHERE (bucket, key_id, provider, model, priced_from_ms) IN (
+                            SELECT bucket, key_id, provider, model, priced_from_ms FROM usage_metering
                             WHERE bucket = ?1 LIMIT 5000)",
                         params![bucket],
                     )
@@ -1239,20 +1670,34 @@ impl Store for SqliteStore {
                 break;
             }
         }
+        // The purged cells' open-unit rows go too; the count is the metering rows', as before.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            conn.execute(
+                "DELETE FROM usage_metering_units WHERE bucket = ?1",
+                params![bucket],
+            )
+            .store()?;
+            Ok(())
+        })?;
         Ok(total)
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
+        // would silently merge this accrual into a different card's cell.
+        let priced_from = as_storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
             tx.execute(
-                "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, pricing_version,
+                "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                 ON CONFLICT(bucket, key_id, provider, model) DO UPDATE SET
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                 ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
                      tokens_input       = tokens_input + excluded.tokens_input,
                      tokens_output      = tokens_output + excluded.tokens_output,
                      tokens_cache_read  = tokens_cache_read + excluded.tokens_cache_read,
@@ -1264,17 +1709,38 @@ impl Store for SqliteStore {
                     d.key_id,
                     d.provider,
                     d.model,
+                    priced_from,
                     d.key_group_at_use,
                     d.pricing_version,
-                    i64::try_from(d.tokens_input).unwrap_or(i64::MAX),
-                    i64::try_from(d.tokens_output).unwrap_or(i64::MAX),
-                    i64::try_from(d.tokens_cache_read).unwrap_or(i64::MAX),
-                    i64::try_from(d.tokens_cache_write).unwrap_or(i64::MAX),
-                    i64::try_from(d.requests).unwrap_or(i64::MAX),
-                    i64::try_from(d.billable_requests).unwrap_or(i64::MAX),
+                    clamp(d.tokens_input),
+                    clamp(d.tokens_output),
+                    clamp(d.tokens_cache_read),
+                    clamp(d.tokens_cache_write),
+                    clamp(d.requests),
+                    clamp(d.billable_requests),
                 ],
             )
             .store()?;
+            // Every ledgered class the token columns do not hold, additive like every counter here,
+            // in the same transaction as the cell it belongs to.
+            for (unit, count) in &d.usage_units {
+                tx.execute(
+                    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
+                         count = count + excluded.count",
+                    params![
+                        d.bucket as i64,
+                        d.key_id,
+                        d.provider,
+                        d.model,
+                        priced_from,
+                        unit,
+                        clamp(*count),
+                    ],
+                )
+                .store()?;
+            }
             tx.commit().store()?;
             Ok(())
         })
@@ -1285,11 +1751,12 @@ impl Store for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read,
-                    tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version
+                    tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version,
+                    priced_from_ms
                  FROM usage_metering WHERE bucket = ?1",
             )
             .store()?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![bucket.to_string()], |r| {
                 let u = |v: i64| v.max(0) as u64;
                 Ok(MeteringRow {
@@ -1304,11 +1771,43 @@ impl Store for SqliteStore {
                     billable_requests: u(r.get(8)?),
                     key_group_at_use: r.get(9)?,
                     pricing_version: r.get(10)?,
+                    priced_from_ms: u(r.get(11)?),
+                    usage_units: Default::default(),
                 })
             })
             .store()?
             .collect::<Result<Vec<_>, _>>()
             .store()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT key_id, provider, model, priced_from_ms, unit, count
+                 FROM usage_metering_units WHERE bucket = ?1",
+            )
+            .store()?;
+        let units = stmt
+            .query_map(params![bucket.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?.max(0) as u64,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?.max(0) as u64,
+                ))
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        for (key_id, provider, model, priced_from_ms, unit, count) in units {
+            if let Some(row) = rows.iter_mut().find(|m| {
+                m.key_id == key_id
+                    && m.provider == provider
+                    && m.model == model
+                    && m.priced_from_ms == priced_from_ms
+            }) {
+                row.usage_units.insert(unit, count);
+            }
+        }
         Ok(rows)
     }
 
@@ -1423,355 +1922,339 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
-        let body = mcp_call_body(record);
-        let mut conn = self.lock_writer();
-        // IMMEDIATE, and the existence check shares the transaction with the insert: the two must be
-        // one atomic step or a concurrent writer could land between them and turn a fork into a
-        // silent accept.
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .store()?;
-        let existing: Option<(i64, String, String, String)> = tx
-            .query_row(
-                "SELECT ts, prev_hash, hash, body FROM mcp_calls WHERE principal = ?1 AND seq = ?2",
-                params![record.principal, record.seq as i64],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()
-            .store()?;
-        if let Some((ts, prev_hash, hash, stored_body)) = existing {
-            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
-            // tampered log and is an error: overwriting would destroy exactly the case worth
-            // reporting, and this store never restates a digest it was handed.
-            if ts == record.ts as i64
-                && prev_hash == record.prev_hash
-                && hash == record.hash
-                && stored_body == body
-            {
-                return Ok(());
-            }
-            // The message names the sequence and nothing else — it must not echo stored content
-            // (or caller content) back to whoever provoked it.
-            return Err(StoreError(format!(
-                "mcp call log fork: a different record is already persisted at sequence {} for this principal",
-                record.seq
-            )));
-        }
-        tx.execute(
-            "INSERT INTO mcp_calls (principal, seq, ts, prev_hash, hash, body) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                record.principal,
-                record.seq as i64,
-                record.ts as i64,
-                record.prev_hash,
-                record.hash,
-                body,
-            ],
-        )
-        .store()?;
-        tx.commit().store()?;
-        Ok(())
-    }
+    // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (1.6.0) ─────────────────────────────────────
+    //
+    // One table, `plane_records`, for every kind. The store never decodes a `body`: identity,
+    // ordering and retention read only the typed sidecar columns (`kind`, `id`, `parent`, `seq`,
+    // `ts`, `disposition`). No kind is special-cased except where the contract makes the kind's own
+    // retention rule part of the verb (`task`, below), so a kind a future plane declares is stored
+    // and served exactly like the ones that exist today.
 
-    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare(
-                "SELECT principal, seq, ts, prev_hash, hash, body FROM mcp_calls \
-                 WHERE principal = ?1 ORDER BY seq",
-            )
-            .store()?;
-        let rows = stmt.query_map([principal], row_to_mcp_call).store()?;
-        rows.collect::<Result<Vec<_>, _>>().store()
-    }
-
-    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT principal FROM mcp_calls ORDER BY principal")
-            .store()?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).store()?;
-        rows.collect::<Result<Vec<_>, _>>().store()
-    }
-
-    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
-        // STRICTLY less-than, matching the contract's wording: a row exactly at the cutoff is kept.
-        // `execute` returns the rows actually removed, so the count reported is one performed.
-        let removed = self
-            .lock_writer()
-            .execute(
-                "DELETE FROM mcp_calls WHERE ts < ?1",
-                params![i64::try_from(before).unwrap_or(i64::MAX)],
-            )
-            .store()?;
-        Ok(removed as u64)
-    }
-
-    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
-        // Refused rather than mangled, for the reason `append_audit` refuses its own out-of-range
-        // seq: `as i64` wraps a `u64` past `i64::MAX` negative and the read clamps it back, so the
-        // row read back would not be the row written — and here the value that silently changes is
-        // the ARTIFACT CURSOR, i.e. how much of a stream has been relayed. A wrapped cursor either
-        // replays delivered artifacts or skips undelivered ones, and does it without an error ever
-        // having been reported.
-        let cursor = as_storable_i64("put_task", "artifact_cursor", task.artifact_cursor)?;
-        let created = as_storable_i64("put_task", "created_at", task.created_at)?;
-        let updated = as_storable_i64("put_task", "updated_at", task.updated_at)?;
-        // FULL sync. The trait's own framing is that this is the difference between a resume that
-        // is real and one that is nominal, and a task state transition acknowledged to a caller and
-        // then lost to a power cut a second later is exactly the failure the durability exists to
-        // stop — the same reasoning that escalates `append_audit` and the revocation paths.
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        let row = PlaneRow::of(record, "upsert_plane_record")?;
+        // FULL sync: an upserted record is a task state transition, a demotion (a quarantine), a
+        // push-callback capability — each acknowledged to a caller and each worthless if a power cut
+        // a second later hands the previous state back.
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
-            // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second
-            // write for one task must replace the row, never append a second one for the same id.
+            // UPSERT BY (kind, identity, seq): a second write for one record replaces the row, never
+            // appends a rival one beside it.
             conn.execute(
-                "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id, \
-                 artifact_cursor, push_callback, created_at, updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
-                 ON CONFLICT(task_id) DO UPDATE SET \
-                    context_id=excluded.context_id, principal=excluded.principal, \
-                    direction=excluded.direction, state=excluded.state, agent_id=excluded.agent_id, \
-                    artifact_cursor=excluded.artifact_cursor, \
-                    push_callback=excluded.push_callback, created_at=excluded.created_at, \
-                    updated_at=excluded.updated_at",
-                params![
-                    task.task_id,
-                    task.context_id,
-                    task.principal,
-                    task.direction,
-                    task.state,
-                    task.agent_id,
-                    cursor,
-                    task.push_callback,
-                    created,
-                    updated,
-                ],
+                "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                 ON CONFLICT(kind, identity, seq) DO UPDATE SET \
+                    id=excluded.id, parent=excluded.parent, ts=excluded.ts, \
+                    disposition=excluded.disposition, body=excluded.body",
+                row.params(record),
             )
             .store()?;
             Ok(())
         })
     }
 
-    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
-        // No principal filter, deliberately: the contract puts the caller-scoping check engine-side,
-        // because an authorization check living in the backend is one an unauthorized reader
-        // bypasses by configuring a different backend.
+    fn get_plane_record(&self, kind: &str, id: &str) -> StoreResult<Option<Vec<u8>>> {
+        // An upserted record lives at `(kind, id, 0)`. No caller-scoping filter, deliberately: an
+        // authorization check living in the backend is one an unauthorized reader bypasses by
+        // configuring a different backend, so the contract keeps it engine-side.
         let conn = self.lock_reader();
         conn.query_row(
-            "SELECT task_id, context_id, principal, direction, state, agent_id, artifact_cursor, \
-             push_callback, created_at, updated_at FROM tasks WHERE task_id = ?1",
-            [task_id],
-            row_to_task,
+            "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
+            params![kind, id],
+            |r| r.get::<_, Vec<u8>>(0),
         )
         .optional()
         .store()
     }
 
-    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
-        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
-        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
-        // store that pre-filtered for any one of those would break the other two.
+    fn append_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        let row = PlaneRow::of(record, "append_plane_record")?;
+        // FULL sync: this is the tamper-evidence record of a transition or a call, and a chain with a
+        // hole where a crash landed is a chain that fails to verify.
+        let mut conn = self.lock_writer();
+        with_full_sync(&mut conn, |conn| {
+            // IMMEDIATE, and the occupancy check shares the transaction with the insert: the two must
+            // be one atomic step or a concurrent writer could land between them and turn a fork into
+            // a silent accept.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .store()?;
+            let existing: Option<StoredPlaneRow> = tx
+                .query_row(
+                    "SELECT id, parent, ts, disposition, body FROM plane_records \
+                     WHERE kind=?1 AND identity=?2 AND seq=?3",
+                    params![record.kind, row.identity, row.seq],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .store()?;
+            if let Some((id, parent, ts, disposition, body)) = existing {
+                // IDENTICAL is the at-least-once write-through retrying after a timeout, and is
+                // success. DIFFERENT is two records claiming one chain position — a forked or
+                // tampered log — and is an error: overwriting would destroy exactly the case worth
+                // reporting, and silently keeping the first would drop a genuinely different record
+                // on the floor. The same settlement `append_audit` makes.
+                if id == record.id
+                    && parent == record.parent
+                    && ts == row.ts
+                    && disposition == row.disposition
+                    && body == record.body
+                {
+                    return Ok(());
+                }
+                // Names the position and nothing else — it must not echo stored (or caller)
+                // content back to whoever provoked it.
+                return Err(StoreError(format!(
+                    "append_plane_record: kind '{}' already holds a different record at sequence {} \
+                     of this chain; the chain has forked",
+                    record.kind, record.seq
+                )));
+            }
+            tx.execute(
+                "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                row.params(record),
+            )
+            .store()?;
+            tx.commit().store()?;
+            Ok(())
+        })
+    }
+
+    fn list_plane_records(
+        &self,
+        kind: &str,
+        selector: &PlaneSelector,
+    ) -> StoreResult<Vec<Vec<u8>>> {
+        // UNFILTERED beyond the selector, terminal rows included: the boot rehydrate wants the active
+        // rows, the retention sweep the terminal ones and a scoped listing one principal's, and a
+        // store that pre-filtered for any one of those would break the other two. Oldest-first by
+        // `seq`, the order a chain verifier reads a parent's records in.
+        let conn = self.lock_reader();
+        let rows = match selector {
+            PlaneSelector::All => {
+                let mut stmt = conn
+                    .prepare("SELECT body FROM plane_records WHERE kind=?1 ORDER BY seq, identity")
+                    .store()?;
+                let rows = stmt
+                    .query_map([kind], |r| r.get::<_, Vec<u8>>(0))
+                    .store()?
+                    .collect::<Result<Vec<_>, _>>();
+                rows
+            }
+            PlaneSelector::Parent(parent) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT body FROM plane_records WHERE kind=?1 AND parent=?2 ORDER BY seq",
+                    )
+                    .store()?;
+                let rows = stmt
+                    .query_map(params![kind, parent], |r| r.get::<_, Vec<u8>>(0))
+                    .store()?
+                    .collect::<Result<Vec<_>, _>>();
+                rows
+            }
+        };
+        rows.store()
+    }
+
+    fn list_plane_record_parents(&self, kind: &str) -> StoreResult<Vec<String>> {
+        // The boot enumeration: a restart resumes a chain for a parent this process has never seen,
+        // so every parent holding a record is named, exactly once.
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(
-                "SELECT task_id, context_id, principal, direction, state, agent_id, \
-                 artifact_cursor, push_callback, created_at, updated_at FROM tasks ORDER BY task_id",
+                "SELECT DISTINCT parent FROM plane_records \
+                 WHERE kind=?1 AND parent IS NOT NULL ORDER BY parent",
             )
             .store()?;
-        let rows = stmt.query_map([], row_to_task).store()?;
+        let rows = stmt.query_map([kind], |r| r.get::<_, String>(0)).store()?;
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
-        // TERMINAL ONLY, and strictly older than the cutoff. An interrupted task waiting on a human
-        // is exactly the row that legitimately sits still for a long time; compacting it is losing
-        // the work, not reclaiming space. The IN list is the closed terminal set, so a state token
-        // this build does not recognise is never dropped.
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> StoreResult<u64> {
+        // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the kind's
+        // own contract, read off the typed `disposition` column, never out of the body:
+        // - `task` drops only TERMINAL rows. An interrupted task waiting on a human is exactly the row
+        //   that legitimately sits still longest; compacting it is losing the work.
+        // - every other kind drops every row older than `before`.
         //
-        // `execute` returns the rows actually removed, so the count reported is one performed. The
-        // task's provenance chain goes with it via the tasks_cascade_events trigger.
-        let placeholders = (1..=TERMINAL_TASK_STATES.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!("DELETE FROM tasks WHERE updated_at < ?1 AND state IN ({placeholders})");
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(i64::try_from(before).unwrap_or(i64::MAX))];
-        for s in TERMINAL_TASK_STATES {
-            args.push(Box::new(s));
-        }
-        let removed = self
-            .lock_writer()
-            .execute(&sql, rusqlite::params_from_iter(args.iter()))
+        // A purged task takes its `task_event` chain with it, and only its own. Nothing else ever
+        // removes a task's events, so leaving them would grow the table forever with chains whose
+        // task no longer exists — outliving the very retention decision just made about them.
+        //
+        // `before` is clamped rather than refused, unlike the write paths: a cutoff past what SQLite
+        // can hold means "everything older than the end of time", and clamping it says exactly that.
+        let before = i64::try_from(before).unwrap_or(i64::MAX);
+        let terminal_only = kind == "task";
+        let mut conn = self.lock_writer();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
+        let predicate = if terminal_only {
+            "kind=?1 AND ts < ?2 AND disposition='terminal'"
+        } else {
+            "kind=?1 AND ts < ?2"
+        };
+        if terminal_only {
+            tx.execute(
+                &format!(
+                    "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
+                     (SELECT identity FROM plane_records WHERE {predicate})"
+                ),
+                params![kind, before],
+            )
+            .store()?;
+        }
+        let removed = tx
+            .execute(
+                &format!("DELETE FROM plane_records WHERE {predicate}"),
+                params![kind, before],
+            )
+            .store()?;
+        tx.commit().store()?;
         Ok(removed as u64)
     }
 
-    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
-        let seq = as_storable_i64("append_task_event", "seq", event.seq)?;
-        let ts = as_storable_i64("append_task_event", "ts", event.ts)?;
-        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
-        // `append_mcp_call`'s: that one treats an occupied slot holding a different record as a fork
-        // and refuses it, while this one is specified to upsert so that the engine's write-through
-        // is idempotent on replay — "rejecting or duplicating a replayed seq breaks the chain the
-        // engine will verify on read". Copying the call log's fork check here would be wrong in a
-        // way that looks right.
-        //
-        // FULL sync for the same reason `put_task` uses it: this is the tamper-evidence record of a
-        // transition, and a chain with a hole where a crash landed is a chain that fails to verify.
+    fn delete_plane_record(&self, kind: &str, id: &str) -> StoreResult<()> {
+        // Deleting what is not there is a NO-OP, not an error: the engine clears on every
+        // observation that agrees with an approval rather than tracking whether it had demoted, so
+        // the common call is one against no row at all. Every `seq` under the identity goes, so a
+        // delete can never leave part of a chain behind. FULL sync: a clear lost to a power cut
+        // re-establishes a quarantine the operator has already worked, or revives a revoked
+        // callback capability.
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             conn.execute(
-                "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id, \
-                 state, request_id, prev_hash, hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
-                 ON CONFLICT(task_id, seq) DO UPDATE SET \
-                    ts=excluded.ts, kind=excluded.kind, context_id=excluded.context_id, \
-                    principal=excluded.principal, agent_id=excluded.agent_id, state=excluded.state, \
-                    request_id=excluded.request_id, prev_hash=excluded.prev_hash, \
-                    hash=excluded.hash",
-                params![
-                    event.task_id,
-                    seq,
-                    ts,
-                    event.kind,
-                    event.context_id,
-                    event.principal,
-                    event.agent_id,
-                    event.state,
-                    event.request_id,
-                    event.prev_hash,
-                    event.hash,
-                ],
+                "DELETE FROM plane_records WHERE kind=?1 AND identity=?2",
+                params![kind, id],
             )
             .store()?;
             Ok(())
         })
     }
 
-    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
-        // Oldest-first by seq — the order the engine's chain verifier reads, and the scope is the
-        // one task, because the chain is per-task.
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare(
-                "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, \
-                 request_id, prev_hash, hash FROM task_events WHERE task_id = ?1 ORDER BY seq",
-            )
-            .store()?;
-        let rows = stmt.query_map([task_id], row_to_task_event).store()?;
-        rows.collect::<Result<Vec<_>, _>>().store()
-    }
-
-    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
-        let recorded = as_storable_i64("put_mcp_demotion", "recorded_at", row.recorded_at)?;
-        // FULL sync, for the reason `put_task` uses it and then some: this row IS the quarantine.
-        // Acknowledged and then lost to a power cut, it is an upstream the engine decided it could
-        // no longer trust that comes back up holding the operator's approval.
-        let mut conn = self.lock_writer();
-        with_full_sync(&mut conn, |conn| {
-            // UPSERT BY server, as the trait requires: a second write for one upstream replaces the
-            // row rather than appending a rival one, so the boot read cannot come back holding two
-            // answers about one server.
-            conn.execute(
-                "INSERT INTO mcp_demotions (server, reason, recorded_at) VALUES (?1,?2,?3) \
-                 ON CONFLICT(server) DO UPDATE SET \
-                    reason=excluded.reason, recorded_at=excluded.recorded_at",
-                params![row.server, row.reason, recorded],
-            )
-            .store()?;
-            Ok(())
-        })
-    }
-
-    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
-        // The boot read. An EMPTY answer means "no upstream is recorded as demoted" and never "we
-        // could not tell" — a read failure is returned as an error, because a server with no row is
-        // a server nobody demoted, which is a different fact from a server that drifted, and
-        // conflating them would quarantine every declaratively-approved deployment at boot.
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare("SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server")
-            .store()?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(McpDemotionRow {
-                    server: r.get(0)?,
-                    reason: r.get(1)?,
-                    recorded_at: r.get::<_, i64>(2)?.max(0) as u64,
-                })
-            })
-            .store()?;
-        rows.collect::<Result<Vec<_>, _>>().store()
-    }
-
-    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
-        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
-        // observation that agrees with the approval rather than tracking whether it had demoted, so
-        // the overwhelmingly common call is one against no row at all. FULL sync for the same reason
-        // the write has it, and the mirror of it: a clear lost to a power cut re-establishes a
-        // quarantine the operator has already worked.
-        let mut conn = self.lock_writer();
-        with_full_sync(&mut conn, |conn| {
-            conn.execute("DELETE FROM mcp_demotions WHERE server = ?1", [server])
-                .store()?;
-            Ok(())
-        })
-    }
-
-    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
-        // REFUSED rather than clamped, and this is not the same judgement call `purge_mcp_calls_
-        // before` makes when it clamps its cutoff. A `now` clamped to `i64::MAX` would sweep the
-        // ENTIRE ledger and then report the insert as a first redemption — i.e. an out-of-range
-        // argument would silently reopen every spent approval in the deployment. The only safe
-        // answer to a value this store cannot hold faithfully is an error, which the engine's call
-        // site turns into a REFUSED redemption.
-        let expires = as_storable_i64("redeem_ask_state", "expires_at", expires_at)?;
-        let now_i = as_storable_i64("redeem_ask_state", "now", now)?;
+    fn redeem_plane_token(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
+        // REFUSED rather than clamped. A `now` clamped to `i64::MAX` would sweep the ENTIRE ledger
+        // and then report the insert as a first redemption — an out-of-range argument silently
+        // reopening every spent grant in the deployment. The only safe answer to a value this store
+        // cannot hold faithfully is an error, which the engine turns into a REFUSED redemption.
+        let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        let now_i = as_storable_i64("redeem_plane_token", "now", now)?;
 
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             // ONE transaction over the sweep and the test-and-set. BEGIN IMMEDIATE takes the write
-            // lock up front (as every write path in this file does), so two redemptions of one
-            // approval — two threads here, or two nodes on one file — serialise rather than
-            // interleave. Splitting the lookup from the insert is precisely the read-then-write race
-            // this method is specified NOT to be: both readers would see no row and both would be
-            // told they were first.
+            // lock up front, so two redemptions of one grant — two threads here, or two nodes on one
+            // file — serialise rather than interleave. Splitting the lookup from the insert is
+            // precisely the read-then-write race this verb exists NOT to be: both readers would see
+            // no row and both would be told they were first.
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
-            // The eviction sweep, carried by the redemption itself: an entry whose approval can no
-            // longer be opened protects nothing, so the table is bounded by one validity window
-            // rather than growing forever. STRICTLY less-than, so an entry expiring exactly at `now`
-            // is kept — the same boundary convention every retention method here uses.
-            tx.execute(
-                "DELETE FROM spent_ask_states WHERE expires_at < ?1",
-                [now_i],
-            )
-            .store()?;
-            // THE TEST AND SET, as ONE statement. `execute` returns the rows actually inserted, so
-            // 1 means this call is the one that recorded the redemption and 0 means the row was
-            // already there — the answer is read off what the database did, never off a prior read.
+            // The eviction sweep, carried by the redemption itself: an entry whose grant can no
+            // longer be presented protects nothing, so the table is bounded by one validity window.
+            // STRICTLY less-than, so an entry expiring exactly at `now` is kept — the fail-closed
+            // side of the boundary.
+            tx.execute("DELETE FROM plane_tokens WHERE expires_at < ?1", [now_i])
+                .store()?;
+            // THE TEST AND SET, as ONE statement: 1 row inserted means this call recorded the
+            // redemption, 0 means it was already there — read off what the database did, never off a
+            // prior read.
             let inserted = tx
                 .execute(
-                    "INSERT INTO spent_ask_states (nonce, expires_at) VALUES (?1,?2) \
-                     ON CONFLICT(nonce) DO NOTHING",
-                    params![nonce, expires],
+                    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES (?1,?2,?3) \
+                     ON CONFLICT(kind, token) DO NOTHING",
+                    params![kind, token, expires],
                 )
                 .store()?;
             tx.commit().store()?;
             Ok(inserted == 1)
         })
     }
+
+    fn plane_token_live(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
+        // MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted record. LIVE
+        // means all three: present, still `active`, and `now` not past `expires_at`. A missing row
+        // holds no capability, a terminal one names work that has finished, and a lapsed one is dead
+        // even if nothing finished. Asking twice answers the same twice. Fail-closed on every
+        // uncertain answer, including an unrepresentable deadline.
+        if now > expires_at {
+            return Ok(false);
+        }
+        let conn = self.lock_reader();
+        let disposition: Option<String> = conn
+            .query_row(
+                "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
+                params![kind, token],
+                |r| r.get(0),
+            )
+            .optional()
+            .store()?;
+        Ok(disposition.as_deref() == Some(DISPOSITION_ACTIVE))
+    }
+}
+
+/// A stored plane row's `(id, parent, ts, disposition, body)`, as the append verb's fork check reads it.
+type StoredPlaneRow = (String, Option<String>, i64, String, Vec<u8>);
+
+const DISPOSITION_ACTIVE: &str = "active";
+const DISPOSITION_TERMINAL: &str = "terminal";
+
+/// A [`PlaneRecord`]'s storable sidecar columns, range-checked once for every verb that writes one.
+struct PlaneRow {
+    identity: String,
+    seq: i64,
+    ts: i64,
+    disposition: &'static str,
+}
+
+impl PlaneRow {
+    /// Refused rather than mangled: `as i64` wraps a `u64` past `i64::MAX` negative and the read
+    /// clamps it back, so the row read back would not be the row written — a wrapped `seq` reorders a
+    /// chain and a wrapped `ts` changes what retention does to it, with no error ever reported.
+    fn of(record: &PlaneRecord, method: &str) -> StoreResult<Self> {
+        Ok(Self {
+            // A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
+            identity: record.parent.clone().unwrap_or_else(|| record.id.clone()),
+            seq: as_storable_i64(method, "seq", record.seq)?,
+            ts: as_storable_i64(method, "ts", record.ts)?,
+            disposition: match record.disposition {
+                PlaneDisposition::Active => DISPOSITION_ACTIVE,
+                PlaneDisposition::Terminal => DISPOSITION_TERMINAL,
+            },
+        })
+    }
+
+    fn params<'a>(&'a self, record: &'a PlaneRecord) -> [&'a dyn rusqlite::ToSql; 8] {
+        [
+            &record.kind,
+            &self.identity,
+            &self.seq,
+            &record.id,
+            &record.parent,
+            &self.ts,
+            &self.disposition,
+            &record.body,
+        ]
+    }
 }
 
 /// Reject a `u64` that SQLite's signed 64-bit integer cannot hold, naming the method and the field.
 /// `as i64` would wrap it negative and the read would clamp it back to something else again, so the
 /// row read back would not be the row written — and nothing would ever have reported an error. The
-/// same guard `append_audit` applies to its own `seq`/`ts`, factored out because the task store has
-/// five such fields across two methods.
+/// same guard `append_audit` applies to its own `seq`/`ts`, factored out because the plane verbs share it.
 fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
     i64::try_from(v).map_err(|_| {
         StoreError(format!(
@@ -1781,89 +2264,41 @@ fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
     })
 }
 
-fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
-    Ok(TaskRow {
-        task_id: r.get(0)?,
-        context_id: r.get(1)?,
-        principal: r.get(2)?,
-        direction: r.get(3)?,
-        state: r.get(4)?,
-        agent_id: r.get(5)?,
-        artifact_cursor: r.get::<_, i64>(6)?.max(0) as u64,
-        push_callback: r.get(7)?,
-        created_at: r.get::<_, i64>(8)?.max(0) as u64,
-        updated_at: r.get::<_, i64>(9)?.max(0) as u64,
-    })
-}
-
-fn row_to_task_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEventRow> {
-    Ok(TaskEventRow {
-        task_id: r.get(0)?,
-        seq: r.get::<_, i64>(1)?.max(0) as u64,
-        ts: r.get::<_, i64>(2)?.max(0) as u64,
-        kind: r.get(3)?,
-        context_id: r.get(4)?,
-        principal: r.get(5)?,
-        agent_id: r.get(6)?,
-        state: r.get(7)?,
-        request_id: r.get(8)?,
-        prev_hash: r.get(9)?,
-        hash: r.get(10)?,
-    })
-}
-
-/// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,
-/// `ts`, `prev_hash` and `hash` are deliberately NOT duplicated here: they are real columns, and a
-/// value stored in two places is a value that can disagree with itself. `serde_json`'s object keys
-/// are ordered, so this encoding is deterministic — which is what makes the byte-comparison in
-/// `append_mcp_call`'s replay check meaningful.
-fn mcp_call_body(record: &McpCallRecord) -> String {
-    serde_json::json!({
-        "server": record.server,
-        "tool": record.tool,
-        "outcome": record.outcome,
-        "reason": record.reason,
-        "tool_digest": record.tool_digest,
-        "pin_generation": record.pin_generation,
-        "request_id": record.request_id,
-    })
-    .to_string()
-}
-
-/// Rebuild a record from its columns plus its opaque body. The CHAIN comes from the columns, which
-/// is the point of their being columns: what the engine verifies is what the database holds in a
-/// field it can constrain, not a value recovered by decoding a blob.
-fn row_to_mcp_call(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpCallRecord> {
-    let body: String = r.get(5)?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    Ok(McpCallRecord {
-        principal: r.get(0)?,
-        seq: r.get::<_, i64>(1)? as u64,
-        ts: r.get::<_, i64>(2)? as u64,
-        prev_hash: r.get(3)?,
-        hash: r.get(4)?,
-        server: s("server"),
-        tool: s("tool"),
-        outcome: s("outcome"),
-        reason: s("reason"),
-        tool_digest: s("tool_digest"),
-        pin_generation: v
-            .get("pin_generation")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
-        request_id: s("request_id"),
-    })
-}
-
 fn put_credential_inner(
     tx: &rusqlite::Transaction,
     secret: &CredentialSecret,
     revision: i64,
 ) -> StoreResult<()> {
     let m = &secret.meta;
+    // The owning key must EXIST and be LIVE, checked in the caller's transaction. `delete_key`
+    // cascades a key's credentials away precisely so the secret material stops resolving; accepting a
+    // credential onto a tombstoned key afterwards puts it back under a key an operator just revoked.
+    // The FK alone only covers the "no such row" half — a tombstone is still a row. Checked here, in
+    // the same IMMEDIATE transaction as the write, because a caller-side check-then-write is exactly
+    // the gap a concurrent `delete_key` lands in.
+    let owner_live: Option<bool> = tx
+        .query_row(
+            "SELECT deleted_at IS NULL FROM keys WHERE id=?1",
+            params![m.key_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .store()?;
+    match owner_live {
+        None => {
+            return Err(StoreError(format!(
+                "put_credential: owning key '{}' does not exist",
+                m.key_id
+            )))
+        }
+        Some(false) => {
+            return Err(StoreError(format!(
+            "put_credential: owning key '{}' is tombstoned; a revoked key takes no new credential",
+            m.key_id
+        )))
+        }
+        Some(true) => {}
+    }
     // UPSERT on (key_id, kind, slot): minting into an occupied LIVE slot must fail rather than
     // silently destroy a working credential mid-overlap-window. Enforced by only overwriting a row
     // whose revoked_at IS NOT NULL (or that doesn't exist yet) — the WHERE clause on the DO UPDATE.

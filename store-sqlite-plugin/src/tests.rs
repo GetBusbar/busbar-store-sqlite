@@ -116,6 +116,7 @@ fn explicit_in_memory_db_path_is_honored() {
         expires_at: None,
         deleted_at: None,
         revision: 0,
+        ..Default::default()
     };
     store
         .put_key(&key)
