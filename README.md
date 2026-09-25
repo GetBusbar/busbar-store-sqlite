@@ -47,7 +47,7 @@ this dynamic wrapper — see busbarAI's plugin docs.)
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
 until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly —
-a sibling checkout of `busbarAI` at `../busbarAI` (see
+a sibling checkout of `busbar` at `../busbar` (see
 [Dependencies](#dependencies) below).
 
 ```sh
@@ -64,12 +64,12 @@ This crate depends on `busbar-api`, `busbar-store-sqlite`, and
 `busbar-plugin-loader`) from the
 [busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
 busbarAI is not yet public, `Cargo.toml` points at these as **local path
-dependencies** (`../busbarAI/crates/...`), which means this repo expects
-to be checked out as a sibling of `busbarAI`:
+dependencies** (`../busbar/crates/...`), which means this repo expects
+to be checked out as a sibling of `busbar`:
 
 ```
 some-parent-dir/
-├── busbarAI/
+├── busbar/
 └── store-sqlite/
 ```
 
