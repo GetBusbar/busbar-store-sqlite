@@ -33,8 +33,8 @@ jobs:
   #    `fail_ci_if_error: false`, so a Codecov hiccup can't turn this job red either.
   #
   #    Why a sibling busbar checkout (like plugin-ci.yml's build leg): this repo's workspace crates
-  #    take INTERIM local-path dependencies into a sibling busbarAI checkout
-  #    (`../../busbarAI/crates/{api,plugin-sdk,plugin-testkit,plugin-loader}`), so `cargo llvm-cov`
+  #    take INTERIM local-path dependencies into a sibling busbar checkout
+  #    (`../../busbar/crates/{api,plugin-sdk,plugin-loader}`), so `cargo llvm-cov`
   #    cannot resolve the workspace without busbar checked out beside it. Both checkouts use `path:`
   #    and mirror the busbar ref this repo's `ci` job already builds against
   #    (`github.base_ref || github.ref_name`). `service: none` for this plugin, so — unlike core's
@@ -58,7 +58,7 @@ jobs:
         with:
           repository: GetBusbar/busbar
           ref: ${{ env.BUSBAR_REF }}
-          path: busbarAI
+          path: busbar
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,7 +70,7 @@ jobs:
           # `workspaces:` the action finds no Cargo.toml and silently caches nothing.
           workspaces: |
             plugin
-            busbarAI
+            busbar
           key: busbar-${{ env.BUSBAR_REF }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

@@ -15,7 +15,7 @@ to build, test, and submit changes.
 
 `store-sqlite` is a Rust `cdylib` plugin. You need a recent stable toolchain
 (`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
-ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
+ships publicly — a sibling checkout of it at `../busbar`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
 README's [Dependencies](README.md#dependencies) section for the exact layout;
 CI checks out `GetBusbar/busbar` at the branch named in the reusable
