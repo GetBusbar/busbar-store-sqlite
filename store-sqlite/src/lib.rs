@@ -2,29 +2,29 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The built-in SQLite backend for busbar's durable governance store — the default `db` plugin.
-//! Implements `busbar_api::store::Store` over embedded rusqlite connections: one mutex-guarded
+//! Implements `busbar_contract::records::RecordStore` over embedded rusqlite connections: one mutex-guarded
 //! writer, plus a small pool of `query_only` readers so a long billing report or retention sweep
 //! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
-//! Depends only on the `busbar-api` contract (plus rusqlite), never on the engine.
+//! Depends only on the `busbar-contract` crate (plus rusqlite), never on the engine.
 
-use busbar_api::{
+use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecord, PlaneSelector, ScopeRef, SecretForm, Store, StoreError,
-    StoreResult, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
+    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult,
+    ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
     UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-// rusqlite error -> the api's backend-agnostic `StoreError` (the contract crate stays storage-free,
+// rusqlite error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays storage-free,
 // so the `From` impl that powers `?` cannot live there). Replace `<rusqlite call>?` with `<call>.store()?`.
 trait IntoStoreResult<T> {
-    fn store(self) -> StoreResult<T>;
+    fn store(self) -> RecordStoreResult<T>;
 }
 impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
-    fn store(self) -> StoreResult<T> {
-        self.map_err(|e| StoreError(e.to_string()))
+    fn store(self) -> RecordStoreResult<T> {
+        self.map_err(|e| RecordStoreError(e.to_string()))
     }
 }
 
@@ -340,7 +340,7 @@ fn apply_pragmas(
     path: &str,
     busy_timeout_ms: i64,
     is_writer: bool,
-) -> StoreResult<()> {
+) -> RecordStoreResult<()> {
     conn.pragma_update(None, "busy_timeout", busy_timeout_ms)
         .store()?;
     let is_memory = is_memory_path(path);
@@ -350,7 +350,7 @@ fn apply_pragmas(
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .store()?;
         if !mode.eq_ignore_ascii_case("wal") {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "sqlite: failed to enable WAL mode on {path} (got journal_mode={mode}); refusing to \
                  continue on a rollback-journal database, which would make every read block on the writer"
             )));
@@ -361,7 +361,7 @@ fn apply_pragmas(
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
         .store()?;
     if fk != 1 {
-        return Err(StoreError(
+        return Err(RecordStoreError(
             "sqlite: foreign_keys could not be enabled (SQLITE_OMIT_FOREIGN_KEY build, or the pragma \
              was issued inside a transaction) — refusing to start without FK enforcement backing the \
              credentials->keys CASCADE".to_string(),
@@ -405,8 +405,8 @@ fn apply_pragmas(
 /// so an early `?` inside `f` can never leave the connection permanently paying the FULL-fsync cost.
 fn with_full_sync<T>(
     conn: &mut Connection,
-    f: impl FnOnce(&mut Connection) -> StoreResult<T>,
-) -> StoreResult<T> {
+    f: impl FnOnce(&mut Connection) -> RecordStoreResult<T>,
+) -> RecordStoreResult<T> {
     conn.pragma_update(None, "synchronous", "FULL").store()?;
     let result = f(conn);
     let _ = conn.pragma_update(None, "synchronous", "NORMAL");
@@ -426,7 +426,7 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    pub fn open(path: &str, busy_timeout_ms: i64) -> StoreResult<Self> {
+    pub fn open(path: &str, busy_timeout_ms: i64) -> RecordStoreResult<Self> {
         // `:memory:` (and its URI-form spellings, e.g. `file::memory:`, `file:foo?mode=memory`) is
         // not a real file path -- SQLite opens a NEW, PRIVATE in-memory database per connection to
         // it, never a shared one. Opening a writer + N readers against it the normal way would
@@ -451,7 +451,11 @@ impl SqliteStore {
         )
     }
 
-    fn open_with_readers(path: &str, busy_timeout_ms: i64, n_readers: usize) -> StoreResult<Self> {
+    fn open_with_readers(
+        path: &str,
+        busy_timeout_ms: i64,
+        n_readers: usize,
+    ) -> RecordStoreResult<Self> {
         let writer_conn = Connection::open(path).store()?;
         apply_pragmas(&writer_conn, path, busy_timeout_ms, true)?;
         let mut readers = Vec::with_capacity(n_readers);
@@ -473,7 +477,7 @@ impl SqliteStore {
     /// In-memory SQLite store, for unit tests. Single connection reused for both roles: `:memory:`
     /// is one private database per connection, so a separate reader pool would see a DIFFERENT
     /// empty database, not a read replica of the writer's data.
-    pub fn open_in_memory() -> StoreResult<Self> {
+    pub fn open_in_memory() -> RecordStoreResult<Self> {
         let conn = Connection::open_in_memory().store()?;
         apply_pragmas(&conn, ":memory:", 5000, true)?;
         let store = Self {
@@ -507,7 +511,7 @@ impl SqliteStore {
         self.readers[i].lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn migrate(&self) -> StoreResult<()> {
+    fn migrate(&self) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -622,7 +626,7 @@ impl SqliteStore {
     /// transaction as the mutation it stamps — `RETURNING` hands the new value back with no second
     /// round trip, and single-writer + IMMEDIATE makes this gapless-under-commit-order for free (no
     /// sequence, no advisory lock).
-    fn bump_revision(tx: &rusqlite::Transaction) -> StoreResult<i64> {
+    fn bump_revision(tx: &rusqlite::Transaction) -> RecordStoreResult<i64> {
         tx.query_row(
             "UPDATE store_revision SET revision = revision + 1 WHERE id = 0 RETURNING revision",
             [],
@@ -645,7 +649,7 @@ fn open_units<V>(
         .filter(|(k, _)| !RESERVED_COLUMNS.contains(&k.as_str()))
 }
 
-fn table_exists(tx: &rusqlite::Connection, table: &str) -> StoreResult<bool> {
+fn table_exists(tx: &rusqlite::Connection, table: &str) -> RecordStoreResult<bool> {
     tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
         [table],
@@ -654,7 +658,7 @@ fn table_exists(tx: &rusqlite::Connection, table: &str) -> StoreResult<bool> {
     .store()
 }
 
-fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> StoreResult<bool> {
+fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> RecordStoreResult<bool> {
     tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
         params![table, column],
@@ -676,7 +680,7 @@ fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> StoreR
 /// does not exist — which is the state between the DROP and the RENAME. So the trigger is dropped
 /// first; `SCHEMA`, executed immediately after this, recreates it against the rebuilt table. All of
 /// it runs inside `migrate`'s single transaction: a crash anywhere leaves the v9 table intact.
-fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> StoreResult<()> {
+fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS keys_guard_hard_delete;
          CREATE TABLE usage_metering_v10 (
@@ -710,7 +714,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> StoreResult<()> 
 /// The v10 `keys` columns. Nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as it did:
 /// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
 /// attribution fields, which is what the contract says a key minted before them carries.
-fn add_v10_key_columns(tx: &rusqlite::Connection) -> StoreResult<()> {
+fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     const COLUMNS: [(&str, &str); 4] = [
         // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
         // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
@@ -791,7 +795,7 @@ mod legacy {
 /// digest stream the engine seals itself; a backend re-encoding a typed row into it would be forging
 /// the chain the engine verifies, and busbar ships no `call` migration either. The rows stay where
 /// they are, unread, so no evidence is destroyed by an upgrade.
-fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> StoreResult<()> {
+fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     let insert_record = |kind: &str,
                          identity: &str,
                          seq: i64,
@@ -800,7 +804,7 @@ fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> StoreResult<()> {
                          ts: i64,
                          terminal: bool,
                          body: Vec<u8>|
-     -> StoreResult<()> {
+     -> RecordStoreResult<()> {
         tx.execute(
             "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(kind, identity, seq) DO NOTHING",
@@ -951,9 +955,9 @@ fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> StoreResult<()> {
 }
 
 /// `serde_json`-encode one legacy row into the opaque body the plane decodes.
-fn encode<T: serde::Serialize>(row: &T) -> StoreResult<Vec<u8>> {
+fn encode<T: serde::Serialize>(row: &T) -> RecordStoreResult<Vec<u8>> {
     serde_json::to_vec(row)
-        .map_err(|e| StoreError(format!("v10 migration: encode a legacy plane row: {e}")))
+        .map_err(|e| RecordStoreError(format!("v10 migration: encode a legacy plane row: {e}")))
 }
 
 // `allowed_scopes` storage. The in-memory grant is `Option<Vec<ScopeRef>>`; on disk it is split by
@@ -1011,7 +1015,7 @@ fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<V
         // came in on a key the engine itself serialized, i.e. a kind the engine had registered, so
         // registering it on the way back out is restating the engine's own registration, never
         // widening it.
-        busbar_api::register_scope_kind(&kind);
+        busbar_contract::records::register_scope_kind(&kind);
         list.extend(values.into_iter().map(|value| ScopeRef {
             kind: kind.clone(),
             value,
@@ -1104,7 +1108,11 @@ fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
     })
 }
 
-fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -> StoreResult<()> {
+fn put_key_inner(
+    conn: &rusqlite::Connection,
+    key: &VirtualKey,
+    revision: i64,
+) -> RecordStoreResult<()> {
     // `?6` (created_at) seeds `updated_at` on a fresh INSERT, where created_at == updated_at is
     // correct. The ON CONFLICT branch must NOT reuse `?6` there -- every other mutation path in
     // this file (delete_key, scrub_key, revoke_credential) stamps updated_at to the actual
@@ -1156,7 +1164,7 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
     )
     .store()?;
     if affected == 0 {
-        return Err(StoreError(format!(
+        return Err(RecordStoreError(format!(
             "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
              tombstone",
             key.id
@@ -1165,8 +1173,8 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey, revision: i64) -
     Ok(())
 }
 
-impl Store for SqliteStore {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+impl RecordStore for SqliteStore {
+    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1177,7 +1185,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
+    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let conn = self.lock_reader();
         conn.query_row(
             &format!("SELECT {KEY_COLS} FROM keys WHERE id=?1"),
@@ -1188,7 +1196,7 @@ impl Store for SqliteStore {
         .store()
     }
 
-    fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(&format!("SELECT {KEY_COLS} FROM keys ORDER BY created_at"))
@@ -1197,7 +1205,7 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn list_keys_since(&self, since: u64) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(&format!(
@@ -1208,7 +1216,7 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn delete_key(&self, id: &str) -> StoreResult<()> {
+    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
@@ -1245,14 +1253,14 @@ impl Store for SqliteStore {
                 )
                 .store()?;
             if changed == 0 {
-                return Err(StoreError(format!("delete_key: no such key {id}")));
+                return Err(RecordStoreError(format!("delete_key: no such key {id}")));
             }
             tx.commit().store()?;
             Ok(())
         })
     }
 
-    fn scrub_key(&self, id: &str) -> StoreResult<()> {
+    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1267,7 +1275,7 @@ impl Store for SqliteStore {
             .store()?
             .flatten();
         if deleted_at.is_none() {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "scrub_key: key {id} is unknown or not yet tombstoned — delete_key it first"
             )));
         }
@@ -1281,7 +1289,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> StoreResult<()> {
+    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
@@ -1297,7 +1305,7 @@ impl Store for SqliteStore {
         &self,
         key: &VirtualKey,
         secret: &CredentialSecret,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
@@ -1311,7 +1319,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn list_credentials(&self, key_id: &str) -> StoreResult<Vec<CredentialMeta>> {
+    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(&format!(
@@ -1326,7 +1334,7 @@ impl Store for SqliteStore {
         &self,
         kind: &str,
         public_id: &str,
-    ) -> StoreResult<Option<CredentialSecret>> {
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
         let conn = self.lock_reader();
         conn.query_row(
             &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE kind=?1 AND public_id=?2"),
@@ -1337,7 +1345,7 @@ impl Store for SqliteStore {
         .store()
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> StoreResult<()> {
+    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
@@ -1365,7 +1373,9 @@ impl Store for SqliteStore {
                     )
                     .store()?;
                 if !exists {
-                    return Err(StoreError(format!("revoke_credential: unknown id '{id}'")));
+                    return Err(RecordStoreError(format!(
+                        "revoke_credential: unknown id '{id}'"
+                    )));
                 }
                 // Else: the row exists and was already revoked. Idempotent, per the contract.
             }
@@ -1374,7 +1384,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn list_credentials_since(&self, since: u64) -> StoreResult<Vec<CredentialSecret>> {
+    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(&format!(
@@ -1387,7 +1397,7 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let conn = self.lock_reader();
         // requests/billable_requests live EXCLUSIVELY on the reserved model='' sentinel row (see
         // put_usage/add_usage) — never duplicated across per-model rows, so there is exactly one
@@ -1475,7 +1485,7 @@ impl Store for SqliteStore {
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1530,7 +1540,12 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+    fn add_usage(
+        &self,
+        bucket_id: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1586,7 +1601,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn purge_windows_before(&self, before: u64) -> StoreResult<u64> {
+    fn purge_windows_before(&self, before: u64) -> RecordStoreResult<u64> {
         // Chunked: a single unchunked DELETE on the highest-churn table would transiently balloon
         // the WAL and monopolize the write lock. LIMIT on DELETE needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT
         // (not in the default rusqlite bundled build) — use the subquery form instead.
@@ -1646,7 +1661,7 @@ impl Store for SqliteStore {
         Ok(total)
     }
 
-    fn purge_metering_before(&self, bucket: &str) -> StoreResult<u64> {
+    fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
         let mut total = 0u64;
         loop {
             let mut conn = self.lock_writer();
@@ -1683,7 +1698,7 @@ impl Store for SqliteStore {
         Ok(total)
     }
 
-    fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
+    fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
         let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
         // would silently merge this accrual into a different card's cell.
@@ -1746,7 +1761,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare(
@@ -1811,7 +1826,7 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
         // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `as i64` wraps it negative and
         // `row_to_audit` clamps the negative back to 0 on read, so the record read back is NOT the
         // record written. An identical retry then compares unequal and is reported as "the audit
@@ -1820,7 +1835,7 @@ impl Store for SqliteStore {
         // trade that false alarm for silent loss, which is the wrong half to give up. Same guard as
         // store-postgres, where `clamp` produces the same hazard by a different route.
         if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
                  store a record that would not read back as itself",
                 entry.seq, entry.ts
@@ -1860,7 +1875,7 @@ impl Store for SqliteStore {
                     )
                     .store()?;
                 if &stored != entry {
-                    return Err(StoreError(format!(
+                    return Err(RecordStoreError(format!(
                         "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
                          has forked (stored action '{}', incoming '{}')",
                         entry.seq, stored.action, entry.action
@@ -1872,7 +1887,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare("SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq")
@@ -1881,7 +1896,7 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
         let conn = self.lock_reader();
         let mut stmt = conn
             .prepare("SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT ?1")
@@ -1895,7 +1910,7 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         // FULL sync, like every other revocation path. This is a token revocation: the operator is
         // told the subject is denied, and under WAL with `synchronous=NORMAL` that committed
         // transaction can be lost to a power cut seconds later, so the token is valid again on
@@ -1915,7 +1930,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
         let conn = self.lock_reader();
         let mut stmt = conn.prepare("SELECT sub FROM denylist").store()?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).store()?;
@@ -1930,7 +1945,7 @@ impl Store for SqliteStore {
     // retention rule part of the verb (`task`, below), so a kind a future plane declares is stored
     // and served exactly like the ones that exist today.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
         let row = PlaneRow::of(record, "upsert_plane_record")?;
         // FULL sync: an upserted record is a task state transition, a demotion (a quarantine), a
         // push-callback capability — each acknowledged to a caller and each worthless if a power cut
@@ -1952,7 +1967,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn get_plane_record(&self, kind: &str, id: &str) -> StoreResult<Option<Vec<u8>>> {
+    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
         // An upserted record lives at `(kind, id, 0)`. No caller-scoping filter, deliberately: an
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend, so the contract keeps it engine-side.
@@ -1966,7 +1981,7 @@ impl Store for SqliteStore {
         .store()
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
         let row = PlaneRow::of(record, "append_plane_record")?;
         // FULL sync: this is the tamper-evidence record of a transition or a call, and a chain with a
         // hole where a crash landed is a chain that fails to verify.
@@ -2003,7 +2018,7 @@ impl Store for SqliteStore {
                 }
                 // Names the position and nothing else — it must not echo stored (or caller)
                 // content back to whoever provoked it.
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "append_plane_record: kind '{}' already holds a different record at sequence {} \
                      of this chain; the chain has forked",
                     record.kind, record.seq
@@ -2024,7 +2039,7 @@ impl Store for SqliteStore {
         &self,
         kind: &str,
         selector: &PlaneSelector,
-    ) -> StoreResult<Vec<Vec<u8>>> {
+    ) -> RecordStoreResult<Vec<Vec<u8>>> {
         // UNFILTERED beyond the selector, terminal rows included: the boot rehydrate wants the active
         // rows, the retention sweep the terminal ones and a scoped listing one principal's, and a
         // store that pre-filtered for any one of those would break the other two. Oldest-first by
@@ -2057,7 +2072,7 @@ impl Store for SqliteStore {
         rows.store()
     }
 
-    fn list_plane_record_parents(&self, kind: &str) -> StoreResult<Vec<String>> {
+    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
         // The boot enumeration: a restart resumes a chain for a parent this process has never seen,
         // so every parent holding a record is named, exactly once.
         let conn = self.lock_reader();
@@ -2071,7 +2086,7 @@ impl Store for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> StoreResult<u64> {
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the kind's
         // own contract, read off the typed `disposition` column, never out of the body:
         // - `task` drops only TERMINAL rows. An interrupted task waiting on a human is exactly the row
@@ -2115,7 +2130,7 @@ impl Store for SqliteStore {
         Ok(removed as u64)
     }
 
-    fn delete_plane_record(&self, kind: &str, id: &str) -> StoreResult<()> {
+    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         // Deleting what is not there is a NO-OP, not an error: the engine clears on every
         // observation that agrees with an approval rather than tracking whether it had demoted, so
         // the common call is one against no row at all. Every `seq` under the identity goes, so a
@@ -2139,7 +2154,7 @@ impl Store for SqliteStore {
         token: &str,
         expires_at: u64,
         now: u64,
-    ) -> StoreResult<bool> {
+    ) -> RecordStoreResult<bool> {
         // REFUSED rather than clamped. A `now` clamped to `i64::MAX` would sweep the ENTIRE ledger
         // and then report the insert as a first redemption — an out-of-range argument silently
         // reopening every spent grant in the deployment. The only safe answer to a value this store
@@ -2184,7 +2199,7 @@ impl Store for SqliteStore {
         token: &str,
         expires_at: u64,
         now: u64,
-    ) -> StoreResult<bool> {
+    ) -> RecordStoreResult<bool> {
         // MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted record. LIVE
         // means all three: present, still `active`, and `now` not past `expires_at`. A missing row
         // holds no capability, a terminal one names work that has finished, and a lapsed one is dead
@@ -2224,7 +2239,7 @@ impl PlaneRow {
     /// Refused rather than mangled: `as i64` wraps a `u64` past `i64::MAX` negative and the read
     /// clamps it back, so the row read back would not be the row written — a wrapped `seq` reorders a
     /// chain and a wrapped `ts` changes what retention does to it, with no error ever reported.
-    fn of(record: &PlaneRecord, method: &str) -> StoreResult<Self> {
+    fn of(record: &PlaneRecord, method: &str) -> RecordStoreResult<Self> {
         Ok(Self {
             // A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
             identity: record.parent.clone().unwrap_or_else(|| record.id.clone()),
@@ -2255,9 +2270,9 @@ impl PlaneRow {
 /// `as i64` would wrap it negative and the read would clamp it back to something else again, so the
 /// row read back would not be the row written — and nothing would ever have reported an error. The
 /// same guard `append_audit` applies to its own `seq`/`ts`, factored out because the plane verbs share it.
-fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
+fn as_storable_i64(method: &str, field: &str, v: u64) -> RecordStoreResult<i64> {
     i64::try_from(v).map_err(|_| {
-        StoreError(format!(
+        RecordStoreError(format!(
             "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
              that would not read back as itself"
         ))
@@ -2268,7 +2283,7 @@ fn put_credential_inner(
     tx: &rusqlite::Transaction,
     secret: &CredentialSecret,
     revision: i64,
-) -> StoreResult<()> {
+) -> RecordStoreResult<()> {
     let m = &secret.meta;
     // The owning key must EXIST and be LIVE, checked in the caller's transaction. `delete_key`
     // cascades a key's credentials away precisely so the secret material stops resolving; accepting a
@@ -2286,13 +2301,13 @@ fn put_credential_inner(
         .store()?;
     match owner_live {
         None => {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "put_credential: owning key '{}' does not exist",
                 m.key_id
             )))
         }
         Some(false) => {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
             "put_credential: owning key '{}' is tombstoned; a revoked key takes no new credential",
             m.key_id
         )))
@@ -2335,12 +2350,12 @@ fn put_credential_inner(
             )
             .store()?;
         if occupied {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
                 m.slot, m.key_id, m.kind
             )));
         }
-        return Err(StoreError(format!(
+        return Err(RecordStoreError(format!(
             "put_credential: public_id {} is already taken for kind {}",
             m.public_id, m.kind
         )));
@@ -2366,6 +2381,23 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+mod door;
+pub use door::open;
+
+// THE DOOR (DECISIONS #2 rule (1)): this image's one registration. Emits `BUSBAR_COLD_ENTRY` (the
+// boundary a build that LINKS this crate hands the loader) and registers that same entry as the
+// door the contract SDK's frozen symbols answer through in the `busbar-store-sqlite-plugin` cdylib.
+busbar_contract::abi::sdk::export_store_plugin!(door::open);
+
+/// THE LINKED ENTRY: what a busbar build that links this store registers onto the cold-kind axis —
+/// the same row a dropped-in `busbar-store-sqlite-plugin` tarball states, opened in process.
+pub mod linked {
+    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs
+    /// over, exactly what the dropped-in tarball states and exports.
+    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
+        ("busbar-store-sqlite", "sqlite", &super::BUSBAR_COLD_ENTRY);
 }
 
 #[cfg(test)]

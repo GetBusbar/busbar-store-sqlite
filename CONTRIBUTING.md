@@ -39,10 +39,10 @@ cargo fmt --all -- --check                   # format before committing
 
 ## Architecture
 
-This repo is deliberately a thin adapter (`src/lib.rs`): it turns the engine's
-JSON `open` config into a `SqliteStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the C ABI symbols the loader resolves. The actual schema and
+The `store-sqlite-plugin` crate is deliberately a thin adapter: it re-exports
+`busbar-store-sqlite`, whose `open` turns the engine's JSON config into a
+`SqliteStore` and whose `busbar_contract::abi::sdk::export_store_plugin!(open)`
+registers the door the loader resolves. The actual schema and
 persistence logic lives in the `busbar-store-sqlite` library crate this plugin
 wraps, in the `store-sqlite/` directory of THIS repository. Most substantive
 changes belong here, not in the `busbar` monorepo.

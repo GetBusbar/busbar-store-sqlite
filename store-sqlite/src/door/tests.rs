@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::open;
-fn expect_err(result: Result<Box<dyn busbar_api::Store>, String>) -> String {
+fn expect_err(result: Result<Box<dyn busbar_contract::records::RecordStore>, String>) -> String {
     match result {
         Ok(_) => panic!("expected open() to fail, but it succeeded"),
         Err(e) => e,
@@ -104,7 +104,7 @@ fn explicit_in_memory_db_path_is_honored() {
     // Proves `db_path` is actually read (not ignored in favor of the default) via the one value
     // that's observable without touching disk: `:memory:` opens instantly with no file created.
     let store = open(r#"{"db_path": ":memory:"}"#).expect("in-memory db_path must open");
-    let key = busbar_api::VirtualKey {
+    let key = busbar_contract::records::VirtualKey {
         id: "vk_adapter_test".into(),
         generation_hash: "h".into(),
         name: "n".into(),
