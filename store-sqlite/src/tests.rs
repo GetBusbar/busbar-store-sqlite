@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{AuditRecord, ModelTokensDelta, Store, VirtualKey};
+use busbar_contract::records::{AuditRecord, ModelTokensDelta, RecordStore, VirtualKey};
 use rusqlite::TransactionBehavior;
 
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
@@ -1388,7 +1388,7 @@ fn call_record(c: &CallBody) -> PlaneRecord {
     }
 }
 
-fn append_call(s: &SqliteStore, c: &CallBody) -> StoreResult<()> {
+fn append_call(s: &SqliteStore, c: &CallBody) -> RecordStoreResult<()> {
     s.append_plane_record(&call_record(c))
 }
 

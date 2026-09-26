@@ -40,13 +40,13 @@ All the actual SQLite logic — schema, key/usage/audit persistence, a
 mutex-guarded writer connection plus a small pool of `query_only` reader
 connections (so a long billing report or retention sweep never blocks the
 hot-path usage flush) — lives in the `busbar-store-sqlite` `lib` crate in
-this repository's `store-sqlite/` directory. This crate is
-deliberately tiny: it adapts the engine's JSON `open` config into a
-`SqliteStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the six `extern "C"` symbols the loader resolves. (A custom
-build can also link `busbar-store-sqlite` statically instead of using
-this dynamic wrapper — see busbar's plugin docs.)
+this repository's `store-sqlite/` directory. The
+`store-sqlite-plugin` crate is deliberately tiny: the logic crate also holds
+its one door registration (`busbar_contract::abi::sdk::export_store_plugin!(open)`,
+where `open` adapts the engine's JSON config into a `SqliteStore`), and the
+plugin crate re-exports it, so the cdylib answers the loader through the same
+door a busbar build that LINKS `busbar-store-sqlite` registers (its
+`linked::STORE` row) — one source, both doors.
 
 ## What it is for
 
@@ -75,23 +75,19 @@ cargo fmt --all -- --check
 
 ## Dependencies
 
-This crate depends on `busbar-api`, `busbar-store-sqlite`, and
-`busbar-plugin-sdk` (and, as a dev-dependency for the end-to-end test,
-`busbar-plugin-loader`) from the
-[busbar](https://github.com/GetBusbar/busbar) monorepo. Because
-busbar is not yet public, `Cargo.toml` points at these as **local path
-dependencies** (`../busbar/crates/...`), which means this repo expects
-to be checked out as a sibling of `busbar`:
+The only busbar crate this repo names is `busbar-contract` (plus
+`busbar-plugin-loader`, dev-only, for the conformance and end-to-end tests),
+as a **git dependency** on [busbar](https://github.com/GetBusbar/busbar)
+pinned to the rev in field 1 of `.busbar-ref`. No sibling checkout is needed
+to build or unit-test. The end-to-end tests (`store-sqlite-plugin/tests/e2e.rs`)
+boot a REAL busbar binary, so they need a busbar checkout at that same rev:
+set `BUSBAR_CHECKOUT=/path/to/busbar`, or check it out as a sibling:
 
 ```
 some-parent-dir/
 ├── busbar/
 └── store-sqlite/
 ```
-
-This is an interim measure — once busbar ships publicly, these should
-become git (pinned rev/tag) or crates.io dependencies instead. Grep
-`Cargo.toml` for the `INTERIM` comments when doing that migration.
 
 ## Pack and sign
 
@@ -153,10 +149,12 @@ default. Only an *absent* key falls back to its default.
 
 ## Tests
 
-`cargo test` runs both the pure unit tests (`src/lib.rs` — adapting the
-engine's JSON config into a `SqliteStore`; the underlying SQLite/
-governance logic is `busbar-store-sqlite`'s own job, covered by that
-crate's own test suite) and the end-to-end test in `tests/e2e.rs`, which
+`cargo test` runs the store's own suite (`store-sqlite/src/tests*`, including
+the config-adapting `open` in `store-sqlite/src/door/tests.rs`), the
+linked == dropped-in conformance test (`store-sqlite-plugin/tests/conformance.rs`:
+the linked `linked::STORE` row and the signed, dropped-in cdylib driven through
+one scenario, including a restart, and compared byte for byte, with RED arms),
+and the end-to-end tests in `store-sqlite-plugin/tests/e2e.rs`, which
 loads the *built* cdylib over the real `busbar-plugin-loader` ABI seam
 — the same seam busbar's engine uses — against a real SQLite file on
 disk. It writes a key and a usage ledger through the plugin over the C

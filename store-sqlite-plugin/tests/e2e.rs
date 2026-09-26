@@ -44,9 +44,9 @@
 //! /api/v1/admin/keys`, and independently verifies both landed in the real on-disk file with a
 //! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
-use busbar_api::{
-    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, Store, UsageLedger, UNIT_INPUT,
-    UNIT_OUTPUT,
+use busbar_contract::records::{
+    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageLedger,
+    UNIT_INPUT, UNIT_OUTPUT,
 };
 use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ impl Drop for ScratchDir {
 ///     coverage of the ten task/call-log methods.
 ///   * STALE artifact -> a cdylib older than the ABI relay answers every write `Ok(())` and every
 ///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none
+///     exists to catch (that defect was real: `DynStore`'s `impl RecordStore` overrode 24 methods, none
 ///     of them task methods, so `put_task` took the accept-and-keep-nothing trait default). RED on
 ///     a stale artifact is indistinguishable from RED on the real bug; and an artifact that happens
 ///     to be NEWER than a regression reports GREEN while the shipped ABI is broken.
@@ -218,13 +218,21 @@ fn referenced_env_vars(text: &str) -> Vec<String> {
 /// `auth.signing_key` and harmless as any other secret's value.
 const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
-/// The sibling busbar checkout's root (same convention this repo already uses for its path deps
-/// in Cargo.toml).
+/// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` if set, else the sibling
+/// `../../busbar` (relative to this crate). It must be a checkout of the rev `.busbar-ref` pins — CI
+/// checks exactly that rev out beside this repo. Missing is a FAILURE, never a skip: these tests are
+/// the only proof the plugin installs through a real busbar's boot and admin paths.
 fn busbar_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbar")
-        .canonicalize()
-        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
+    let root = std::env::var_os("BUSBAR_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"));
+    root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT or check GetBusbar/busbar out \
+             at the `.busbar-ref` rev beside this repo",
+            root.display()
+        )
+    })
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
@@ -232,15 +240,15 @@ fn busbar_root() -> PathBuf {
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-sdk` (busbar 1.6.0 folded
-    // the standalone pack crate into the SDK), built exactly the way plugin-ci.yml builds it.
+    // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` (roster def 14:
+    // author-side packaging lives with the loader that verifies what it packs).
     for args in [
         &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
         &[
             "build",
             "--release",
             "-p",
-            "busbar-plugin-sdk",
+            "busbar-plugin-loader",
             "--features",
             "pack",
             "--bin",
@@ -420,7 +428,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
         .expect("open the real file directly with the plain SqliteStore, bypassing the plugin");
     assert!(
-        Store::list_keys(&direct).unwrap().is_empty(),
+        RecordStore::list_keys(&direct).unwrap().is_empty(),
         "a freshly migrated, never-written store must have zero keys, not error out"
     );
     drop(direct);
@@ -774,12 +782,12 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     // live admin API just wrote. ──
     let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
         .expect("open the real file directly, bypassing the plugin and the admin API");
-    let key = Store::get_key(&direct, &key_id).unwrap().expect(
+    let key = RecordStore::get_key(&direct, &key_id).unwrap().expect(
         "the virtual key minted over the admin API must be readable directly from the file",
     );
     assert_eq!(key.name, "e2e-admin-api-key");
 
-    let creds = Store::list_credentials(&direct, &key_id).unwrap();
+    let creds = RecordStore::list_credentials(&direct, &key_id).unwrap();
     let cred = creds.iter().find(|c| c.public_id == access_key_id).expect(
         "the AWS SigV4 credential minted over the admin API must be readable directly \
              from the file, keyed by the same access-key-id the admin API returned",
@@ -843,7 +851,7 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// busbar 1.6.0 carries every durable plane record — an A2A task and its provenance chain, the MCP
 /// per-call log — through eight kind-tagged verbs (`upsert_plane_record`, `append_plane_record`,
 /// `list_plane_records`, `list_plane_record_parents`, `purge_plane_records_before`, …), all of which
-/// `busbar_api::Store` DEFAULTS to accept-and-keep-nothing. A plugin seam that does not RELAY them
+/// `busbar_contract::records::RecordStore` DEFAULTS to accept-and-keep-nothing. A plugin seam that does not RELAY them
 /// silently substitutes those defaults: every write returns `Ok`, every read answers empty, and a
 /// deployment running this backend as a plugin — which is the ONLY way it ever runs — loses every
 /// in-flight task and every tool-call record while reporting success. Tests of `SqliteStore` called
@@ -1080,7 +1088,7 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE, OVER THE REAL PLUGIN PATH.
 ///
-/// Same reasoning as the task/call-log test above, and a sharper cost. `busbar_api::Store` defaults
+/// Same reasoning as the task/call-log test above, and a sharper cost. `busbar_contract::records::RecordStore` defaults
 /// the plane verbs to accept-and-keep-nothing, `redeem_plane_token` to `false` and
 /// `plane_token_live` to `false`, so a seam that does not RELAY them substitutes silent failures:
 ///

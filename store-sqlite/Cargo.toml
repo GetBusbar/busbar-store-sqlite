@@ -2,25 +2,30 @@
 [package]
 name = "busbar-store-sqlite"
 version = "1.0.0"
-publish = false            # internal workspace crate; never goes to crates.io
+publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
 rust-version = "1.97"
-description = "The SQLite backend for busbar's durable governance store: implements busbar_api::Store on rusqlite (bundled)."
+description = "The SQLite backend for busbar's durable governance store: implements busbar_contract::records::RecordStore on rusqlite (bundled)."
 license = "Apache-2.0"
 
+[lib]
+# rlib: THE LOGIC and its one door registration (`export_store_plugin!(open)`, its `linked::STORE`
+# row and `BUSBAR_COLD_ENTRY`). The sibling `busbar-store-sqlite-plugin` cdylib re-exports it as the
+# dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+crate-type = ["rlib"]
+
 [dependencies]
-# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-sqlite-plugin.
-busbar-api = { path = "../../busbar/crates/api" }
-# `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all —
-# same as the busbar in-tree crate this was extracted from.
+# The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
+# as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
+# build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
+# contract links.
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+# `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all.
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde_json = "1"
 # `derive` for the v10 migration's legacy row encoders (and the conformance suite's stand-in bodies).
 serde = { version = "1", features = ["derive"] }
 
-# NO DEV-DEPENDENCIES. The `Store` contract conformance suite used to arrive here as
-# `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a
-# shared test util between plugins, so this crate owns its copy at `src/tests/store_conformance.rs`.
-# All it needs is `busbar-api`, which is already a normal dependency above.
+# NO DEV-DEPENDENCIES. The `RecordStore` contract conformance suite lives in this crate's own
+# `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins); all it needs is
+# `busbar-contract`, already a normal dependency above.
