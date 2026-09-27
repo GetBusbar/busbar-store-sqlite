@@ -13,7 +13,7 @@
 //! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` genuinely
 //! exercises the trust gate + ABI dlopen + `Store::open`/schema migration, so a successful validate
 //! is real proof the plugin loads and initializes through busbar's own boot path, not a proxy for
-//! it. Mirrors the pattern `GetBusbar/store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
+//! it. Mirrors the pattern `GetBusbar/busbar-store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
 //! (see that file's module doc for the fuller rationale); SQLite needs no external service, so
 //! there is no `postgres_url()`-style skip gate here.
 //!
@@ -194,7 +194,7 @@ fn plugin_path() -> PathBuf {
 /// a real-looking env var (here, `MOCK_KEY`) then fails `--validate` on any machine that doesn't
 /// happen to have that var set -- which is every CI runner and most dev machines. Hardcoding
 /// `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future one, names
-/// a different variable. Extracting the names generically (same approach `GetBusbar/store-mysql`'s
+/// a different variable. Extracting the names generically (same approach `GetBusbar/busbar-store-mysql`'s
 /// own `store-mysql-plugin/tests/e2e.rs` already took for this exact change, and the core repo's
 /// `crates/busbar/tests/docs_examples.rs`) keeps the harness working no matter what the fixture
 /// references.
