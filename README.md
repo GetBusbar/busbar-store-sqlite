@@ -1,4 +1,14 @@
-# store-sqlite
+<!-- fleet:header:begin (rendered by `cargo xtask fleet render` from GetBusbar/busbar's plugins.yaml; edit it there) -->
+# busbar-store-sqlite
+
+First-party signed kind:store plugin cdylib: the SQLite governance store packaged as a droppable busbar plugin exporting the store C ABI. Drop the built library into the plugins folder and set store.module: sqlite.
+
+| kind | alias | crate | busbar | license |
+|---|---|---|---|---|
+| `store` | `sqlite` | `busbar-store-sqlite-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+
+[![ci](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml)
+<!-- fleet:header:end -->
 
 **This plugin's version: v1.0.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
