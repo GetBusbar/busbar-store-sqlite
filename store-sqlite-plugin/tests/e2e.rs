@@ -303,7 +303,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-sqlite-plugin",
+            "busbar-store-sqlite",
             "--alias",
             "sqlite",
             "--kind",
@@ -494,7 +494,7 @@ fn pack_sqlite_tarball(
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-sqlite-plugin",
+            "busbar-store-sqlite",
             "--alias",
             "sqlite",
             "--kind",
@@ -666,7 +666,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     );
     let installed: serde_json::Value = install_resp.json().unwrap();
     assert_eq!(installed["file"], file);
-    assert_eq!(installed["name"], "busbar-store-sqlite-plugin");
+    assert_eq!(installed["name"], "busbar-store-sqlite");
     assert!(
         plugins_dir.join(file).exists(),
         "the admin API install must have written the tarball to the real plugins dir"
