@@ -2929,3 +2929,94 @@ fn a_real_v9_database_from_the_pre_port_dev_build_opens_and_upgrades_losslessly(
     drop(again);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// TWO FIRST-OPENS OF ONE UN-MIGRATED FILE. `migrate` gates its destructive pre-v5 drop on the
+/// file's `user_version`, so that version must be the one inside the write transaction. Here a raw
+/// connection plays the process that migrates first: it holds `BEGIN IMMEDIATE`, lays down the
+/// current schema with a marker revision, stamps the current version and commits only after the
+/// second store's `open` is already waiting on the lock. A version read before the lock is still 0
+/// by then, the second open takes the drop path, and the first process's tables are wiped.
+#[test]
+fn a_second_first_open_waiting_on_the_lock_does_not_rerun_the_destructive_migration() {
+    let dir = tempdir();
+    let path = dir.join("two-first-opens.db");
+    let path_str = path.to_str().unwrap().to_string();
+    // An empty file already in WAL mode, so the waiting open's pragmas never need the lock.
+    {
+        let setup = Connection::open(&path).unwrap();
+        setup
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
+            .unwrap();
+    }
+
+    let first = Connection::open(&path).unwrap();
+    first
+        .execute_batch("PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE;")
+        .unwrap();
+    first.execute_batch(SCHEMA).unwrap();
+    first
+        .execute_batch(&format!(
+            "INSERT INTO store_revision (id, revision) VALUES (0, 42); \
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .unwrap();
+
+    let reopened = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| SqliteStore::open(&path_str, 10_000));
+        // Long enough for the second open to reach its BEGIN IMMEDIATE and wait there.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        first.execute_batch("COMMIT").unwrap();
+        waiter.join().unwrap()
+    })
+    .expect("the second open waits for the first migration and then opens");
+
+    let revision: i64 = reopened
+        .lock_reader()
+        .query_row("SELECT revision FROM store_revision WHERE id = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        revision, 42,
+        "the second open re-ran the pre-v5 drop against the tables the first open had just \
+         migrated: it gated the drop on a user_version read before it held the write lock"
+    );
+    drop(reopened);
+    drop(first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A FILE FROM A LATER BUILD IS REFUSED, NOT RESTAMPED. Opening it would run this build's schema
+/// pass over it and stamp it back down to `SCHEMA_VERSION`, so the newer build would later re-run
+/// its own version-gated steps against data it already migrated.
+#[test]
+fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
+    let dir = tempdir();
+    let path = dir.join("newer.db");
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL; PRAGMA user_version = {};",
+            SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+    }
+    let err = match SqliteStore::open(path.to_str().unwrap(), 5000) {
+        Ok(_) => panic!("a database stamped by a newer build must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        err.0.contains(&format!("v{}", SCHEMA_VERSION + 1)) && err.0.contains("newer"),
+        "the refusal names the file's version and why: {err:?}"
+    );
+    let v: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        v,
+        SCHEMA_VERSION + 1,
+        "a refused open must not restamp the file's version"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
