@@ -84,6 +84,32 @@ impl Drop for ScratchDir {
     }
 }
 
+/// A spawned busbar process that is killed and reaped when it goes out of scope, including on a
+/// panicking assertion partway through a test. Without it, a failed assertion between spawn and
+/// the explicit kill leaves a running gateway holding its ports and its sqlite file after the
+/// scratch directory is gone. Declared after the test's `ScratchDir`, so it drops (kills) first.
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
 ///
 /// This looks in `target/<profile>/deps/`, NOT `target/<profile>/`, and that distinction is the
@@ -120,7 +146,10 @@ impl Drop for ScratchDir {
 ///
 /// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
 /// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
-/// fail a perfectly current cdylib.
+/// fail a perfectly current cdylib. The same holds for the `#[cfg(test)]` modules this repo keeps
+/// under `src/` (a `tests.rs` file, and anything in a `src/**/tests/` directory, pulled in by
+/// `#[path]`): they are absent from the non-test lib's dep-info, so cargo never rebuilds the cdylib
+/// for them, and counting them would fail every e2e with STALE ARTIFACT after a unit-test edit.
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -128,6 +157,12 @@ fn newest_source_mtime() -> std::time::SystemTime {
         };
         for e in rd.flatten() {
             let p = e.path();
+            let is_test_module = p
+                .file_name()
+                .is_some_and(|n| n == "tests" || n == "tests.rs");
+            if is_test_module {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, newest);
             } else if p.extension().is_some_and(|x| x == "rs") {
@@ -395,11 +430,12 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     for name in referenced_env_vars(&config_text) {
         boot_cmd.env(name, SECRET_PLACEHOLDER);
     }
-    let mut child = boot_cmd
+    let child = boot_cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn a real busbar boot");
+    let mut child = KillOnDrop(child);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let booted = loop {
         if db_path.exists() {
@@ -628,7 +664,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     };
     let admin_addr1 = format!("127.0.0.1:{admin_addr1}");
 
-    let mut child1 = Command::new(&busbar_bin)
+    let child1 = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config1)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
@@ -640,6 +676,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn boot 1 (memory store, admin listener up)");
+    let mut child1 = KillOnDrop(child1);
     assert!(
         wait_for_admin_ready(&client, &admin_addr1, ADMIN_TOKEN, &mut child1),
         "boot 1's admin API must become ready within 15s"
@@ -717,7 +754,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     };
     let admin_addr2 = format!("127.0.0.1:{admin_addr2}");
 
-    let mut child2 = Command::new(&busbar_bin)
+    let child2 = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config2)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", ADMIN_TOKEN)
@@ -729,6 +766,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn boot 2 (sqlite store, over the admin-API-installed plugin)");
+    let mut child2 = KillOnDrop(child2);
     assert!(
         wait_for_admin_ready(&client, &admin_addr2, ADMIN_TOKEN, &mut child2),
         "boot 2 (real dlopen of the admin-API-installed sqlite plugin, real Store::open/migrate) \
