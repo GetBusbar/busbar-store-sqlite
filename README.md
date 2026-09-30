@@ -10,6 +10,8 @@ First-party signed kind:store plugin cdylib: the SQLite governance store package
 [![ci](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
+## What it is for
+
 **This plugin's version: v1.0.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
@@ -25,7 +27,7 @@ built library into busbar's plugins folder, set
 `store: { module: sqlite, settings: {...} }`, and busbar loads it in-process at boot
 (`dlopen`'d, not spawned as a separate process).
 
-## Versioning
+### Versioning
 
 This plugin is versioned **independently of busbar** — `v1.0.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
@@ -35,7 +37,7 @@ replaced the per-protocol task/MCP methods, and the 1.6.0 key, usage and
 metering record shapes). Pin both versions explicitly in production; do
 not assume they move together.
 
-## Upgrading an existing database
+### Upgrading an existing database
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
@@ -58,7 +60,6 @@ plugin crate re-exports it, so the cdylib answers the loader through the same
 door a busbar build that LINKS `busbar-store-sqlite` registers (its
 `linked::STORE` row) — one source, both doors.
 
-## What it is for
 
 - The **default durable store** for busbar's governance data: virtual
   keys, credentials, usage and metering ledgers, the durable audit log,
@@ -68,6 +69,32 @@ door a busbar build that LINKS `busbar-store-sqlite` registers (its
   single-node, file-backed, zero external dependencies (SQLite is bundled).
 - The reference `kind: store` plugin: a minimal example of adapting an
   engine-agnostic storage backend to the plugin C ABI.
+
+## Config
+
+| Setting | Required | Default | Notes |
+|---|---|---|---|
+| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
+| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value is rejected as a config error, since it can only be a mistake. |
+
+**`db_path` must be an explicit absolute path in any real deployment.** The
+`busbar-governance.db` default is resolved relative to the engine
+process's *current working directory* at the moment it calls `open` —
+not relative to the plugin, the config file, or `plugins.dir`. Under
+systemd without an explicit `WorkingDirectory=`, or across a deploy that
+changes cwd between restarts, the engine can silently bind to a
+*different* file each time: it boots healthy, but against an empty
+database (no virtual keys, no budgets, no usage history). This looks
+like nothing is wrong at boot — it reads as data loss only once someone
+notices the governance state is missing. Always set `db_path` to a full
+absolute path (e.g. `/var/lib/busbar/governance.db`, as in the example
+above) in production.
+
+A `db_path`/`busy_timeout_ms` key that is *present* in the config but
+the wrong JSON type (a number for `db_path`, a string for
+`busy_timeout_ms`, etc.) — or a negative `busy_timeout_ms` — is a config
+error and `open` fails loudly — it is never silently replaced with the
+default. Only an *absent* key falls back to its default.
 
 ## Build
 
@@ -83,7 +110,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## Dependencies
+### Dependencies
 
 The only busbar crate this repo names is `busbar-contract` (plus
 `busbar-plugin-loader`, dev-only, for the conformance and end-to-end tests),
@@ -99,7 +126,7 @@ some-parent-dir/
 └── store-sqlite/
 ```
 
-## Pack and sign
+### Pack and sign
 
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
@@ -130,32 +157,6 @@ store:
 
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
-
-## Config
-
-| Setting | Required | Default | Notes |
-|---|---|---|---|
-| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
-| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value is rejected as a config error, since it can only be a mistake. |
-
-**`db_path` must be an explicit absolute path in any real deployment.** The
-`busbar-governance.db` default is resolved relative to the engine
-process's *current working directory* at the moment it calls `open` —
-not relative to the plugin, the config file, or `plugins.dir`. Under
-systemd without an explicit `WorkingDirectory=`, or across a deploy that
-changes cwd between restarts, the engine can silently bind to a
-*different* file each time: it boots healthy, but against an empty
-database (no virtual keys, no budgets, no usage history). This looks
-like nothing is wrong at boot — it reads as data loss only once someone
-notices the governance state is missing. Always set `db_path` to a full
-absolute path (e.g. `/var/lib/busbar/governance.db`, as in the example
-above) in production.
-
-A `db_path`/`busy_timeout_ms` key that is *present* in the config but
-the wrong JSON type (a number for `db_path`, a string for
-`busy_timeout_ms`, etc.) — or a negative `busy_timeout_ms` — is a config
-error and `open` fails loudly — it is never silently replaced with the
-default. Only an *absent* key falls back to its default.
 
 ## Tests
 
