@@ -94,7 +94,11 @@ A `db_path`/`busy_timeout_ms` key that is *present* in the config but
 the wrong JSON type (a number for `db_path`, a string for
 `busy_timeout_ms`, etc.) — or a negative `busy_timeout_ms` — is a config
 error and `open` fails loudly — it is never silently replaced with the
-default. Only an *absent* key falls back to its default.
+default. An *absent* key falls back to its default, and so does a key
+whose value is an explicit JSON `null`: `null` is read as absent (the
+behaviour this plugin has always had). A template variable that renders
+`db_path` as `null` therefore opens the default relative path, which is
+one more reason to set it explicitly.
 
 ## Build
 

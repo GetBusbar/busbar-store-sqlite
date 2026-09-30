@@ -46,6 +46,10 @@ struct ScratchCwd {
     scratch: std::path::PathBuf,
 }
 
+/// Serialises every test that switches the process cwd (`ScratchCwd`), since cargo runs tests in
+/// parallel and the cwd is process-global.
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl ScratchCwd {
     fn enter(tag: &str) -> Self {
         let original = std::env::current_dir().expect("read the current cwd");
@@ -81,6 +85,7 @@ fn empty_and_bare_object_configs_use_defaults_and_succeed() {
     // `#[test]`s) because `set_current_dir` is process-global — two tests changing it concurrently
     // under cargo's parallel runner would race each other, and both would otherwise try to open the
     // same default-named file concurrently and contend on SQLite's file lock.
+    let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let cwd = ScratchCwd::enter("empty-and-bare");
 
     let store = open("").expect("empty config must fall back to defaults and succeed");
@@ -231,4 +236,41 @@ fn busy_timeout_ms_is_actually_applied() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An explicit JSON `null` for either key is read as ABSENT and falls back to the default, the
+/// semantics this plugin shipped with in busbar 1.5.5. Pinned so a change to them is a decision,
+/// not an accident: `db_path: null` opens the default relative file, exactly as `{}` does.
+#[test]
+fn null_db_path_and_busy_timeout_read_as_absent() {
+    let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cwd = ScratchCwd::enter("null-reads-as-absent");
+    let store = open(r#"{"db_path": null, "busy_timeout_ms": null}"#)
+        .expect("an explicit null must fall back to the defaults and succeed");
+    drop(store);
+    assert!(
+        cwd.scratch.join("busbar-governance.db").exists(),
+        "`db_path: null` must have opened the default-named db in the scratch cwd"
+    );
+}
+
+/// `0` is a legal, deliberate "never retry" setting (only a negative value is refused), so it must
+/// open.
+#[test]
+fn zero_busy_timeout_ms_is_accepted() {
+    open(r#"{"db_path": ":memory:", "busy_timeout_ms": 0}"#)
+        .expect("busy_timeout_ms 0 is a legal explicit setting and must open");
+}
+
+/// An unsigned value past `i64::MAX` passes the integer type check (`is_u64`) but cannot be a
+/// SQLite busy timeout; it must be refused as out of range, never wrapped or clamped.
+#[test]
+fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
+    let err = expect_err(open(
+        r#"{"db_path": ":memory:", "busy_timeout_ms": 18446744073709551615}"#,
+    ));
+    assert!(
+        err.contains("busy_timeout_ms") && err.contains("out of range"),
+        "error should name the offending field and say it is out of range: {err}"
+    );
 }
