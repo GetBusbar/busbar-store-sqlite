@@ -17,11 +17,12 @@ use busbar_contract::records::RecordStore;
 /// ```
 ///
 /// A key that is ABSENT falls back to its default (this plugin's whole design point — an empty
-/// `{}` must work). A key that is PRESENT but the wrong JSON type (e.g. `db_path: 5` or
-/// `busy_timeout_ms: "5000"`) is a config error, not silently defaulted: a template variable that
-/// resolves to `null`/a number for `db_path` must never be swallowed into quietly opening the
-/// default relative path — that reads as a healthy boot against an empty governance database
-/// (data loss), not a config error.
+/// `{}` must work), and so does a key whose value is an explicit JSON `null`: `null` is read as
+/// absent, the semantics this plugin has shipped with since busbar 1.5. A key that is PRESENT with
+/// any other wrong JSON type (e.g. `db_path: 5` or `busy_timeout_ms: "5000"`) is a config error,
+/// not silently defaulted: a template variable that resolves to a number for `db_path` must never
+/// be swallowed into quietly opening the default relative path — that reads as a healthy boot
+/// against an empty governance database (data loss), not a config error.
 pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     let v: serde_json::Value = if cfg.trim().is_empty() {
         serde_json::Value::Object(Default::default())
