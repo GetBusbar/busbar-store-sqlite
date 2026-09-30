@@ -1083,6 +1083,35 @@ fn purge_windows_before_purges_past_a_single_chunk_boundary() {
     assert!(s.get_usage("vk_chunk", 0).unwrap().requests == 0);
 }
 
+/// A window whose rows STRADDLE a 5000-row batch boundary is still one window. 4999 windows of a
+/// lone sentinel row, then one window of a sentinel plus three model rows: 5003 rows in 5000
+/// windows, and the first batch ends on the last window's sentinel, so its model rows fall into
+/// the second batch. Counting the distinct windows each batch touches counts that window twice.
+#[test]
+fn purge_windows_before_counts_a_window_split_across_batches_once() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.lock_writer()
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 4998)
+             INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
+               SELECT i, 'vk_straddle', '', 1, 1 FROM n;
+             INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
+               VALUES (4999, 'vk_straddle', '', 1, 1), (4999, 'vk_straddle', 'm1', 0, 0),
+                      (4999, 'vk_straddle', 'm2', 0, 0), (4999, 'vk_straddle', 'm3', 0, 0);",
+        )
+        .unwrap();
+    assert_eq!(
+        s.purge_windows_before(10_000).unwrap(),
+        5000,
+        "5000 windows were purged; a window whose rows straddle two batches must be counted once"
+    );
+    let left: i64 = s
+        .lock_reader()
+        .query_row("SELECT COUNT(*) FROM usage_windows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "every stale row is gone");
+}
+
 #[test]
 fn purge_metering_before_purges_past_a_single_chunk_boundary() {
     let s = SqliteStore::open_in_memory().unwrap();

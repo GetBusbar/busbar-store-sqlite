@@ -1633,27 +1633,28 @@ impl RecordStore for SqliteStore {
             // reserved `model = ''` sentinel row plus one row per model, so a row count is the
             // window count multiplied by that window's model cardinality. The contract is "returns
             // the number of windows purged", and a figure that moves with model cardinality cannot
-            // be reconciled against the retention the caller asked for. Counted before the DELETE,
-            // inside the same transaction, so it matches exactly what this batch removes.
-            let windows_in_batch: u64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM (
-                        SELECT DISTINCT window_start, bucket_id FROM usage_windows
-                        WHERE (window_start, bucket_id, model) IN (
+            // be reconciled against the retention the caller asked for. A window is counted by its
+            // SENTINEL row, which every window has exactly one of (`put_usage`/`add_usage` always
+            // write it): a window whose rows straddle two batches is then counted once, in the
+            // batch that deletes its sentinel, never once per batch. Read off the rows the DELETE
+            // itself reports, so it matches exactly what this batch removes.
+            let (changed, windows_in_batch) = {
+                let mut stmt = tx
+                    .prepare(
+                        "DELETE FROM usage_windows WHERE (window_start, bucket_id, model) IN (
                             SELECT window_start, bucket_id, model FROM usage_windows
-                            WHERE window_start < ?1 LIMIT 5000))",
-                    params![before as i64],
-                    |r| r.get::<_, i64>(0),
-                )
-                .store()? as u64;
-            let changed = tx
-                .execute(
-                    "DELETE FROM usage_windows WHERE (window_start, bucket_id, model) IN (
-                        SELECT window_start, bucket_id, model FROM usage_windows
-                        WHERE window_start < ?1 LIMIT 5000)",
-                    params![before as i64],
-                )
-                .store()?;
+                            WHERE window_start < ?1 LIMIT 5000)
+                         RETURNING model = ''",
+                    )
+                    .store()?;
+                let sentinels = stmt
+                    .query_map(params![before as i64], |r| r.get::<_, bool>(0))
+                    .store()?
+                    .collect::<Result<Vec<bool>, _>>()
+                    .store()?;
+                let windows = sentinels.iter().filter(|s| **s).count() as u64;
+                (sentinels.len(), windows)
+            };
             tx.commit().store()?;
             total += windows_in_batch;
             if changed < 5000 {
