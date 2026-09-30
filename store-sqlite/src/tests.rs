@@ -2065,7 +2065,7 @@ fn migrate_v9_to_v10_adds_the_plane_tables_without_wiping_data() {
     append_call(&s, &sample_call("vk_v9", 1, 10, "", "h1"))
         .expect("the newly created plane_records table must be writable after the migration");
     assert_eq!(list_calls(&s, "vk_v9").len(), 1);
-    assert!(s.redeem_plane_token("approval", "n", 20, 10).unwrap());
+    assert!(s.redeem_plane_token("ask", "n", 20, 10).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2206,7 +2206,7 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
     {
         let s = SqliteStore::open(&path, 5000).unwrap();
         assert!(
-            s.redeem_plane_token("approval", "nonce-a", expires, now)
+            s.redeem_plane_token("ask", "nonce-a", expires, now)
                 .unwrap(),
             "the FIRST redemption is the one that must proceed, or nothing below is about single use"
         );
@@ -2216,7 +2216,7 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
     let reopened = SqliteStore::open(&path, 5000).unwrap();
     assert!(
         !reopened
-            .redeem_plane_token("approval", "nonce-a", expires, now + 1)
+            .redeem_plane_token("ask", "nonce-a", expires, now + 1)
             .unwrap(),
         "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
          is the point of it — so the only thing that changed is that the process which recorded the \
@@ -2228,7 +2228,7 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
     // above and would have deleted the feature.
     assert!(
         reopened
-            .redeem_plane_token("approval", "nonce-b", expires, now + 2)
+            .redeem_plane_token("ask", "nonce-b", expires, now + 2)
             .unwrap(),
         "a different approval is not the one that was spent; refusing it would make the ledger a \
          blanket refusal of every confirmation after the first"
@@ -2253,11 +2253,11 @@ fn a_second_handle_on_the_same_file_cannot_redeem_what_the_first_spent() {
     let now = 1_700_000_000u64;
 
     assert!(node_a
-        .redeem_plane_token("approval", "nonce-fleet", now + 900, now)
+        .redeem_plane_token("ask", "nonce-fleet", now + 900, now)
         .unwrap());
     assert!(
         !node_b
-            .redeem_plane_token("approval", "nonce-fleet", now + 900, now)
+            .redeem_plane_token("ask", "nonce-fleet", now + 900, now)
             .unwrap(),
         "a second node of the same deployment redeemed an approval the first already spent, which \
          is one confirmation executing once per node"
@@ -2284,7 +2284,7 @@ fn exactly_one_of_many_racing_redemptions_wins() {
                 scope.spawn(move || {
                     barrier.wait();
                     store
-                        .redeem_plane_token("approval", "nonce-race", now + 900, now)
+                        .redeem_plane_token("ask", "nonce-race", now + 900, now)
                         .unwrap() as usize
                 })
             })
@@ -2312,16 +2312,16 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
 
     let s = SqliteStore::open(&path, 5000).unwrap();
     assert!(s
-        .redeem_plane_token("approval", "short-lived", now + 10, now)
+        .redeem_plane_token("ask", "short-lived", now + 10, now)
         .unwrap());
     assert!(s
-        .redeem_plane_token("approval", "long-lived", now + 10_000, now)
+        .redeem_plane_token("ask", "long-lived", now + 10_000, now)
         .unwrap());
 
     // A redemption well past the first entry's expiry: the sweep runs inside the same call.
     let later = now + 11;
     assert!(s
-        .redeem_plane_token("approval", "another", later + 900, later)
+        .redeem_plane_token("ask", "another", later + 900, later)
         .unwrap());
     let rows: i64 = s
         .lock_reader()
@@ -2342,12 +2342,12 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
     assert!(
-        s.redeem_plane_token("approval", "n", u64::MAX, 1_700_000_000)
+        s.redeem_plane_token("ask", "n", u64::MAX, 1_700_000_000)
             .is_err(),
         "an unstorable expires_at must be an error, never a silent 'first redemption'"
     );
     assert!(
-        s.redeem_plane_token("approval", "n", 1_700_000_900, u64::MAX)
+        s.redeem_plane_token("ask", "n", 1_700_000_900, u64::MAX)
             .is_err(),
         "an unstorable now must be an error: clamped to i64::MAX it would evict the entire ledger \
          and then report every replay as a first redemption"
@@ -2360,7 +2360,7 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     );
     // And the in-range boundary still stores.
     assert!(s
-        .redeem_plane_token("approval", "boundary", i64::MAX as u64, 1_700_000_000)
+        .redeem_plane_token("ask", "boundary", i64::MAX as u64, 1_700_000_000)
         .unwrap());
 }
 
@@ -2903,10 +2903,14 @@ fn a_real_v9_database_from_the_pre_port_dev_build_opens_and_upgrades_losslessly(
         list_demotions(&s),
         vec![demotion("srv_bad", "drift", 1_700_000_060)]
     );
-    // The spent approval is still spent, under the kind the 1.6.0 MCP plane redeems with.
-    assert!(!s
-        .redeem_plane_token("approval", "nonce_spent", 4_000_000_000, 1_700_000_001)
-        .unwrap());
+    // The spent approval is still spent, under the kind the 1.6.0 kernel redeems with (`ask`, its
+    // `KIND_ASK`). Filed under any other kind, this redemption is told it is the first, and the
+    // approval the 1.5.x node already spent executes a second time after the upgrade.
+    assert!(
+        !s.redeem_plane_token("ask", "nonce_spent", 4_000_000_000, 1_700_000_001)
+            .unwrap(),
+        "DOUBLE SPEND: an approval spent before the upgrade was redeemed again after it"
+    );
 
     // The call log is LEFT IN PLACE, unread: its rows cannot be re-encoded into the 1.6.0 call body
     // without forging the chain, and an upgrade must not destroy evidence.
