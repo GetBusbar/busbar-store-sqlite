@@ -513,15 +513,30 @@ impl SqliteStore {
 
     fn migrate(&self) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .store()?;
         // ONE transaction over the drop, the recreate, and the version stamp — a crash between them
         // must not leave a half-initialised DB the re-run can't repair. BEGIN IMMEDIATE (not
         // DEFERRED): see the type-level doc for why every write transaction in this file uses it.
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
+        // The version is read INSIDE the write transaction, never before it: every destructive or
+        // one-time step below is gated on it, and a value read before BEGIN IMMEDIATE is stale the
+        // moment another process opening the same file commits its own migration while this one
+        // waits for the lock. Read before the lock, a second first-open of an un-migrated file
+        // would take the pre-v5 drop path against the tables the first open just created.
+        let version: i64 = tx
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .store()?;
+        // A file stamped by a LATER build is refused, not restamped: running this build's schema
+        // pass over it and stamping it back down to `SCHEMA_VERSION` would make the newer build
+        // re-run its own version-gated steps against data they already migrated. The transaction
+        // is dropped (rolled back) unwritten.
+        if version > SCHEMA_VERSION {
+            return Err(RecordStoreError(format!(
+                "sqlite: database schema v{version} is newer than this build (v{SCHEMA_VERSION}); \
+                 refusing to open"
+            )));
+        }
         // Gated on the actual pre-v5 boundary (`< 5`), NOT on `SCHEMA_VERSION` (which moves every
         // bump): every bump up to and including v5 was destructive by design (1.5.0 was
         // unreleased, so a pre-v5 dev database is simply wiped and recreated). v6+ are ADDITIVE,
