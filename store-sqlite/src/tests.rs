@@ -3183,9 +3183,11 @@ fn a_second_first_open_waiting_on_the_lock_does_not_rerun_the_destructive_migrat
 
     let revision: i64 = reopened
         .lock_reader()
-        .query_row("SELECT revision FROM store_revision WHERE id = 0", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT revision FROM store_revision WHERE id = 0",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(
         revision, 42,
