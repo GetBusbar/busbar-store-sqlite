@@ -957,10 +957,13 @@ fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> RecordStoreResult<(
     }
 
     if table_exists(tx, "spent_ask_states")? {
-        // The 1.6.0 MCP plane redeems its confirm-once grants under the `approval` record schema.
+        // The 1.6.0 kernel redeems a confirm-once grant under the token kind `ask` (its
+        // `KIND_ASK`), so a spent one must be filed under that kind to stay spent. `approval` is
+        // the MCP record-schema id, not a token kind: filed there, the spent nonce is never
+        // consulted, and the upgrade hands every unexpired spent approval back for a second use.
         tx.execute_batch(
             "INSERT INTO plane_tokens (kind, token, expires_at) \
-               SELECT 'approval', nonce, expires_at FROM spent_ask_states WHERE true \
+               SELECT 'ask', nonce, expires_at FROM spent_ask_states WHERE true \
                ON CONFLICT(kind, token) DO NOTHING;
              DROP TABLE spent_ask_states;",
         )

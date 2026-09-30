@@ -1152,7 +1152,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
         assert!(
             store
-                .redeem_plane_token("approval", "nonce-abi", now + 900, now)
+                .redeem_plane_token("ask", "nonce-abi", now + 900, now)
                 .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -1184,7 +1184,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     assert!(
         !store
-            .redeem_plane_token("approval", "nonce-abi", now + 900, now + 1)
+            .redeem_plane_token("ask", "nonce-abi", now + 900, now + 1)
             .expect("redeem_plane_token"),
         "a restart handed a spent approval back over the plugin ABI"
     );
@@ -1215,13 +1215,13 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .expect("a second node loads the same plugin against the same store");
     assert!(
         store
-            .redeem_plane_token("approval", "nonce-fleet", now + 900, now + 2)
+            .redeem_plane_token("ask", "nonce-fleet", now + 900, now + 2)
             .expect("redeem_plane_token"),
         "node A's first redemption of a fresh approval must proceed"
     );
     assert!(
         !node_b
-            .redeem_plane_token("approval", "nonce-fleet", now + 900, now + 3)
+            .redeem_plane_token("ask", "nonce-fleet", now + 900, now + 3)
             .expect("redeem_plane_token"),
         "a second node redeemed an approval the first already spent, which is one operator \
          confirmation executing once per node"
@@ -1230,7 +1230,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // deleted the feature.
     assert!(
         node_b
-            .redeem_plane_token("approval", "nonce-distinct", now + 900, now + 4)
+            .redeem_plane_token("ask", "nonce-distinct", now + 900, now + 4)
             .expect("redeem_plane_token"),
         "a freshly minted approval is not the one that was spent; refusing it would make the shared \
          ledger a blanket refusal of every confirmation after the first"
