@@ -113,7 +113,9 @@ fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
     s.put_key(&k).unwrap();
     // Mutate (rename) and put again -- this goes through the ON CONFLICT DO UPDATE branch.
     k.name = "renamed".to_string();
+    let before = now_secs();
     s.put_key(&k).unwrap();
+    let after = now_secs();
     let conn = s.lock_writer();
     let updated_at: i64 = conn
         .query_row("SELECT updated_at FROM keys WHERE id='vk_stamp'", [], |r| {
@@ -123,6 +125,12 @@ fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
     assert_ne!(
         updated_at, k.created_at as i64,
         "updated_at must reflect the actual mutation time, not be frozen at created_at"
+    );
+    // Not merely "anything but created_at": the mutation time itself, bracketed by the clock read
+    // on either side of the write (a revision, a zero or any other bound value falls outside).
+    assert!(
+        (before..=after).contains(&updated_at),
+        "updated_at {updated_at} must be the mutation time, within [{before}, {after}]"
     );
 }
 
@@ -231,6 +239,29 @@ fn delete_key_tombstones_not_removes() {
     assert!(!row.enabled);
     assert!(row.deleted_at.is_some());
     assert!(!row.is_live());
+}
+
+/// A tombstone is a MUTATION a hydrating peer must see: `delete_key` stamps a new revision, so a
+/// peer reading `list_keys_since` from its watermark receives the key with `deleted_at` set and
+/// stops honouring it. Without the stamp the revoked key stays live on every peer.
+#[test]
+fn delete_key_bumps_the_revision_so_hydration_sees_the_tombstone() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_hyd", "g")).unwrap();
+    let watermark = s.get_key("vk_hyd").unwrap().unwrap().revision;
+    s.delete_key("vk_hyd").unwrap();
+    let delta = s.list_keys_since(watermark).unwrap();
+    assert_eq!(
+        delta.len(),
+        1,
+        "the tombstone must be past the watermark, or a hydrating peer never learns of it"
+    );
+    assert_eq!(delta[0].id, "vk_hyd");
+    assert!(
+        delta[0].deleted_at.is_some(),
+        "the delta must carry the tombstone itself"
+    );
+    assert!(delta[0].revision > watermark);
 }
 
 #[test]
@@ -343,6 +374,45 @@ fn credential_mint_into_occupied_live_slot_fails() {
     assert!(
         result.is_err(),
         "minting into a live slot must fail, not silently overwrite"
+    );
+}
+
+/// A revocation is EVIDENCE: its reason and time must read back as recorded, and a second revoke of
+/// the same credential is an idempotent no-op that keeps the first reason and time rather than
+/// overwriting what the operator responding to a leak wrote down.
+#[test]
+fn revoke_credential_records_its_reason_and_a_second_revoke_keeps_the_first() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_rv", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_rv", "AKIA_RV", 0))
+        .unwrap();
+    let id = s.list_credentials("vk_rv").unwrap()[0].id.clone();
+
+    let before = now_secs();
+    s.revoke_credential(&id, "leak").unwrap();
+    let after = now_secs();
+    let first = s.list_credentials("vk_rv").unwrap()[0].clone();
+    assert_eq!(first.revoke_reason.as_deref(), Some("leak"));
+    let Some(revoked_at) = first.revoked_at else {
+        panic!("a revoked credential carries revoked_at");
+    };
+    let revoked_at = revoked_at as i64;
+    assert!(
+        (before..=after).contains(&revoked_at),
+        "revoked_at {revoked_at} must be the revocation time, within [{before}, {after}]"
+    );
+
+    s.revoke_credential(&id, "rotated")
+        .expect("revoking an already-revoked credential is idempotent");
+    let second = s.list_credentials("vk_rv").unwrap()[0].clone();
+    assert_eq!(
+        second.revoke_reason.as_deref(),
+        Some("leak"),
+        "a second revoke overwrote the original reason"
+    );
+    assert_eq!(
+        second.revoked_at, first.revoked_at,
+        "a second revoke moved the original revocation time"
     );
 }
 
@@ -763,6 +833,42 @@ fn begin_immediate_succeeds_under_contention_where_deferred_fails_instantly() {
     immediate2.commit().unwrap();
 }
 
+/// The same invariant through the STORE's own write path, not raw rusqlite: a store write that
+/// reads before it writes (`append_plane_record` reads the chain position first) runs while another
+/// connection holds the write lock and commits a change underneath it. Under `BEGIN IMMEDIATE` the
+/// store waits at BEGIN through its busy handler and then succeeds; under `DEFERRED` its read
+/// snapshot is stale by the time it writes, and it fails with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT`.
+#[test]
+fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
+    let dir = tempdir();
+    let path = dir.join("store-contend.db");
+    let path_str = path.to_str().unwrap().to_string();
+    let store = SqliteStore::open(&path_str, 5000).unwrap();
+
+    let holder = Connection::open(&path).unwrap();
+    holder
+        .execute_batch(
+            "BEGIN IMMEDIATE; UPDATE store_revision SET revision = revision + 1 WHERE id = 0;",
+        )
+        .unwrap();
+
+    let call = sample_call("vk_contend", 1, 100, "", "h1");
+    let result = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| append_call(&store, &call));
+        // Let the store's write start and meet the held lock, then commit a change underneath it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holder.execute_batch("COMMIT").unwrap();
+        writer.join().unwrap()
+    });
+    result.expect(
+        "a store write must wait for the lock and then succeed; failing here means its transaction \
+         was not taken IMMEDIATE",
+    );
+    assert_eq!(list_calls(&store, "vk_contend").len(), 1);
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// HARDEST INVARIANT #5: `foreign_keys` verification actually fails startup if the pragma readback
 /// shows it didn't take. Simulated by calling `apply_pragmas` and confirming it error-checks the
 /// readback rather than trusting the `pragma_update` call blindly (the real SQLITE_OMIT_FOREIGN_KEY
@@ -779,6 +885,22 @@ fn foreign_keys_pragma_is_verified_by_readback_not_assumed() {
     assert_eq!(
         fk, 1,
         "apply_pragmas must leave foreign_keys actually ON, verified by readback"
+    );
+}
+
+/// The refusal half of the readback: `PRAGMA foreign_keys` is a no-op inside an open transaction,
+/// so issuing `apply_pragmas` there leaves enforcement OFF, and the readback must turn that into an
+/// error rather than a store quietly running without the credentials->keys CASCADE.
+#[test]
+fn foreign_keys_that_did_not_take_refuse_the_connection() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN;")
+        .unwrap();
+    let err = apply_pragmas(&conn, ":memory:", 2000, true)
+        .expect_err("foreign_keys still OFF after apply_pragmas must be refused");
+    assert!(
+        err.0.contains("foreign_keys could not be enabled"),
+        "the refusal must say why: {err:?}"
     );
 }
 
@@ -1609,6 +1731,45 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         .expect_err("the same body under a different ts is a different record at that position");
 }
 
+/// Every field of the envelope is part of the record at a position, not only the body and `ts`: a
+/// record at an occupied position that differs in its DISPOSITION, its ID or its PARENT is a fork,
+/// never a benign replay. A Terminal record slipping in as a "replay" changes what retention does.
+#[test]
+fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_fork() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let rec = call_record(&sample_call("vk_a", 1, 100, "", "h1"));
+    s.append_plane_record(&rec).unwrap();
+
+    let mut terminal = rec.clone();
+    terminal.disposition = PlaneDisposition::Terminal;
+    let mut other_id = rec.clone();
+    other_id.id = "vk_other".to_string();
+    // Same position (kind, identity = "vk_a", seq): a top-level record's identity is its own id.
+    let mut no_parent = rec.clone();
+    no_parent.parent = None;
+
+    for (what, forked) in [
+        ("disposition", &terminal),
+        ("id", &other_id),
+        ("parent", &no_parent),
+    ] {
+        let err = s
+            .append_plane_record(forked)
+            .expect_err("a different record at an occupied position must be refused");
+        assert!(
+            format!("{err}").contains("the chain has forked"),
+            "a differing {what} must be reported as a fork: {err}"
+        );
+    }
+    assert_eq!(
+        s.list_plane_records("call", &PlaneSelector::Parent("vk_a".into()))
+            .unwrap()
+            .len(),
+        1,
+        "no refused fork may have added or overwritten a row"
+    );
+}
+
 /// A persisted chain record is never REWRITTEN. Enforced by a trigger so it survives an operator
 /// opening the file with the sqlite3 CLI, not merely by the write path being careful. An upserted
 /// top-level record (no parent) is updated in place by design, so the guard must not reach it.
@@ -2362,6 +2523,23 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
          grants still presentable"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE EVICTION BOUNDARY IS FAIL-CLOSED. An entry whose grant expires exactly at `now` can still be
+/// presented at `now`, so the sweep must keep it (strictly less-than): evicting it first would tell
+/// that replay it is the first redemption.
+#[test]
+fn an_entry_expiring_exactly_now_is_kept_and_its_replay_refused() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let now = 1_700_000_000u64;
+    let expires = now + 10;
+    assert!(s.redeem_plane_token("ask", "edge", expires, now).unwrap());
+    assert!(
+        !s.redeem_plane_token("ask", "edge", expires, expires)
+            .unwrap(),
+        "a replay at now == expires_at was told it was first: the sweep evicted an entry whose \
+         grant is still presentable"
+    );
 }
 
 /// REFUSED RATHER THAN MANGLED, and here the reason is sharper than it is for a chain position: `as
