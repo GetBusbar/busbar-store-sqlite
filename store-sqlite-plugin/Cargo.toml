@@ -22,8 +22,8 @@ busbar-store-sqlite = { path = "../store-sqlite" }
 # The conformance and e2e tests load the built cdylib over the REAL loader (sign, pack, scan, open)
 # and the linked row through the same registry — dev-only, never in the shipped artifact. Same pinned
 # rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
 serde_json = "1"
 # Dev-only: the `busy_timeout_ms_is_actually_applied`-style checks open a second, independent
 # connection to the SAME sqlite file. Same version/feature as `busbar-store-sqlite`'s dependency so
