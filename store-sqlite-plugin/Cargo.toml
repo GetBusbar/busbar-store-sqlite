@@ -9,22 +9,23 @@ description = "First-party signed kind:store plugin cdylib: the SQLite governanc
 license = "Apache-2.0"
 
 [lib]
-# cdylib: the DROPPED-IN door (a signed tarball in `plugins/`). rlib: REQUIRED for `cargo test` to
-# emit the cdylib artifact the conformance and e2e tests load.
+# cdylib: the DROPPED-IN door (a signed tarball in `plugins/`), exporting `busbar_plugin_door`.
+# rlib: REQUIRED for `cargo test` to emit the cdylib artifact the conformance and e2e tests load.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE LOGIC, same repo. Its `export_store_plugin!(open)` registers the image's one door; this crate
-# only makes that door a loadable library.
+# THE LOGIC, same repo: its `door::door` is the door this image exports.
 busbar-store-sqlite = { path = "../store-sqlite" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
 
 [dev-dependencies]
-# The conformance and e2e tests load the built cdylib over the REAL loader (sign, pack, scan, open)
-# and the linked row through the same registry — dev-only, never in the shipped artifact. Same pinned
-# rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
+# The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
+# one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
+# the logic crate's busbar-contract, so one busbar source resolves.
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
 serde_json = "1"
+# Dev-only: the conformance test awaits the store v3 calls (`StoreCalls`), which are futures.
+tokio = { version = "1", features = ["rt"] }
 # Dev-only: the `busy_timeout_ms_is_actually_applied`-style checks open a second, independent
 # connection to the SAME sqlite file. Same version/feature as `busbar-store-sqlite`'s dependency so
 # only one sqlite is ever linked in.

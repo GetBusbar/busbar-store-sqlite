@@ -9,9 +9,10 @@ description = "The SQLite backend for busbar's durable governance store: impleme
 license = "Apache-2.0"
 
 [lib]
-# rlib: THE LOGIC and its one door registration (`export_store_plugin!(open)`, its `linked::STORE`
-# row and `BUSBAR_COLD_ENTRY`). The sibling `busbar-store-sqlite-plugin` cdylib re-exports it as the
-# dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+# rlib: THE LOGIC and its one door (`store_door!`, `door::door`, the store v3 table), which exports
+# no symbol. A busbar build that links this crate registers `door`; the sibling
+# `busbar-store-sqlite-plugin` cdylib exports the same `door` as `busbar_plugin_door`. One source,
+# both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
 
 [dependencies]
@@ -19,11 +20,12 @@ crate-type = ["rlib"]
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
 # build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
 # contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
 # `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all.
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde_json = "1"
-# `derive` for the v10 migration's legacy row encoders (and the conformance suite's stand-in bodies).
+# `derive` for the v10 migration's legacy row encoders, the v3 dedupe log's stored answers (and the
+# conformance suite's stand-in bodies).
 serde = { version = "1", features = ["derive"] }
 
 # NO DEV-DEPENDENCIES. The `RecordStore` contract conformance suite lives in this crate's own
