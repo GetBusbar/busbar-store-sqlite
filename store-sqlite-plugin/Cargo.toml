@@ -16,21 +16,21 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # THE LOGIC, same repo: its `door::door` is the door this image exports.
 busbar-store-sqlite = { path = "../store-sqlite" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
+busbar-contract = { workspace = true }
 
 [dev-dependencies]
 # The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
 # one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
-serde_json = "1"
+busbar-plugin-loader = { workspace = true }
+serde_json = { workspace = true }
 # Dev-only: the conformance test awaits the store v3 calls (`StoreCalls`), which are futures.
-tokio = { version = "1", features = ["rt"] }
+tokio = { workspace = true, features = ["rt"] }
 # Dev-only: the `busy_timeout_ms_is_actually_applied`-style checks open a second, independent
 # connection to the SAME sqlite file. Same version/feature as `busbar-store-sqlite`'s dependency so
 # only one sqlite is ever linked in.
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { workspace = true }
 # Dev-only: the admin-API install e2e test drives a REAL running busbar process's admin HTTP API
 # (POST /api/v1/admin/plugins, POST /api/v1/admin/keys) — the actual operator install path.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+reqwest = { workspace = true, features = ["json", "blocking"] }
 base64 = "0.22"
