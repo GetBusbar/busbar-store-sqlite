@@ -54,11 +54,12 @@ connections (so a long billing report or retention sweep never blocks the
 hot-path usage flush) — lives in the `busbar-store-sqlite` `lib` crate in
 this repository's `store-sqlite/` directory. The
 `store-sqlite-plugin` crate is deliberately tiny: the logic crate also holds
-its one door registration (`busbar_contract::abi::sdk::export_store_plugin!(open)`,
-where `open` adapts the engine's JSON config into a `SqliteStore`), and the
-plugin crate re-exports it, so the cdylib answers the loader through the same
-door a busbar build that LINKS `busbar-store-sqlite` registers (its
-`linked::STORE` row) — one source, both doors.
+its one door (`door::door`, the store v3 table over `SqliteStore` through
+`busbar_contract::store_door!`; its `open` slot adapts the operator's settings
+into a `SqliteStore`), and the plugin crate exports that door as the image's one
+symbol, `busbar_plugin_door` (`export_door!`), so the cdylib answers the loader
+through the same door a busbar build that LINKS `busbar-store-sqlite`
+registers — one source, both doors.
 
 
 - The **default durable store** for busbar's governance data: virtual
@@ -167,8 +168,9 @@ for the full store config reference.
 `cargo test` runs the store's own suite (`store-sqlite/src/tests*`, including
 the config-adapting `open` in `store-sqlite/src/door/tests.rs`), the
 linked == dropped-in conformance test (`store-sqlite-plugin/tests/conformance.rs`:
-the linked `linked::STORE` row and the signed, dropped-in cdylib driven through
-one scenario, including a restart, and compared byte for byte, with RED arms),
+the linked `door::door` and the dropped-in cdylib, each opened through the
+loader's store v3 table and driven through one scenario, including the v3
+slots and a restart, and compared, with RED arms),
 and the end-to-end tests in `store-sqlite-plugin/tests/e2e.rs`, which
 loads the *built* cdylib over the real `busbar-plugin-loader` ABI seam
 — the same seam busbar's engine uses — against a real SQLite file on

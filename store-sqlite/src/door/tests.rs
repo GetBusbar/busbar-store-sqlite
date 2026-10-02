@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::open;
-fn expect_err(result: Result<Box<dyn busbar_contract::records::RecordStore>, String>) -> String {
+use busbar_contract::records::RecordStore;
+fn expect_err(result: Result<crate::SqliteStore, String>) -> String {
     match result {
         Ok(_) => panic!("expected open() to fail, but it succeeded"),
         Err(e) => e,

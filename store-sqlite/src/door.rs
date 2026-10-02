@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE DOOR's constructor: adapts the engine's JSON config into a [`SqliteStore`]. The crate root
-//! hands it to `export_store_plugin!`, which registers this image's one door — the entry a busbar
-//! build that links this crate is handed (`linked::STORE`) and the one the
-//! `busbar-store-sqlite-plugin` cdylib answers through when dropped in.
+//! THE DOOR: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`, the contract's store
+//! SDK), and [`open`], the settings parser its `open` slot runs. A busbar build that links this crate
+//! registers `door` as its compiled-in row; the `busbar-store-sqlite-plugin` cdylib exports the same
+//! `door` as `busbar_plugin_door`. Compiled in or dropped in, the host reaches one table. The store
+//! answers every call Ready: it is local-disk-bound, and the host runs it on its bounded disk lane
+//! (THE DESIGN §11.11 R4, Q-DISK).
 
 use crate::SqliteStore;
-use busbar_contract::records::RecordStore;
 
-/// Construct a SQLite store from the JSON config the engine passes through `open`. Shape (both keys
+/// The store's name, as its Statement states it and its signed manifest names it.
+pub const NAME: &str = "busbar-store-sqlite";
+
+busbar_contract::store_door!(SqliteStore, NAME, env!("CARGO_PKG_VERSION"), 64);
+
+/// Construct a SQLite store from the settings the host passes through `open`. Shape (both keys
 /// optional, sensible defaults so an empty `{}` works):
 ///
 /// ```json
@@ -23,7 +29,7 @@ use busbar_contract::records::RecordStore;
 /// not silently defaulted: a template variable that resolves to a number for `db_path` must never
 /// be swallowed into quietly opening the default relative path — that reads as a healthy boot
 /// against an empty governance database (data loss), not a config error.
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
+pub fn open(cfg: &str) -> Result<SqliteStore, String> {
     let v: serde_json::Value = if cfg.trim().is_empty() {
         serde_json::Value::Object(Default::default())
     } else {
@@ -67,8 +73,7 @@ pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
             ))
         }
     };
-    let store = SqliteStore::open(path, busy_timeout_ms).map_err(|e| e.0)?;
-    Ok(Box::new(store))
+    SqliteStore::open(path, busy_timeout_ms).map_err(|e| e.0)
 }
 
 // ── unit tests for the door's own responsibility: adapting the engine's JSON config into a real

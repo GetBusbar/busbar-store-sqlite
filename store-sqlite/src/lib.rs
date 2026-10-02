@@ -6,12 +6,20 @@
 //! writer, plus a small pool of `query_only` readers so a long billing report or retention sweep
 //! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
 //! Depends only on the `busbar-contract` crate (plus rusqlite), never on the engine.
+//!
+//! THE DOOR: [`door::door`] answers the store v3 table (`busbar_contract::abi::store`) over
+//! [`SqliteStore`] through the contract's safe store SDK — the 1.5.5 op set is the
+//! [`RecordStore`] implementation below, the v3 additions are in `v3`. The crate exports no
+//! symbol: a build that links it registers `door`, and the `busbar-store-sqlite-plugin` cdylib
+//! exports it. No `unsafe` here at all.
+
+#![forbid(unsafe_code)]
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult,
-    ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
-    UNIT_INPUT, UNIT_OUTPUT,
+    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
+    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,7 +94,13 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 ///
 /// Versions 7-9 were never released (the last release, v1.0.6, is schema v6), but a dev database at
 /// any of them upgrades the same way; `tests/fixtures/` pins both a real v6 and a real v9 file.
-const SCHEMA_VERSION: i64 = 10;
+///
+/// v11 (busbar 1.6.0, the store v3 table): the state the v3 slots keep — the DURABLE `op_id` dedupe
+/// log (`store_ops`, S4: a replay after a restart still answers the original), the money slots'
+/// caps, drawn totals and slices (`money_caps`, `money_used`, `money_slices`), the ledger streams
+/// (`journal`), the session directory (`sessions`) and a plane's kernel-held records
+/// (`schema_records`). Additive on the same terms as v7-v9: new tables only, created by `SCHEMA`.
+const SCHEMA_VERSION: i64 = 11;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
 /// sidecar on a task row copied out of the legacy typed `tasks` table (a live 1.6.0 engine sets it
@@ -293,6 +307,61 @@ CREATE TABLE IF NOT EXISTS plane_tokens (
     token      TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     PRIMARY KEY (kind, token)
+) STRICT, WITHOUT ROWID;
+
+-- THE STORE v3 STATE (v11). `store_ops` is the DURABLE `op_id` dedupe log (abi::store S1-S4): an
+-- op that APPLIED is remembered with its value fields (`body`) and its answer for at least
+-- OP_ID_RETENTION_SECS, in the same transaction as its effect, so a replay after a crash or a
+-- restart answers the original and applies nothing.
+CREATE TABLE IF NOT EXISTS store_ops (
+    op_id       BLOB NOT NULL PRIMARY KEY,
+    body        TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS store_ops_recorded_idx ON store_ops (recorded_at);
+
+-- The money slots. A `slot` is `(bucket, pool, dimension, class_key, window_start)`, kept as its
+-- JSON array so `pool`'s None and Some('') stay apart. Amounts are u64 stored bit-for-bit in the
+-- signed column and compared in Rust, never in SQL.
+CREATE TABLE IF NOT EXISTS money_caps (
+    slot       TEXT NOT NULL PRIMARY KEY,
+    cap        INTEGER NOT NULL,
+    config_gen INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS money_used (
+    slot TEXT NOT NULL PRIMARY KEY,
+    used INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+-- AUTOINCREMENT: a slice id is never reused, so a late release of a closed slice can never land on
+-- a newer one.
+CREATE TABLE IF NOT EXISTS money_slices (
+    slice_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot      TEXT NOT NULL,
+    remaining INTEGER NOT NULL
+) STRICT;
+
+-- The ledger streams: `seq` counts from 1 per stream, so a stream's head is its MAX(seq).
+CREATE TABLE IF NOT EXISTS journal (
+    stream TEXT NOT NULL,
+    seq    INTEGER NOT NULL,
+    record BLOB NOT NULL,
+    PRIMARY KEY (stream, seq)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session   INTEGER NOT NULL PRIMARY KEY,
+    node      TEXT NOT NULL,
+    principal TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS sessions_principal_idx ON sessions (principal);
+
+-- A plane's kernel-held durable records, by `(schema, key)`; a scan reads a key prefix in byte order.
+CREATE TABLE IF NOT EXISTS schema_records (
+    schema     TEXT NOT NULL,
+    record_key BLOB NOT NULL,
+    value      BLOB NOT NULL,
+    PRIMARY KEY (schema, record_key)
 ) STRICT, WITHOUT ROWID;
 
 -- Pragma-independent integrity triggers: survive an operator opening the file with the sqlite3 CLI
@@ -1191,6 +1260,230 @@ fn put_key_inner(
     Ok(())
 }
 
+/// [`RecordStore::add_usage`]'s writes, inside the caller's transaction (the trait method's own, or
+/// a store v3 slot's, where the `op_id` record shares it).
+fn add_usage_in(
+    tx: &Connection,
+    bucket_id: &str,
+    window_start: u64,
+    delta: &UsageDelta,
+) -> RecordStoreResult<()> {
+    // Same sentinel-row discipline as put_usage: requests/billable_requests accumulate
+    // unconditionally on model='', regardless of whether this particular delta touched any
+    // models (a rejected/errored request can add to `requests` while reaching zero models).
+    // `prepare_cached`, not `execute`/`prepare`: this fires once per admitted request (the
+    // hottest write path in the crate), and these statement texts never vary — caching
+    // avoids paying SQLite's parse+plan cost on every single request.
+    tx.prepare_cached(
+        "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
+         VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
+         ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
+            requests = MAX(0, requests + ?3), billable_requests = MAX(0, billable_requests + ?4)",
+    )
+    .store()?
+    .execute(params![
+        window_start as i64,
+        bucket_id,
+        delta.requests,
+        delta.billable_requests
+    ])
+    .store()?;
+    for m in &delta.models {
+        let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
+        tx.prepare_cached(
+            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
+                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+             VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
+             ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
+                tokens_input       = MAX(0, tokens_input + ?4),
+                tokens_output      = MAX(0, tokens_output + ?5),
+                tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
+                tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
+        )
+        .store()?
+        .execute(params![
+            window_start as i64, bucket_id, m.model,
+            d(UNIT_INPUT), d(UNIT_OUTPUT), d(UNIT_CACHE_READ), d(UNIT_CACHE_WRITE),
+        ])
+        .store()?;
+        // Every open unit accumulates the same way the reserved columns do: one atomic
+        // UPSERT per unit, floored at 0 (a refund never drives a durable counter negative).
+        for (unit, d) in open_units(&m.usage_units) {
+            tx.prepare_cached(
+                "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
+                 VALUES (?1,?2,?3,?4,MAX(0,?5))
+                 ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
+                    count = MAX(0, count + ?5)",
+            )
+            .store()?
+            .execute(params![window_start as i64, bucket_id, m.model, unit, d])
+            .store()?;
+        }
+    }
+    Ok(())
+}
+
+/// [`RecordStore::add_metering`]'s writes, inside the caller's transaction.
+fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> {
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
+    // would silently merge this accrual into a different card's cell.
+    let priced_from = as_storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
+    tx.execute(
+        "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
+             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
+             tokens_input       = tokens_input + excluded.tokens_input,
+             tokens_output      = tokens_output + excluded.tokens_output,
+             tokens_cache_read  = tokens_cache_read + excluded.tokens_cache_read,
+             tokens_cache_write = tokens_cache_write + excluded.tokens_cache_write,
+             requests           = requests + excluded.requests,
+             billable_requests  = billable_requests + excluded.billable_requests",
+        params![
+            d.bucket as i64,
+            d.key_id,
+            d.provider,
+            d.model,
+            priced_from,
+            d.key_group_at_use,
+            d.pricing_version,
+            clamp(d.tokens_input),
+            clamp(d.tokens_output),
+            clamp(d.tokens_cache_read),
+            clamp(d.tokens_cache_write),
+            clamp(d.requests),
+            clamp(d.billable_requests),
+        ],
+    )
+    .store()?;
+    // Every ledgered class the token columns do not hold, additive like every counter here,
+    // in the same transaction as the cell it belongs to.
+    for (unit, count) in &d.usage_units {
+        tx.execute(
+            "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
+                 count = count + excluded.count",
+            params![
+                d.bucket as i64,
+                d.key_id,
+                d.provider,
+                d.model,
+                priced_from,
+                unit,
+                clamp(*count),
+            ],
+        )
+        .store()?;
+    }
+    Ok(())
+}
+
+/// [`RecordStore::append_audit`]'s write and fork check, inside the caller's transaction.
+fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()> {
+    // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `as i64` wraps it negative and
+    // `row_to_audit` clamps the negative back to 0 on read, so the record read back is NOT the
+    // record written. An identical retry then compares unequal and is reported as "the audit
+    // chain has forked" — naming the same action on both sides, which is the worst possible page
+    // to hand an operator. Rejected outright. Comparing the round-tripped form instead would
+    // trade that false alarm for silent loss, which is the wrong half to give up. Same guard as
+    // store-postgres, where `clamp` produces the same hazard by a different route.
+    if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
+        return Err(RecordStoreError(format!(
+            "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
+             store a record that would not read back as itself",
+            entry.seq, entry.ts
+        )));
+    }
+    let affected = tx
+        .execute(
+            "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(seq) DO NOTHING",
+            params![
+                entry.seq as i64,
+                entry.ts as i64,
+                entry.action,
+                entry.resource,
+                entry.outcome,
+                entry.principal,
+                entry.prev_hash,
+                entry.hash,
+            ],
+        )
+        .store()?;
+    // DO NOTHING keeps the stored record, which is right for ONE of the two ways a `seq`
+    // collides and wrong for the other. Compare them, in the same transaction that just
+    // lost the race, and let the difference decide (see the trait contract):
+    //   identical  -> the write-through retrying after a timeout. Common, benign, Ok.
+    //   different  -> two records claiming one chain position: a forked or tampered log,
+    //                 and the single most important thing an audit store can report.
+    // Dropping the second case silently is what this used to do.
+    if affected == 0 {
+        let stored = tx
+            .query_row(
+                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+                 FROM audit_log WHERE seq=?1",
+                params![entry.seq as i64],
+                row_to_audit,
+            )
+            .store()?;
+        if &stored != entry {
+            return Err(RecordStoreError(format!(
+                "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
+                 has forked (stored action '{}', incoming '{}')",
+                entry.seq, stored.action, entry.action
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`RecordStore::append_plane_record`]'s occupancy check and insert, inside the caller's
+/// transaction.
+fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    let row = PlaneRow::of(record, "append_plane_record")?;
+    let existing: Option<StoredPlaneRow> = tx
+        .query_row(
+            "SELECT id, parent, ts, disposition, body FROM plane_records \
+             WHERE kind=?1 AND identity=?2 AND seq=?3",
+            params![record.kind, row.identity, row.seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .store()?;
+    if let Some((id, parent, ts, disposition, body)) = existing {
+        // IDENTICAL is the at-least-once write-through retrying after a timeout, and is
+        // success. DIFFERENT is two records claiming one chain position — a forked or
+        // tampered log — and is an error: overwriting would destroy exactly the case worth
+        // reporting, and silently keeping the first would drop a genuinely different record
+        // on the floor. The same settlement `append_audit` makes.
+        if id == record.id
+            && parent.as_deref() == record.parent
+            && ts == row.ts
+            && disposition == row.disposition
+            && body == record.body
+        {
+            return Ok(());
+        }
+        // Names the position and nothing else — it must not echo stored (or caller)
+        // content back to whoever provoked it.
+        return Err(RecordStoreError(format!(
+            "append_plane_record: kind '{}' already holds a different record at sequence {} \
+             of this chain; the chain has forked",
+            record.kind, record.seq
+        )));
+    }
+    tx.execute(
+        "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        row.params(&record),
+    )
+    .store()?;
+    Ok(())
+}
+
 impl RecordStore for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
@@ -1568,53 +1861,7 @@ impl RecordStore for SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
-        // Same sentinel-row discipline as put_usage: requests/billable_requests accumulate
-        // unconditionally on model='', regardless of whether this particular delta touched any
-        // models (a rejected/errored request can add to `requests` while reaching zero models).
-        // `prepare_cached`, not `execute`/`prepare`: this fires once per admitted request (the
-        // hottest write path in the crate), and these statement texts never vary — caching
-        // avoids paying SQLite's parse+plan cost on every single request.
-        tx.prepare_cached(
-            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
-             VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
-             ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-                requests = MAX(0, requests + ?3), billable_requests = MAX(0, billable_requests + ?4)",
-        )
-        .store()?
-        .execute(params![window_start as i64, bucket_id, delta.requests, delta.billable_requests])
-        .store()?;
-        for m in &delta.models {
-            let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
-            tx.prepare_cached(
-                "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
-                 ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-                    tokens_input       = MAX(0, tokens_input + ?4),
-                    tokens_output      = MAX(0, tokens_output + ?5),
-                    tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
-                    tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
-            )
-            .store()?
-            .execute(params![
-                window_start as i64, bucket_id, m.model,
-                d(UNIT_INPUT), d(UNIT_OUTPUT), d(UNIT_CACHE_READ), d(UNIT_CACHE_WRITE),
-            ])
-            .store()?;
-            // Every open unit accumulates the same way the reserved columns do: one atomic
-            // UPSERT per unit, floored at 0 (a refund never drives a durable counter negative).
-            for (unit, d) in open_units(&m.usage_units) {
-                tx.prepare_cached(
-                    "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
-                     VALUES (?1,?2,?3,?4,MAX(0,?5))
-                     ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
-                        count = MAX(0, count + ?5)",
-                )
-                .store()?
-                .execute(params![window_start as i64, bucket_id, m.model, unit, d])
-                .store()?;
-            }
-        }
+        add_usage_in(&tx, bucket_id, window_start, delta)?;
         tx.commit().store()?;
         Ok(())
     }
@@ -1718,63 +1965,12 @@ impl RecordStore for SqliteStore {
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-        // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
-        // would silently merge this accrual into a different card's cell.
-        let priced_from = as_storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
-            tx.execute(
-                "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-                 ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
-                     tokens_input       = tokens_input + excluded.tokens_input,
-                     tokens_output      = tokens_output + excluded.tokens_output,
-                     tokens_cache_read  = tokens_cache_read + excluded.tokens_cache_read,
-                     tokens_cache_write = tokens_cache_write + excluded.tokens_cache_write,
-                     requests           = requests + excluded.requests,
-                     billable_requests  = billable_requests + excluded.billable_requests",
-                params![
-                    d.bucket as i64,
-                    d.key_id,
-                    d.provider,
-                    d.model,
-                    priced_from,
-                    d.key_group_at_use,
-                    d.pricing_version,
-                    clamp(d.tokens_input),
-                    clamp(d.tokens_output),
-                    clamp(d.tokens_cache_read),
-                    clamp(d.tokens_cache_write),
-                    clamp(d.requests),
-                    clamp(d.billable_requests),
-                ],
-            )
-            .store()?;
-            // Every ledgered class the token columns do not hold, additive like every counter here,
-            // in the same transaction as the cell it belongs to.
-            for (unit, count) in &d.usage_units {
-                tx.execute(
-                    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)
-                     ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
-                         count = count + excluded.count",
-                    params![
-                        d.bucket as i64,
-                        d.key_id,
-                        d.provider,
-                        d.model,
-                        priced_from,
-                        unit,
-                        clamp(*count),
-                    ],
-                )
-                .store()?;
-            }
+            add_metering_in(&tx, d)?;
             tx.commit().store()?;
             Ok(())
         })
@@ -1846,20 +2042,6 @@ impl RecordStore for SqliteStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `as i64` wraps it negative and
-        // `row_to_audit` clamps the negative back to 0 on read, so the record read back is NOT the
-        // record written. An identical retry then compares unequal and is reported as "the audit
-        // chain has forked" — naming the same action on both sides, which is the worst possible page
-        // to hand an operator. Rejected outright. Comparing the round-tripped form instead would
-        // trade that false alarm for silent loss, which is the wrong half to give up. Same guard as
-        // store-postgres, where `clamp` produces the same hazard by a different route.
-        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(RecordStoreError(format!(
-                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
-                 store a record that would not read back as itself",
-                entry.seq, entry.ts
-            )));
-        }
         // FULL sync: the trait's contract for this method is that a hard crash loses ~0 entries,
         // which `synchronous=NORMAL` does not provide under WAL.
         let mut conn = self.lock_writer();
@@ -1867,40 +2049,7 @@ impl RecordStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
-            let affected = tx.execute(
-                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(seq) DO NOTHING",
-                params![
-                    entry.seq as i64, entry.ts as i64, entry.action, entry.resource,
-                    entry.outcome, entry.principal, entry.prev_hash, entry.hash,
-                ],
-            )
-            .store()?;
-            // DO NOTHING keeps the stored record, which is right for ONE of the two ways a `seq`
-            // collides and wrong for the other. Compare them, in the same transaction that just
-            // lost the race, and let the difference decide (see the trait contract):
-            //   identical  -> the write-through retrying after a timeout. Common, benign, Ok.
-            //   different  -> two records claiming one chain position: a forked or tampered log,
-            //                 and the single most important thing an audit store can report.
-            // Dropping the second case silently is what this used to do.
-            if affected == 0 {
-                let stored = tx
-                    .query_row(
-                        "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                         FROM audit_log WHERE seq=?1",
-                        params![entry.seq as i64],
-                        row_to_audit,
-                    )
-                    .store()?;
-                if &stored != entry {
-                    return Err(RecordStoreError(format!(
-                        "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
-                         has forked (stored action '{}', incoming '{}')",
-                        entry.seq, stored.action, entry.action
-                    )));
-                }
-            }
+            append_audit_in(&tx, entry)?;
             tx.commit().store()?;
             Ok(())
         })
@@ -1964,7 +2113,7 @@ impl RecordStore for SqliteStore {
     // retention rule part of the verb (`task`, below), so a kind a future plane declares is stored
     // and served exactly like the ones that exist today.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         let row = PlaneRow::of(record, "upsert_plane_record")?;
         // FULL sync: an upserted record is a task state transition, a demotion (a quarantine), a
         // push-callback capability — each acknowledged to a caller and each worthless if a power cut
@@ -1979,7 +2128,7 @@ impl RecordStore for SqliteStore {
                  ON CONFLICT(kind, identity, seq) DO UPDATE SET \
                     id=excluded.id, parent=excluded.parent, ts=excluded.ts, \
                     disposition=excluded.disposition, body=excluded.body",
-                row.params(record),
+                row.params(&record),
             )
             .store()?;
             Ok(())
@@ -2000,8 +2149,7 @@ impl RecordStore for SqliteStore {
         .store()
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
-        let row = PlaneRow::of(record, "append_plane_record")?;
+    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         // FULL sync: this is the tamper-evidence record of a transition or a call, and a chain with a
         // hole where a crash landed is a chain that fails to verify.
         let mut conn = self.lock_writer();
@@ -2012,43 +2160,7 @@ impl RecordStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .store()?;
-            let existing: Option<StoredPlaneRow> = tx
-                .query_row(
-                    "SELECT id, parent, ts, disposition, body FROM plane_records \
-                     WHERE kind=?1 AND identity=?2 AND seq=?3",
-                    params![record.kind, row.identity, row.seq],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .optional()
-                .store()?;
-            if let Some((id, parent, ts, disposition, body)) = existing {
-                // IDENTICAL is the at-least-once write-through retrying after a timeout, and is
-                // success. DIFFERENT is two records claiming one chain position — a forked or
-                // tampered log — and is an error: overwriting would destroy exactly the case worth
-                // reporting, and silently keeping the first would drop a genuinely different record
-                // on the floor. The same settlement `append_audit` makes.
-                if id == record.id
-                    && parent == record.parent
-                    && ts == row.ts
-                    && disposition == row.disposition
-                    && body == record.body
-                {
-                    return Ok(());
-                }
-                // Names the position and nothing else — it must not echo stored (or caller)
-                // content back to whoever provoked it.
-                return Err(RecordStoreError(format!(
-                    "append_plane_record: kind '{}' already holds a different record at sequence {} \
-                     of this chain; the chain has forked",
-                    record.kind, record.seq
-                )));
-            }
-            tx.execute(
-                "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                row.params(record),
-            )
-            .store()?;
+            append_plane_record_in(&tx, record)?;
             tx.commit().store()?;
             Ok(())
         })
@@ -2057,7 +2169,7 @@ impl RecordStore for SqliteStore {
     fn list_plane_records(
         &self,
         kind: &str,
-        selector: &PlaneSelector,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
         // UNFILTERED beyond the selector, terminal rows included: the boot rehydrate wants the active
         // rows, the retention sweep the terminal ones and a scoped listing one principal's, and a
@@ -2258,10 +2370,10 @@ impl PlaneRow {
     /// Refused rather than mangled: `as i64` wraps a `u64` past `i64::MAX` negative and the read
     /// clamps it back, so the row read back would not be the row written — a wrapped `seq` reorders a
     /// chain and a wrapped `ts` changes what retention does to it, with no error ever reported.
-    fn of(record: &PlaneRecord, method: &str) -> RecordStoreResult<Self> {
+    fn of(record: PlaneRecordRef<'_>, method: &str) -> RecordStoreResult<Self> {
         Ok(Self {
             // A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
-            identity: record.parent.clone().unwrap_or_else(|| record.id.clone()),
+            identity: record.parent.unwrap_or(record.id).to_string(),
             seq: as_storable_i64(method, "seq", record.seq)?,
             ts: as_storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
@@ -2271,7 +2383,7 @@ impl PlaneRow {
         })
     }
 
-    fn params<'a>(&'a self, record: &'a PlaneRecord) -> [&'a dyn rusqlite::ToSql; 8] {
+    fn params<'a>(&'a self, record: &'a PlaneRecordRef<'a>) -> [&'a dyn rusqlite::ToSql; 8] {
         [
             &record.kind,
             &self.identity,
@@ -2402,22 +2514,11 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-mod door;
-pub use door::open;
-
-// THE DOOR (DECISIONS #2 rule (1)): this image's one registration. Emits `BUSBAR_COLD_ENTRY` (the
-// boundary a build that LINKS this crate hands the loader) and registers that same entry as the
-// door the contract SDK's frozen symbols answer through in the `busbar-store-sqlite-plugin` cdylib.
-busbar_contract::abi::sdk::export_store_plugin!(door::open);
-
-/// THE LINKED ENTRY: what a busbar build that links this store registers onto the cold-kind axis —
-/// the same row a dropped-in `busbar-store-sqlite-plugin` tarball states, opened in process.
-pub mod linked {
-    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs
-    /// over, exactly what the dropped-in tarball states and exports.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        ("busbar-store-sqlite", "sqlite", &super::BUSBAR_COLD_ENTRY);
-}
+/// THE DOOR: the settings parser and the store v3 table over [`SqliteStore`] (`door::door`), the one
+/// function a build that links this crate registers and the `busbar-store-sqlite-plugin` cdylib
+/// exports.
+pub mod door;
+mod v3;
 
 #[cfg(test)]
 mod tests;

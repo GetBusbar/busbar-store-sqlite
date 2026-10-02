@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_contract::records::{AuditRecord, ModelTokensDelta, RecordStore, VirtualKey};
+use busbar_contract::records::{
+    AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, VirtualKey,
+};
 use rusqlite::TransactionBehavior;
 
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
@@ -1540,11 +1542,11 @@ fn call_record(c: &CallBody) -> PlaneRecord {
 }
 
 fn append_call(s: &SqliteStore, c: &CallBody) -> RecordStoreResult<()> {
-    s.append_plane_record(&call_record(c))
+    s.append_plane_record(call_record(c).view())
 }
 
 fn list_calls(s: &SqliteStore, principal: &str) -> Vec<CallBody> {
-    s.list_plane_records("call", &PlaneSelector::Parent(principal.to_string()))
+    s.list_plane_records("call", &PlaneSelector::Parent(principal.to_string().into()))
         .unwrap()
         .iter()
         .map(|b| serde_json::from_slice(b).unwrap())
@@ -1634,13 +1636,9 @@ fn mcp_call_principals_are_enumerable_after_a_restart() {
     );
     // The enumeration is per KIND: a parent of another kind is not a call principal.
     reopened
-        .append_plane_record(&event_record(&sample_event(
-            "t-1",
-            1,
-            "task.submitted",
-            "",
-            "e1",
-        )))
+        .append_plane_record(
+            event_record(&sample_event("t-1", 1, "task.submitted", "", "e1")).view(),
+        )
         .unwrap();
     assert_eq!(reopened.list_plane_record_parents("call").unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1727,7 +1725,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     // And so is a differing SIDECAR under an identical body: the envelope is the record.
     let mut moved = call_record(&rec);
     moved.ts = 999;
-    s.append_plane_record(&moved)
+    s.append_plane_record(moved.view())
         .expect_err("the same body under a different ts is a different record at that position");
 }
 
@@ -1738,7 +1736,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_fork() {
     let s = SqliteStore::open_in_memory().unwrap();
     let rec = call_record(&sample_call("vk_a", 1, 100, "", "h1"));
-    s.append_plane_record(&rec).unwrap();
+    s.append_plane_record(rec.view()).unwrap();
 
     let mut terminal = rec.clone();
     terminal.disposition = PlaneDisposition::Terminal;
@@ -1754,7 +1752,7 @@ fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_f
         ("parent", &no_parent),
     ] {
         let err = s
-            .append_plane_record(forked)
+            .append_plane_record(forked.view())
             .expect_err("a different record at an occupied position must be refused");
         assert!(
             format!("{err}").contains("the chain has forked"),
@@ -1791,9 +1789,9 @@ fn a_chain_record_rejects_a_direct_update_but_allows_the_retention_delete() {
         .expect("retention must remain possible; only rewriting is forbidden");
 
     // The upsert path is untouched by the guard: a second write of a top-level record replaces it.
-    s.upsert_plane_record(&task_record(&sample_task("t-1", "working", 200)))
+    s.upsert_plane_record(task_record(&sample_task("t-1", "working", 200)).view())
         .unwrap();
-    s.upsert_plane_record(&task_record(&sample_task("t-1", "completed", 300)))
+    s.upsert_plane_record(task_record(&sample_task("t-1", "completed", 300)).view())
         .expect("an upserted top-level record is updated in place, not refused as a rewrite");
     assert_eq!(get_task(&s, "t-1").unwrap().state, "completed");
 }
@@ -1911,11 +1909,14 @@ fn event_record(e: &EventBody) -> PlaneRecord {
 }
 
 fn list_events(s: &SqliteStore, task_id: &str) -> Vec<EventBody> {
-    s.list_plane_records("task_event", &PlaneSelector::Parent(task_id.to_string()))
-        .unwrap()
-        .iter()
-        .map(|b| serde_json::from_slice(b).unwrap())
-        .collect()
+    s.list_plane_records(
+        "task_event",
+        &PlaneSelector::Parent(task_id.to_string().into()),
+    )
+    .unwrap()
+    .iter()
+    .map(|b| serde_json::from_slice(b).unwrap())
+    .collect()
 }
 
 /// THE TEST THAT MATTERS, and it is deliberately not a unit test against a live handle: a live
@@ -1932,14 +1933,15 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
 
     {
         let s = SqliteStore::open(&path, 5000).unwrap();
-        s.upsert_plane_record(&task_record(&sample_task("t-1", "working", 200)))
+        s.upsert_plane_record(task_record(&sample_task("t-1", "working", 200)).view())
             .unwrap();
         // The write-through on a state transition REPLACES the row rather than appending a second
         // one — an interrupted task waiting on a human is what a restart has to find.
         let mut interrupted = sample_task("t-1", "input-required", 300);
         interrupted.artifact_cursor = 12;
-        s.upsert_plane_record(&task_record(&interrupted)).unwrap();
-        s.upsert_plane_record(&task_record(&sample_task("t-2", "submitted", 210)))
+        s.upsert_plane_record(task_record(&interrupted).view())
+            .unwrap();
+        s.upsert_plane_record(task_record(&sample_task("t-2", "submitted", 210)).view())
             .unwrap();
         drop(s);
     }
@@ -1968,7 +1970,7 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
     );
     // A point read is per KIND: a record of another kind under the same id is not a task.
     reopened
-        .upsert_plane_record(&demotion_record(&demotion("t-3", "drift", 1)))
+        .upsert_plane_record(demotion_record(&demotion("t-3", "drift", 1)).view())
         .unwrap();
     assert!(get_task(&reopened, "t-3").is_none());
 
@@ -1992,7 +1994,7 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_restart() {
             sample_task("t-done", "completed", 202),
             sample_task("t-failed", "failed", 203),
         ] {
-            s.upsert_plane_record(&task_record(&t)).unwrap();
+            s.upsert_plane_record(task_record(&t).view()).unwrap();
         }
         drop(s);
     }
@@ -2020,7 +2022,7 @@ fn a_task_event_chain_survives_a_restart_and_still_links() {
             // A second task's chain is independent — it must not leak into the first one's read.
             sample_event("t-2", 1, "task.submitted", "", "f1"),
         ] {
-            s.append_plane_record(&event_record(&e)).unwrap();
+            s.append_plane_record(event_record(&e).view()).unwrap();
         }
         drop(s);
     }
@@ -2075,8 +2077,8 @@ fn a_task_event_chain_survives_a_restart_and_still_links() {
 fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
     let s = SqliteStore::open_in_memory().unwrap();
     let e = sample_event("t-1", 1, "task.submitted", "", "e1");
-    s.append_plane_record(&event_record(&e)).unwrap();
-    s.append_plane_record(&event_record(&e))
+    s.append_plane_record(event_record(&e).view()).unwrap();
+    s.append_plane_record(event_record(&e).view())
         .expect("an identical replay must succeed, not be rejected as a fork");
     assert_eq!(
         list_events(&s, "t-1").len(),
@@ -2086,7 +2088,7 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
 
     let mut rewritten = sample_event("t-1", 1, "task.submitted", "", "e1-rewritten");
     rewritten.state = "submitted".to_string();
-    s.append_plane_record(&event_record(&rewritten))
+    s.append_plane_record(event_record(&rewritten).view())
         .expect_err("a different event at an occupied seq is a fork and must be refused");
     let got = list_events(&s, "t-1");
     assert_eq!(got.len(), 1, "a refused fork appends nothing");
@@ -2114,7 +2116,7 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         sample_task("t-at-cutoff", "completed", 200),
         sample_task("t-new-done", "completed", 300),
     ] {
-        s.upsert_plane_record(&task_record(&t)).unwrap();
+        s.upsert_plane_record(task_record(&t).view()).unwrap();
     }
 
     let purged = s.purge_plane_records_before("task", 200).unwrap();
@@ -2150,16 +2152,16 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let s = SqliteStore::open_in_memory().unwrap();
-    s.upsert_plane_record(&task_record(&sample_task("t-gone", "completed", 100)))
+    s.upsert_plane_record(task_record(&sample_task("t-gone", "completed", 100)).view())
         .unwrap();
-    s.upsert_plane_record(&task_record(&sample_task("t-stays", "working", 100)))
+    s.upsert_plane_record(task_record(&sample_task("t-stays", "working", 100)).view())
         .unwrap();
     for e in [
         sample_event("t-gone", 1, "task.submitted", "", "g1"),
         sample_event("t-gone", 2, "task.completed", "g1", "g2"),
         sample_event("t-stays", 1, "task.submitted", "", "s1"),
     ] {
-        s.append_plane_record(&event_record(&e)).unwrap();
+        s.append_plane_record(event_record(&e).view()).unwrap();
     }
 
     assert_eq!(s.purge_plane_records_before("task", 200).unwrap(), 1);
@@ -2185,7 +2187,7 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
     let mut t = task_record(&sample_task("t-1", "working", 200));
     t.ts = u64::MAX;
     let err = s
-        .upsert_plane_record(&t)
+        .upsert_plane_record(t.view())
         .expect_err("a ts past i64::MAX must be refused, not wrapped");
     assert!(
         err.0.contains("storable range"),
@@ -2200,14 +2202,14 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
     let mut e = event_record(&sample_event("t-1", 1, "task.submitted", "", "e1"));
     e.seq = u64::MAX;
     assert!(s
-        .append_plane_record(&e)
+        .append_plane_record(e.view())
         .expect_err("a seq past i64::MAX must be refused")
         .0
         .contains("storable range"));
     e.seq = 1;
     e.ts = u64::MAX;
     assert!(s
-        .append_plane_record(&e)
+        .append_plane_record(e.view())
         .expect_err("a ts past i64::MAX must be refused")
         .0
         .contains("storable range"));
@@ -2215,7 +2217,8 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
 
     // The boundary itself is storable, and a record written there reads back and sweeps correctly.
     t.ts = i64::MAX as u64;
-    s.upsert_plane_record(&t).expect("i64::MAX is in range");
+    s.upsert_plane_record(t.view())
+        .expect("i64::MAX is in range");
     assert!(get_task(&s, "t-1").is_some());
     assert_eq!(
         s.purge_plane_records_before("task", u64::MAX).unwrap(),
@@ -2315,25 +2318,19 @@ fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
 
     {
         let s = SqliteStore::open(&path, 5000).unwrap();
-        s.upsert_plane_record(&demotion_record(&demotion(
-            "payments",
-            "tool-drift",
-            1_700_000_000,
-        )))
+        s.upsert_plane_record(
+            demotion_record(&demotion("payments", "tool-drift", 1_700_000_000)).view(),
+        )
         .unwrap();
         // UPSERT by `server`: a second demotion of one upstream replaces the row rather than
         // standing a rival one beside it, so a read cannot come back holding two answers.
-        s.upsert_plane_record(&demotion_record(&demotion(
-            "payments",
-            "digest-mismatch",
-            1_700_000_100,
-        )))
+        s.upsert_plane_record(
+            demotion_record(&demotion("payments", "digest-mismatch", 1_700_000_100)).view(),
+        )
         .unwrap();
-        s.upsert_plane_record(&demotion_record(&demotion(
-            "search",
-            "tool-drift",
-            1_700_000_200,
-        )))
+        s.upsert_plane_record(
+            demotion_record(&demotion("search", "tool-drift", 1_700_000_200)).view(),
+        )
         .unwrap();
         drop(s);
     }
@@ -2560,7 +2557,7 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
          and then report every replay as a first redemption"
     );
     assert!(
-        s.upsert_plane_record(&demotion_record(&demotion("srv", "tool-drift", u64::MAX)))
+        s.upsert_plane_record(demotion_record(&demotion("srv", "tool-drift", u64::MAX)).view())
             .is_err(),
         "an unstorable recorded_at must be an error rather than a row that does not read back as \
          itself"
@@ -2590,7 +2587,7 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
     };
     {
         let s = SqliteStore::open(&path, 5000).unwrap();
-        s.upsert_plane_record(&cfg(PlaneDisposition::Active))
+        s.upsert_plane_record(cfg(PlaneDisposition::Active).view())
             .unwrap();
         drop(s);
     }
@@ -2624,7 +2621,7 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
         "the capability is per kind"
     );
     // The task ends: the write that made it terminal flips the record's disposition.
-    s.upsert_plane_record(&cfg(PlaneDisposition::Terminal))
+    s.upsert_plane_record(cfg(PlaneDisposition::Terminal).view())
         .unwrap();
     assert!(
         !s.plane_token_live("push_config", "tok-1", 2_000, 1_500)
@@ -2632,7 +2629,7 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
         "a terminal record names finished work; its token is revoked"
     );
     // And the revoke leg deletes it outright.
-    s.upsert_plane_record(&cfg(PlaneDisposition::Active))
+    s.upsert_plane_record(cfg(PlaneDisposition::Active).view())
         .unwrap();
     s.delete_plane_record("push_config", "tok-1").unwrap();
     assert!(!s
@@ -2659,7 +2656,7 @@ fn a_kind_this_build_has_never_heard_of_round_trips() {
         disposition: PlaneDisposition::Active,
         body: vec![0, 159, 146, 150, 255],
     };
-    s.upsert_plane_record(&rec).unwrap();
+    s.upsert_plane_record(rec.view()).unwrap();
     assert_eq!(
         s.get_plane_record("future_kind", "x").unwrap(),
         Some(rec.body.clone()),
@@ -3005,7 +3002,7 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
     );
 
     // And the upgraded file takes 1.6.0 writes.
-    s.upsert_plane_record(&task_record(&sample_task("t-new", "working", 5)))
+    s.upsert_plane_record(task_record(&sample_task("t-new", "working", 5)).view())
         .unwrap();
     assert!(get_task(s, "t-new").is_some());
 }

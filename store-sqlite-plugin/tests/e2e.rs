@@ -25,7 +25,7 @@
 //!   2. A second, independent `SqliteStore::open` (bypassing the plugin/ABI/loader entirely)
 //!      confirms the data physically landed in the file, not an in-process cache.
 //!
-//! The bad-config-path test below is DELIBERATELY left calling `load_store()` directly — it tests
+//! The bad-config-path test below is DELIBERATELY left opening the dropped-in door directly — it tests
 //! the loader's own error-surface contract in isolation (a legitimate internal unit-test target:
 //! "does a bad config produce a clean Err across the ABI, never a panic"), which is a different
 //! question from "does a real end-user install work," and converting it to a full
@@ -44,13 +44,23 @@
 //! /api/v1/admin/keys`, and independently verifies both landed in the real on-disk file with a
 //! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
 
+use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::lifecycle::slot as lc;
 use busbar_contract::records::{
     ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageLedger,
     UNIT_INPUT, UNIT_OUTPUT,
 };
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    in_head, load_dropped, out_head, rendering_of_library, Bind, DispatchConfig, Dispatcher, Frame,
+    NoSink,
+};
+use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// RAII scratch directory: removes itself on drop, including on an early return via a panicking
 /// assertion partway through a test.
@@ -220,6 +230,34 @@ fn plugin_path() -> PathBuf {
         "busbar-store-sqlite-plugin"
     );
     fresh
+}
+
+/// THE DROPPED-IN DOOR, opened as the host opens a store: the cdylib at `path` `dlopen`ed by the
+/// loader's `load_dropped` against the Statement rendering its own door states (what
+/// `busbar-plugin-pack` signs into the manifest), bound to a real dispatcher, then `open`ed on
+/// `cfg` through the store v3 table (`LoadedStore`). Every call on the handle crosses that table.
+fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let stated = rendering_of_library(path)
+        .map_err(|e| e.to_string())?
+        .ok_or("the cdylib states no door")?;
+    let bind = Bind {
+        instance: Arc::from(format!("sqlite-e2e-{}", N.fetch_add(1, Ordering::Relaxed))),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: d.adopter(),
+        conns: None,
+    };
+    let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
+    LoadedStore::open(plugin, d, cfg.as_bytes(), 1)
+}
+
+/// `close` the instance, as the host does at shutdown: its connections to the file close with it.
+fn close(store: LoadedStore) {
+    let mut f: Frame<InHead, OutHead> = Frame::new(in_head(), out_head());
+    let c = store.plugin().call(lc::CLOSE, &mut f);
+    assert_eq!(c.outcome, Outcome::Ready, "close answers Ready");
 }
 
 /// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
@@ -833,8 +871,8 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     assert_eq!(cred.kind, "sigv4");
 }
 
-/// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
-/// `load_store()` call): an `open()` config that cannot produce a usable store surfaces back across
+/// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct door
+/// load): an `open()` config that cannot produce a usable store surfaces back across
 /// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
@@ -842,9 +880,8 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
 
     // Malformed JSON: the plugin's own `open()` config parsing must reject it, surfaced intact
     // across the ABI.
-    let err = busbar_plugin_loader::load_store(&path, "{ not json")
-        .err()
-        .expect("malformed config JSON must fail to load, not silently succeed");
+    let err = door_store(&path, "{ not json")
+        .expect_err("malformed config JSON must fail to load, not silently succeed");
     assert!(
         err.contains("invalid sqlite plugin config"),
         "the plugin's own error message should survive the ABI crossing intact: {err}"
@@ -861,9 +898,8 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
     let _ = std::fs::remove_dir_all(&bogus_dir);
     let bogus_path = bogus_dir.join("nested").join("governance.db");
     let cfg = serde_json::json!({ "db_path": bogus_path.to_str().unwrap() }).to_string();
-    let err = busbar_plugin_loader::load_store(&path, &cfg)
-        .err()
-        .expect("a db_path under a nonexistent directory must fail to load");
+    let err = door_store(&path, &cfg)
+        .expect_err("a db_path under a nonexistent directory must fail to load");
     assert!(
         !err.is_empty(),
         "expected a descriptive sqlite open failure, got an empty string"
@@ -895,8 +931,8 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// in-flight task and every tool-call record while reporting success. Tests of `SqliteStore` called
 /// directly, in-process, cannot see that.
 ///
-/// So this test goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the cdylib, the
-/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three tasks across two states, three
+/// So this test goes through the dropped-in door (`door_store`): a REAL `dlopen` of the cdylib, the
+/// store v3 table, the host's real `LoadedStore`. It writes AT ARITY > 1 (three tasks across two states, three
 /// events on one task and one on another, three call records for one principal and one for a
 /// second), DROPS the handle — which unloads the library — then `dlopen`s AGAIN over the same file
 /// and reads everything back. A single-row round trip would not distinguish a relayed verb from a
@@ -950,52 +986,51 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
             "content": format!("sha256:tool{seq}|req-{seq}"),
         })),
     };
-    let parent = |p: &str| PlaneSelector::Parent(p.to_string());
+    let parent = |p: &str| PlaneSelector::Parent(p.to_string().into());
 
     {
         // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &cfg)
-            .expect("the sqlite plugin must load over the real ABI");
+        let store = door_store(&path, &cfg).expect("the sqlite plugin must load over the real ABI");
         for (id, state, updated, terminal) in [
             ("t_alpha", "working", 10_u64, false),
             ("t_beta", "input-required", 20, false),
             ("t_gamma", "completed", 30, true),
         ] {
             store
-                .upsert_plane_record(&task(id, state, updated, terminal))
+                .upsert_plane_record(task(id, state, updated, terminal).view())
                 .expect("upsert_plane_record");
         }
         for (seq, prev, hash) in [(1_u64, "", "e1"), (2, "e1", "e2"), (3, "e2", "e3")] {
             store
-                .append_plane_record(&event("t_alpha", seq, prev, hash))
+                .append_plane_record(event("t_alpha", seq, prev, hash).view())
                 .expect("append_plane_record");
         }
         store
-            .append_plane_record(&event("t_beta", 1, "", "b1"))
+            .append_plane_record(event("t_beta", 1, "", "b1").view())
             .expect("append_plane_record");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_plane_record(&call("vk_abi", seq, prev, hash))
+                .append_plane_record(call("vk_abi", seq, prev, hash).view())
                 .expect("append_plane_record");
         }
         store
-            .append_plane_record(&call("vk_other", 1, "", "o1"))
+            .append_plane_record(call("vk_other", 1, "", "o1").view())
             .expect("append_plane_record");
         // A fork crosses the ABI as an error, not as the default's silent Ok.
         assert!(
             store
-                .append_plane_record(&call("vk_other", 1, "", "FORK"))
+                .append_plane_record(call("vk_other", 1, "", "FORK").view())
                 .is_err(),
             "a different record at an occupied chain position must be refused over the ABI too"
         );
         // Dropping the boxed store drops the loader's `Library` handle: the dylib is UNLOADED, so
         // nothing this process still holds can be answering the reads below.
-        drop(store);
+        close(store);
     }
 
     // BOOT 2 — a second, independent dlopen over the same file.
-    let store = busbar_plugin_loader::load_store(&path, &cfg)
-        .expect("the sqlite plugin must load again over the real ABI");
+    let store =
+        door_store(&path, &cfg).expect("the sqlite plugin must load again over the real ABI");
 
     let tasks = store
         .list_plane_records("task", &PlaneSelector::All)
@@ -1136,8 +1171,8 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
 ///     redeemer is told it is the first, so the confirm-once tool executes once per node; and
 ///   * every push callback is refused, or a finished task's token keeps working.
 ///
-/// This goes through `busbar_plugin_loader::load_store`: a real `dlopen`, the real C ABI, the real
-/// `DynStore`. TWO CONCURRENT LOADS of one file are the fleet — the ledger has to refuse the second
+/// This goes through the dropped-in door (`door_store`): a real `dlopen`, the store v3 table, the
+/// host's real `LoadedStore`. TWO CONCURRENT LOADS of one file are the fleet — the ledger has to refuse the second
 /// node — and a drop-and-reload is the restart.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
@@ -1168,8 +1203,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     {
         // BOOT 1 — a real dlopen; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &cfg)
-            .expect("the sqlite plugin must load over the real ABI");
+        let store = door_store(&path, &cfg).expect("the sqlite plugin must load over the real ABI");
         for (server, reason, at) in [
             ("payments", "tool-drift", now),
             // The upsert path crosses the ABI too.
@@ -1178,14 +1212,14 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             ("mail", "tool-drift", now + 30),
         ] {
             store
-                .upsert_plane_record(&demotion(server, reason, at))
+                .upsert_plane_record(demotion(server, reason, at).view())
                 .expect("upsert_plane_record");
         }
         store
             .delete_plane_record("demotion", "mail")
             .expect("a later agreeing observation clears the quarantine");
         store
-            .upsert_plane_record(&push(PlaneDisposition::Active))
+            .upsert_plane_record(push(PlaneDisposition::Active).view())
             .expect("upsert_plane_record");
 
         assert!(
@@ -1194,13 +1228,13 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
                 .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
-        drop(store);
+        close(store);
     }
 
     // BOOT 2 — a second, independent dlopen over the same file. The library was unloaded, so
     // nothing this process still holds can be answering these reads out of RAM.
-    let store = busbar_plugin_loader::load_store(&path, &cfg)
-        .expect("the sqlite plugin must load again over the real ABI");
+    let store =
+        door_store(&path, &cfg).expect("the sqlite plugin must load again over the real ABI");
 
     let mut rows: Vec<serde_json::Value> = store
         .list_plane_records("demotion", &PlaneSelector::All)
@@ -1237,7 +1271,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         );
     }
     store
-        .upsert_plane_record(&push(PlaneDisposition::Terminal))
+        .upsert_plane_record(push(PlaneDisposition::Terminal).view())
         .expect("upsert_plane_record");
     assert!(
         !store
@@ -1249,7 +1283,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // THE FLEET. A second, simultaneous dlopen of the same cdylib over the same file is what a
     // second node of one deployment is: it shares the signing key, so it shares the seal, and every
     // check but this one passes on both.
-    let node_b = busbar_plugin_loader::load_store(&path, &cfg)
+    let node_b = door_store(&path, &cfg)
         .expect("a second node loads the same plugin against the same store");
     assert!(
         store
