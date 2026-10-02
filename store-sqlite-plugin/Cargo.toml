@@ -33,4 +33,4 @@ rusqlite = { workspace = true }
 # Dev-only: the admin-API install e2e test drives a REAL running busbar process's admin HTTP API
 # (POST /api/v1/admin/plugins, POST /api/v1/admin/keys) — the actual operator install path.
 reqwest = { workspace = true, features = ["json", "blocking"] }
-base64 = "0.22"
+base64 = { workspace = true }
