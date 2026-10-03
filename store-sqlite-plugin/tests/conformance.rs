@@ -16,7 +16,7 @@
 //! cross-handle view), and a RESTART — every handle closed, the file reopened, everything read back
 //! and every `op_id` replayed. The two arms must agree on the whole transcript.
 //!
-//! The RED arms are in the same test: (a) the door asked for as another kind is refused, linked and
+//! The RED arms are their own tests (plugin-gates `bothways` needs a RED arm beside the both-ways test): (a) the door asked for as another kind is refused, linked and
 //! dropped in; (b) the dropped-in door opened on a file that already holds a foreign key yields a
 //! transcript that DIFFERS from the linked one — so the comparison above can see a real difference
 //! and is not vacuously equal. A missing cdylib PANICS: this test IS the dropped-in door's proof.
@@ -407,8 +407,8 @@ fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
     })
 }
 
-/// The sqlite store behaves as ONE store through either door — and the RED arms show the
-/// comparison can tell a different store apart.
+/// The sqlite store behaves as ONE store through either door (the RED arms below show the
+/// comparison can tell a different store apart).
 #[test]
 fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     // What the packer signs (the library's own door, read off the built cdylib) is what the
@@ -474,8 +474,11 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     assert_eq!(r(2), "append_batch replay = Ok(Head { seq: 2, epoch: 0 })");
     assert!(r(3).starts_with("reserve 4 = Ok(["), "{replays:?}");
     assert!(r(4).contains("Exhausted"), "{replays:?}");
+}
 
-    // RED (a): the store's door asked for as a secret is refused, through both doors.
+/// RED (a): the store's door asked for as a secret is refused, through both doors.
+#[test]
+fn a_store_door_loaded_as_another_kind_is_refused() {
     let d = Dispatcher::new(DispatchConfig::default());
     for by in [Door::Linked, Door::Dropped] {
         match load::<Secret>(by, &d) {
@@ -489,9 +492,13 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
             ),
         }
     }
+}
 
-    // RED (b): the dropped-in door on a file that already holds a foreign key is NOT the same
-    // transcript — the equality above is not vacuous.
+/// RED (b): the dropped-in door on a file that already holds a foreign key is NOT the same
+/// transcript as the linked one — the equality in the both-ways test is not vacuous.
+#[test]
+fn a_store_holding_a_foreign_row_does_not_compare_equal() {
+    let linked = transcript(Door::Linked, "linked-red", None);
     let red = transcript(Door::Dropped, "red", Some("vk_foreign"));
     assert_ne!(
         red, linked,
