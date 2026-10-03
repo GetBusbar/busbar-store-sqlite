@@ -56,10 +56,12 @@ this repository's `store-sqlite/` directory. The
 `store-sqlite-plugin` crate is deliberately tiny: the logic crate also holds
 its one door (`door::door`, the store v3 table over `SqliteStore` through
 `busbar_contract::store_door!`; its `open` slot adapts the operator's settings
-into a `SqliteStore`), and the plugin crate exports that door as the image's one
-symbol, `busbar_plugin_door` (`export_door!`), so the cdylib answers the loader
+into a `SqliteStore`), and the plugin crate exports that door as
+`busbar_plugin_door` (`export_door!`), so the cdylib answers the loader
 through the same door a busbar build that LINKS `busbar-store-sqlite`
-registers — one source, both doors.
+registers — one source, both doors. The plugin crate also registers the store
+on the cold store lane (`export_store_plugin!`) that the busbar kernel at the
+pin boots a configured `store:` through.
 
 
 - The **default durable store** for busbar's governance data: virtual
