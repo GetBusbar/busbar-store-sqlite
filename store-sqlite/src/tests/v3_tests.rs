@@ -66,20 +66,20 @@ fn reserve(
     cells: &[Cell<'_>],
 ) -> Result<Vec<Grant>, ReserveRefused> {
     let mut grants = Vec::new();
-    s.reserve(op, epoch, cells.iter().copied(), &mut grants)
+    s.v3_reserve(op, epoch, cells.iter().copied(), &mut grants)
         .map(|()| grants)
 }
 
 /// `slice_release`, its amounts collected.
 fn release(s: &SqliteStore, op: OpId, epoch: u64, items: &[(u64, u64)]) -> OpResult<Vec<u64>> {
     let mut released = Vec::new();
-    s.slice_release(op, epoch, items.iter().copied(), &mut released)
+    s.v3_slice_release(op, epoch, items.iter().copied(), &mut released)
         .map(|()| released)
 }
 
 fn capped(dimension: Dimension<'static>, c: u64) -> SqliteStore {
     let s = fresh();
-    s.window_caps(op(1_000_000), &[cap(dimension, c, 1)])
+    s.v3_window_caps(op(1_000_000), &[cap(dimension, c, 1)])
         .expect("caps");
     s
 }
@@ -124,42 +124,52 @@ fn the_sqlite_store_states_it_is_durable_and_refuses_forks() {
 fn a_replayed_usage_batch_applies_once() {
     let s = fresh();
     let cells = [("k", 60, delta(1, 10))];
-    s.add_usage_batch(op(1), &cells).expect("first");
-    s.add_usage_batch(op(1), &cells)
+    s.v3_add_usage_batch(op(1), &cells).expect("first");
+    s.v3_add_usage_batch(op(1), &cells)
         .expect("replay answers the original");
-    assert_eq!(s.get_usage("k", 60).expect("read").requests, 1);
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        1
+    );
 }
 
 #[test]
 fn equal_bodies_under_distinct_op_ids_both_apply() {
     let s = fresh();
     let cells = [("k", 60, delta(2, 4))];
-    s.add_usage_batch(op(1), &cells).expect("a");
-    s.add_usage_batch(op(2), &cells).expect("b");
-    assert_eq!(s.get_usage("k", 60).expect("read").requests, 4);
+    s.v3_add_usage_batch(op(1), &cells).expect("a");
+    s.v3_add_usage_batch(op(2), &cells).expect("b");
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        4
+    );
 }
 
 #[test]
 fn a_reused_op_id_with_a_different_body_is_a_conflict_and_applies_nothing() {
     let s = fresh();
-    s.add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
         .expect("first");
     assert_eq!(
-        s.add_usage_batch(op(1), &[("k", 60, delta(5, 5))]),
+        s.v3_add_usage_batch(op(1), &[("k", 60, delta(5, 5))]),
         Err(OpRefused::Conflict)
     );
-    assert_eq!(s.get_usage("k", 60).expect("read").requests, 1);
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        1
+    );
 }
 
 #[test]
 fn an_op_id_reused_across_slots_is_a_conflict() {
     let s = fresh();
-    s.add_usage_op(op(1), "k", 60, &delta(1, 1)).expect("usage");
+    s.v3_add_usage_op(op(1), "k", 60, &delta(1, 1))
+        .expect("usage");
     assert_eq!(
-        s.append_audit_op(op(1), &audit(1, "a")),
+        s.v3_append_audit_op(op(1), &audit(1, "a")),
         Err(OpRefused::Conflict)
     );
-    assert!(s.list_audit().expect("list").is_empty());
+    assert!(RecordStore::list_audit(&s).expect("list").is_empty());
 }
 
 #[test]
@@ -168,12 +178,12 @@ fn a_failed_write_is_not_recorded_so_a_retry_is_evaluated_afresh() {
     s.append_audit(&audit(1, "a")).expect("seed");
     // A fork FAILS and is not recorded under the op_id ...
     assert!(matches!(
-        s.append_audit_op(op(9), &audit(1, "forked")),
+        s.v3_append_audit_op(op(9), &audit(1, "forked")),
         Err(OpRefused::Failed(_))
     ));
     // ... so the same op_id with a different, applicable body is new, not a conflict.
-    s.append_audit_op(op(9), &audit(2, "b")).expect("fresh");
-    assert_eq!(s.list_audit().expect("list").len(), 2);
+    s.v3_append_audit_op(op(9), &audit(2, "b")).expect("fresh");
+    assert_eq!(RecordStore::list_audit(&s).expect("list").len(), 2);
 }
 
 #[test]
@@ -182,14 +192,14 @@ fn an_audit_batch_with_one_fork_applies_none_of_it() {
     s.append_audit(&audit(2, "a")).expect("seed");
     let batch = [audit(1, "x"), audit(2, "forked")];
     assert!(matches!(
-        s.append_audit_batch(op(1), &batch),
+        s.v3_append_audit_batch(op(1), &batch),
         Err(OpRefused::Failed(_))
     ));
-    assert_eq!(s.list_audit().expect("list").len(), 1);
+    assert_eq!(RecordStore::list_audit(&s).expect("list").len(), 1);
     // Two different records at one seq INSIDE the batch are a fork too.
     let inner = [audit(5, "x"), audit(5, "y")];
-    assert!(s.append_audit_batch(op(2), &inner).is_err());
-    assert_eq!(s.list_audit().expect("list").len(), 1);
+    assert!(s.v3_append_audit_batch(op(2), &inner).is_err());
+    assert_eq!(RecordStore::list_audit(&s).expect("list").len(), 1);
 }
 
 #[test]
@@ -205,10 +215,15 @@ fn a_usage_batch_applies_its_cells_in_order() {
         billable_requests: 1,
         models: vec![],
     };
-    s.add_usage_batch(op(1), &[("k", 60, neg), ("k", 60, pos)])
+    s.v3_add_usage_batch(op(1), &[("k", 60, neg), ("k", 60, pos)])
         .expect("batch");
     // The floor at zero makes order matter: -1 then +1 is 1, not 0.
-    assert_eq!(s.get_usage("k", 60).expect("read").billable_requests, 1);
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60)
+            .expect("read")
+            .billable_requests,
+        1
+    );
 }
 
 #[test]
@@ -230,11 +245,11 @@ fn a_metering_batch_replay_applies_once() {
         priced_from_ms: 0,
         usage_units: Default::default(),
     };
-    s.add_metering_batch(op(1), std::slice::from_ref(&d))
+    s.v3_add_metering_batch(op(1), std::slice::from_ref(&d))
         .expect("a");
-    s.add_metering_batch(op(1), std::slice::from_ref(&d))
+    s.v3_add_metering_batch(op(1), std::slice::from_ref(&d))
         .expect("replay");
-    let rows = s.list_metering(86_400).expect("list");
+    let rows = RecordStore::list_metering(&s, 86_400).expect("list");
     assert_eq!(rows.iter().map(|r| r.requests).sum::<u64>(), 2);
 }
 
@@ -300,7 +315,7 @@ fn an_overflowing_draw_is_exhausted_not_wrapped() {
 #[test]
 fn a_chain_draw_is_all_or_nothing() {
     let s = fresh();
-    s.window_caps(
+    s.v3_window_caps(
         op(100),
         &[
             cap(Dimension::Requests, 10, 1),
@@ -368,18 +383,120 @@ fn a_refused_reserve_is_not_recorded() {
         reserve(&s, op(2), 0, &[cell(Dimension::Requests, 1)]),
         Err(ReserveRefused::Exhausted { cell: 0 })
     );
-    s.window_caps(op(3), &[cap(Dimension::Requests, 2, 2)])
+    s.v3_window_caps(op(3), &[cap(Dimension::Requests, 2, 2)])
         .expect("raise");
     // The same op_id is evaluated afresh and now fits.
     reserve(&s, op(2), 0, &[cell(Dimension::Requests, 1)]).expect("afresh");
 }
 
+/// The store kind's shared epoch and slice-life cases (`abi::store::SLICE_TTL_MS` (a)-(c)), run over
+/// ONE file this harness reopens, on a clock it moves. The store is durable and shared by every node
+/// that opens the file, so it runs the FLEET cases (`busbar_contract::testkit::store_v3`).
+struct FileHarness {
+    path: String,
+    clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A test clock, held still at a real instant.
+fn still_clock() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_790_000_000_000))
+}
+
+impl busbar_contract::testkit::store_v3::Harness for FileHarness {
+    type Store = SqliteStore;
+    fn open(&self) -> SqliteStore {
+        SqliteStore::open(&self.path, 5000)
+            .expect("open")
+            .on_clock(std::sync::Arc::clone(&self.clock))
+    }
+    fn now_ms(&self) -> u64 {
+        self.clock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn advance_ms(&self, ms: u64) {
+        self.clock
+            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[test]
-fn the_sqlite_store_never_answers_a_stale_epoch() {
+fn the_sqlite_store_follows_the_fleet_epoch_and_slice_life() {
+    let (s, path) = on_file("fleet");
+    drop(s);
+    busbar_contract::testkit::store_v3::fleet_store(&FileHarness {
+        path,
+        clock: still_clock(),
+    });
+}
+
+#[test]
+fn a_stale_epoch_is_refused_and_records_nothing_under_its_op_id() {
     let s = capped(Dimension::Requests, 10);
     reserve(&s, op(1), 9, &[cell(Dimension::Requests, 1)]).expect("epoch 9");
-    reserve(&s, op(2), 1, &[cell(Dimension::Requests, 1)])
-        .expect("an older epoch is not stale on a node-local store");
+    assert_eq!(
+        reserve(&s, op(2), 1, &[cell(Dimension::Requests, 1)]),
+        Err(ReserveRefused::StaleEpoch)
+    );
+    // Nothing was recorded under op 2: the same id at the current epoch applies afresh.
+    reserve(&s, op(2), 9, &[cell(Dimension::Requests, 1)]).expect("afresh at epoch 9");
+}
+
+#[test]
+fn a_grant_is_valid_for_slice_ttl_on_the_stores_clock() {
+    let skew = still_clock();
+    let s = capped(Dimension::Requests, 10).on_clock(std::sync::Arc::clone(&skew));
+    let g = reserve(&s, op(1), 0, &[cell(Dimension::Requests, 3)]).expect("draw");
+    assert_eq!(g[0].valid_until_ms, s.now_ms() + SLICE_TTL_MS);
+    // Past its validity a release returns nothing: expiry already gave the 3 back.
+    skew.fetch_add(SLICE_TTL_MS + 1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(release(&s, op(2), 0, &[(g[0].slice_id, 3)]), Ok(vec![0]));
+    reserve(&s, op(3), 0, &[cell(Dimension::Requests, 10)]).expect("all 10 drawable again");
+}
+
+/// v11 -> v12: a slice granted before the crossing keeps the never-expiring validity it was granted,
+/// and the file gains the epoch row's table.
+#[test]
+fn a_v11_slice_crosses_to_v12_never_expiring() {
+    let (s, path) = on_file("v11");
+    s.v3_window_caps(op(1), &[cap(Dimension::Requests, 10, 1)])
+        .expect("caps");
+    drop(s);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw open");
+        conn.execute_batch(
+            "DROP TABLE money_epoch;
+             DROP TABLE money_slices;
+             CREATE TABLE money_slices (
+                 slice_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                 slot      TEXT NOT NULL,
+                 remaining INTEGER NOT NULL
+             ) STRICT;
+             PRAGMA user_version = 11;",
+        )
+        .expect("a v11 file");
+        let (slot, _) = slot_of(&key(Dimension::Requests));
+        conn.execute(
+            "INSERT INTO money_slices (slot, remaining) VALUES (?1, 4)",
+            [&slot],
+        )
+        .expect("a v11 slice");
+        conn.execute(
+            "INSERT INTO money_used (slot, used) VALUES (?1, 4)",
+            [&slot],
+        )
+        .expect("its draw");
+    }
+    let skew = still_clock();
+    let s = SqliteStore::open(&path, 5000)
+        .expect("reopen at v12")
+        .on_clock(std::sync::Arc::clone(&skew));
+    skew.fetch_add(10 * SLICE_TTL_MS, std::sync::atomic::Ordering::Relaxed);
+    // Still drawn: 6 fit, 7 do not.
+    assert_eq!(
+        reserve(&s, op(2), 0, &[cell(Dimension::Requests, 7)]),
+        Err(ReserveRefused::Exhausted { cell: 0 })
+    );
+    assert_eq!(release(&s, op(3), 0, &[(1, 4)]), Ok(vec![4]));
+    reserve(&s, op(4), 0, &[cell(Dimension::Requests, 10)]).expect("the release freed all 4");
 }
 
 #[test]
@@ -417,16 +534,16 @@ fn releasing_an_unknown_slice_fails_and_applies_nothing() {
 #[test]
 fn window_caps_newest_generation_wins_and_equal_generation_conflicts() {
     let s = fresh();
-    s.window_caps(op(1), &[cap(Dimension::Requests, 1, 5)])
+    s.v3_window_caps(op(1), &[cap(Dimension::Requests, 1, 5)])
         .expect("gen 5");
-    s.window_caps(op(2), &[cap(Dimension::Requests, 99, 4)])
+    s.v3_window_caps(op(2), &[cap(Dimension::Requests, 99, 4)])
         .expect("an older generation is ignored");
     assert_eq!(
         reserve(&s, op(3), 0, &[cell(Dimension::Requests, 2)]),
         Err(ReserveRefused::Exhausted { cell: 0 })
     );
     assert_eq!(
-        s.window_caps(
+        s.v3_window_caps(
             op(4),
             &[
                 cap(Dimension::Requests, 3, 6),
@@ -441,7 +558,7 @@ fn window_caps_newest_generation_wins_and_equal_generation_conflicts() {
         reserve(&s, op(5), 0, &[cell(Dimension::Requests, 2)]),
         Err(ReserveRefused::Exhausted { cell: 0 })
     );
-    s.window_caps(op(6), &[cap(Dimension::Requests, 3, 6)])
+    s.v3_window_caps(op(6), &[cap(Dimension::Requests, 3, 6)])
         .expect("gen 6");
     reserve(&s, op(7), 0, &[cell(Dimension::Requests, 2)]).expect("cap 3");
 }
@@ -449,7 +566,7 @@ fn window_caps_newest_generation_wins_and_equal_generation_conflicts() {
 #[test]
 fn an_op_id_is_forgotten_after_its_retention() {
     let s = fresh();
-    s.add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
         .expect("a");
     // Age op 1 past its retention, as the clock would.
     let old = now_secs() - OP_ID_RETENTION_SECS as i64;
@@ -460,11 +577,14 @@ fn an_op_id_is_forgotten_after_its_retention() {
         )
         .expect("age");
     // Recording another op sweeps the expired one; the old op_id then reads as new.
-    s.add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
         .expect("b");
-    s.add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
         .expect("new again");
-    assert_eq!(s.get_usage("k", 60).expect("read").requests, 2);
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        2
+    );
 }
 
 #[test]
@@ -472,19 +592,22 @@ fn append_batch_advances_the_stream_head_once_per_op() {
     let s = fresh();
     let r = |b: u8| RecordBytes::new(vec![b]).expect("record");
     assert_eq!(
-        s.append_batch(op(1), "journal", &[r(1), r(2)])
+        s.v3_append_batch(op(1), "journal", &[r(1), r(2)])
             .expect("a")
             .seq,
         2
     );
     assert_eq!(
-        s.append_batch(op(1), "journal", &[r(1), r(2)])
+        s.v3_append_batch(op(1), "journal", &[r(1), r(2)])
             .expect("replay")
             .seq,
         2
     );
-    assert_eq!(s.append_batch(op(2), "journal", &[r(3)]).expect("b").seq, 3);
-    let heads = s.heads().expect("heads");
+    assert_eq!(
+        s.v3_append_batch(op(2), "journal", &[r(3)]).expect("b").seq,
+        3
+    );
+    let heads = s.v3_heads().expect("heads");
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0].0, "journal");
     assert_eq!(heads[0].1.seq, 3);
@@ -493,17 +616,17 @@ fn append_batch_advances_the_stream_head_once_per_op() {
 #[test]
 fn sessions_are_listed_per_principal_and_removed() {
     let s = fresh();
-    s.session_put(1, "n1", "alice").expect("put");
-    s.session_put(2, "n2", "alice").expect("put");
-    s.session_put(3, "n1", "bob").expect("put");
+    s.v3_session_put(1, "n1", "alice").expect("put");
+    s.v3_session_put(2, "n2", "alice").expect("put");
+    s.v3_session_put(3, "n1", "bob").expect("put");
     assert_eq!(
-        s.sessions_for("alice").expect("list"),
+        s.v3_sessions_for("alice").expect("list"),
         vec![(1, "n1".to_string()), (2, "n2".to_string())]
     );
-    s.session_remove(1).expect("remove");
-    s.session_remove(1).expect("absent is Ok");
+    s.v3_session_remove(1).expect("remove");
+    s.v3_session_remove(1).expect("absent is Ok");
     assert_eq!(
-        s.sessions_for("alice").expect("list"),
+        s.v3_sessions_for("alice").expect("list"),
         vec![(2, "n2".to_string())]
     );
 }
@@ -511,22 +634,23 @@ fn sessions_are_listed_per_principal_and_removed() {
 #[test]
 fn schema_records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     let s = fresh();
-    s.record_put("a", b"k\x01", b"one").expect("put");
-    s.record_put("a", b"k\x00", b"zero").expect("put");
-    s.record_put("a", b"k\xff", b"max").expect("put");
-    s.record_put("a", b"l", b"next").expect("put");
-    s.record_put("b", b"k\x00", b"other schema").expect("put");
-    s.record_put("a", b"k\x01", b"one again")
+    s.v3_record_put("a", b"k\x01", b"one").expect("put");
+    s.v3_record_put("a", b"k\x00", b"zero").expect("put");
+    s.v3_record_put("a", b"k\xff", b"max").expect("put");
+    s.v3_record_put("a", b"l", b"next").expect("put");
+    s.v3_record_put("b", b"k\x00", b"other schema")
+        .expect("put");
+    s.v3_record_put("a", b"k\x01", b"one again")
         .expect("overwrite");
     let read = |k: &[u8]| {
-        s.record_get("a", k)
+        s.v3_record_get("a", k)
             .expect("get")
             .map(|r| r.as_slice().to_vec())
     };
     assert_eq!(read(b"k\x01"), Some(b"one again".to_vec()));
     assert_eq!(read(b"missing"), None);
     let keys = |prefix: &[u8], limit: u32| -> Vec<Vec<u8>> {
-        s.record_scan("a", prefix, limit)
+        s.v3_record_scan("a", prefix, limit)
             .expect("scan")
             .into_iter()
             .map(|(k, _)| k)
@@ -559,16 +683,16 @@ fn prefix_successor_bounds_every_key_the_prefix_starts() {
 #[test]
 fn dedupe_and_money_state_survive_a_reopen_of_the_file() {
     let (s, path) = on_file("durable");
-    s.window_caps(op(1), &[cap(Dimension::Requests, 10, 1)])
+    s.v3_window_caps(op(1), &[cap(Dimension::Requests, 10, 1)])
         .expect("caps");
     let grants = reserve(&s, op(2), 0, &[cell(Dimension::Requests, 6)]).expect("draw");
-    s.add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
         .expect("usage");
     let r = |b: u8| RecordBytes::new(vec![b]).expect("record");
-    s.append_batch(op(4), "journal", &[r(1), r(2)])
+    s.v3_append_batch(op(4), "journal", &[r(1), r(2)])
         .expect("journal");
-    s.session_put(9, "n1", "alice").expect("session");
-    s.record_put("plane", b"k", b"v").expect("record");
+    s.v3_session_put(9, "n1", "alice").expect("session");
+    s.v3_record_put("plane", b"k", b"v").expect("record");
     drop(s);
 
     let s = SqliteStore::open(&path, 5000).expect("reopen");
@@ -586,22 +710,25 @@ fn dedupe_and_money_state_survive_a_reopen_of_the_file() {
         reserve(&s, op(5), 0, &[cell(Dimension::Requests, 5)]),
         Err(ReserveRefused::Exhausted { cell: 0 })
     );
-    s.add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
+    s.v3_add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
         .expect("replay");
-    assert_eq!(s.get_usage("k", 60).expect("read").requests, 1);
     assert_eq!(
-        s.append_batch(op(4), "journal", &[r(1), r(2)])
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        1
+    );
+    assert_eq!(
+        s.v3_append_batch(op(4), "journal", &[r(1), r(2)])
             .expect("replay")
             .seq,
         2
     );
-    assert_eq!(s.heads().expect("heads")[0].1.seq, 2);
+    assert_eq!(s.v3_heads().expect("heads")[0].1.seq, 2);
     assert_eq!(
-        s.sessions_for("alice").expect("sessions"),
+        s.v3_sessions_for("alice").expect("sessions"),
         vec![(9, "n1".to_string())]
     );
     assert_eq!(
-        s.record_get("plane", b"k")
+        s.v3_record_get("plane", b"k")
             .expect("get")
             .map(|v| v.as_slice().to_vec()),
         Some(b"v".to_vec())
@@ -626,19 +753,25 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
         disposition: busbar_contract::records::PlaneDisposition::Active,
         body,
     };
-    s.append_plane_record_op(op(1), rec(b"{}")).expect("append");
-    s.append_plane_record_op(op(1), rec(b"{}")).expect("replay");
+    s.v3_append_plane_record_op(op(1), rec(b"{}"))
+        .expect("append");
+    s.v3_append_plane_record_op(op(1), rec(b"{}"))
+        .expect("replay");
     assert_eq!(
-        s.append_plane_record_op(op(1), rec(b"{\"x\":1}")),
+        s.v3_append_plane_record_op(op(1), rec(b"{\"x\":1}")),
         Err(OpRefused::Conflict)
     );
     assert!(matches!(
-        s.append_plane_record_op(op(2), rec(b"{\"x\":1}")),
+        s.v3_append_plane_record_op(op(2), rec(b"{\"x\":1}")),
         Err(OpRefused::Failed(_))
     ));
     assert_eq!(
-        s.list_plane_records("task_event", &busbar_contract::records::PlaneSelector::All)
-            .expect("list"),
+        RecordStore::list_plane_records(
+            &s,
+            "task_event",
+            &busbar_contract::records::PlaneSelector::All
+        )
+        .expect("list"),
         vec![b"{}".to_vec()]
     );
 }
