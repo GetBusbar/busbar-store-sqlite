@@ -22,8 +22,8 @@ use busbar_contract::records::{
     UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 // rusqlite error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays storage-free,
 // so the `From` impl that powers `?` cannot live there). Replace `<rusqlite call>?` with `<call>.store()?`.
@@ -100,7 +100,12 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// caps, drawn totals and slices (`money_caps`, `money_used`, `money_slices`), the ledger streams
 /// (`journal`), the session directory (`sessions`) and a plane's kernel-held records
 /// (`schema_records`). Additive on the same terms as v7-v9: new tables only, created by `SCHEMA`.
-const SCHEMA_VERSION: i64 = 11;
+///
+/// v12 (busbar 1.6.0, the store kind's epoch and slice life, `abi::store::SLICE_TTL_MS` (a)-(c)):
+/// the ONE persisted fleet epoch (`money_epoch`) and each slice's `valid_until_ms`. Additive: a new
+/// table, and a nullable-free `ADD COLUMN` whose default (`-1`, `u64::MAX` bit-for-bit) is exactly the
+/// never-expiring validity every v11 slice was granted, so no open slice changes meaning.
+const SCHEMA_VERSION: i64 = 12;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
 /// sidecar on a task row copied out of the legacy typed `tasks` table (a live 1.6.0 engine sets it
@@ -335,10 +340,20 @@ CREATE TABLE IF NOT EXISTS money_used (
 ) STRICT, WITHOUT ROWID;
 -- AUTOINCREMENT: a slice id is never reused, so a late release of a closed slice can never land on
 -- a newer one.
+-- A slice stays a row once it is closed (`remaining` 0): any further release of it answers 0 and is
+-- not refused as never granted. `valid_until_ms` is a u64 kept bit-for-bit (-1 = never expires, a
+-- v11 slice).
 CREATE TABLE IF NOT EXISTS money_slices (
-    slice_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    slot      TEXT NOT NULL,
-    remaining INTEGER NOT NULL
+    slice_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot           TEXT NOT NULL,
+    remaining      INTEGER NOT NULL,
+    valid_until_ms INTEGER NOT NULL DEFAULT -1
+) STRICT;
+-- The ONE fleet epoch (v12, `abi::store::SLICE_TTL_MS` (a)): 0 before any reserve; only a reserve
+-- raises it, nothing lowers it.
+CREATE TABLE IF NOT EXISTS money_epoch (
+    id    INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    epoch INTEGER NOT NULL
 ) STRICT;
 
 -- The ledger streams: `seq` counts from 1 per stream, so a stream's head is its MAX(seq).
@@ -492,6 +507,10 @@ pub struct SqliteStore {
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     path: String,
+    /// The clock this store reads, in ms since the epoch: `None` (always, outside its own tests) is
+    /// the wall clock; its tests hand it one they hold still and move to expire a slice
+    /// (`busbar_contract::testkit::store_v3::Harness`).
+    test_clock_ms: Option<Arc<AtomicU64>>,
 }
 
 impl SqliteStore {
@@ -538,6 +557,7 @@ impl SqliteStore {
             readers,
             next_reader: AtomicUsize::new(0),
             path: path.to_string(),
+            test_clock_ms: None,
         };
         store.migrate()?;
         Ok(store)
@@ -554,9 +574,28 @@ impl SqliteStore {
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
             path: ":memory:".to_string(),
+            test_clock_ms: None,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// This store's clock, in ms since the epoch.
+    fn now_ms(&self) -> u64 {
+        if let Some(clock) = &self.test_clock_ms {
+            return clock.load(Ordering::Relaxed);
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Run this store on `clock` (its tests' clock, in ms).
+    #[cfg(test)]
+    fn on_clock(mut self, clock: Arc<AtomicU64>) -> Self {
+        self.test_clock_ms = Some(clock);
+        self
     }
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -659,6 +698,18 @@ impl SqliteStore {
             && !column_exists(&tx, "usage_metering", "priced_from_ms")?
         {
             rebuild_usage_metering_for_v10(&tx)?;
+        }
+        // v12: a v11 `money_slices` gains `valid_until_ms` (its default is the never-expiring
+        // validity v11 granted). Keyed on the column's absence, so a re-run is a no-op, and run
+        // BEFORE `SCHEMA` for the same reason as the v10 rebuild above.
+        if table_exists(&tx, "money_slices")?
+            && !column_exists(&tx, "money_slices", "valid_until_ms")?
+        {
+            tx.execute(
+                "ALTER TABLE money_slices ADD COLUMN valid_until_ms INTEGER NOT NULL DEFAULT -1",
+                [],
+            )
+            .store()?;
         }
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
