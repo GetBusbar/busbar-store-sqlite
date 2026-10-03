@@ -13,12 +13,23 @@ license = "Apache-2.0"
 # rlib: REQUIRED for `cargo test` to emit the cdylib artifact the conformance and e2e tests load.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# THE DROPPED-IN DOOR: `export_door!` emits the one C symbol `busbar_plugin_door`, and ONLY the
+# dropped-in cdylib may export it (compiled in = dropped in, one table: a busbar build that links
+# this crate as a row, alone or beside others, must carry no door symbol, or two doors in one
+# binary multiply define it under `lto = "fat"`). OFF by default; the dropped-in artifact is built
+# `cargo build --release -p busbar-store-sqlite-plugin --features dropped-in`, and `cargo test` names this crate
+# below with it on so the cdylib the conformance test opens carries the door.
+dropped-in = []
+
 [dependencies]
 # THE LOGIC, same repo: its `door::door` is the door this image exports.
 busbar-store-sqlite = { path = "../store-sqlite" }
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
 
 [dev-dependencies]
+# The conformance test opens this crate's own cdylib WITH its dropped-in door on (see `[features]`).
+busbar-store-sqlite-plugin = { path = ".", features = ["dropped-in"] }
 # The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
 # one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.

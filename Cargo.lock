@@ -150,6 +150,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-store-sqlite",
+ "busbar-store-sqlite-plugin",
  "reqwest",
  "rusqlite",
  "serde_json",
