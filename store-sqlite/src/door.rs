@@ -30,50 +30,78 @@ busbar_contract::store_door!(SqliteStore, NAME, env!("CARGO_PKG_VERSION"), 64);
 /// be swallowed into quietly opening the default relative path — that reads as a healthy boot
 /// against an empty governance database (data loss), not a config error.
 pub fn open(cfg: &str) -> Result<SqliteStore, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid sqlite plugin config: {e}"))?
-    };
-    let path = match v.get("db_path") {
-        None | Some(serde_json::Value::Null) => "busbar-governance.db",
-        Some(serde_json::Value::String(s)) => s.as_str(),
-        Some(other) => {
-            return Err(format!(
-                "invalid sqlite plugin config: `db_path` must be a string, got {other}"
-            ))
-        }
-    };
-    let busy_timeout_ms = match v.get("busy_timeout_ms") {
-        None | Some(serde_json::Value::Null) => 5000,
-        Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
-            let ms = n.as_i64().ok_or_else(|| {
-                format!("invalid sqlite plugin config: `busy_timeout_ms` out of range, got {n}")
-            })?;
-            // A negative duration has no meaning and can only be a config mistake (a unit-
-            // conversion bug, a stray sign, a bad template substitution) -- unlike `0`, which is a
-            // real, deliberate SQLite setting (see `apply_pragmas`'s own doc: SQLite's own
-            // zero-second default), a negative number names nothing SQLite or an operator could
-            // sensibly mean. SQLite doesn't reject it either -- like `0`, any `busy_timeout <= 0`
-            // silently disables the busy handler entirely (every write fails instantly on the
-            // slightest lock contention instead of retrying), which reads as a healthy boot with a
-            // quietly degraded reliability posture. `0` is left as a legal, if unusual, explicit
-            // "never retry" choice; only the never-sensible negative case is rejected here, the
-            // same silent-footgun class the wrong-JSON-type check above already guards against.
-            if ms < 0 {
+    let Settings {
+        db_path,
+        busy_timeout_ms,
+    } = Settings::parse(cfg)?;
+    SqliteStore::open(&db_path, busy_timeout_ms).map_err(|e| e.0)
+}
+
+/// The operator's settings, PARSED and nothing more: the store's `validate` slot runs this alone
+/// (`--validate` opens, connects to and migrates no store), and [`open`] opens what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    /// The database file (or an in-memory spelling).
+    pub db_path: String,
+    /// SQLite's busy timeout, in ms; never negative.
+    pub busy_timeout_ms: i64,
+}
+
+impl Settings {
+    /// Parse the section's JSON exactly as [`open`] reads it.
+    ///
+    /// # Errors
+    /// The refusal text [`open`] carries for the same settings.
+    pub fn parse(cfg: &str) -> Result<Self, String> {
+        const BAD: &str = "invalid sqlite plugin config";
+        let v: serde_json::Value = if cfg.trim().is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_str(cfg).map_err(|e| format!("invalid sqlite plugin config: {e}"))?
+        };
+        let path = match v.get("db_path") {
+            None | Some(serde_json::Value::Null) => "busbar-governance.db".to_owned(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => {
                 return Err(format!(
-                    "invalid sqlite plugin config: `busy_timeout_ms` must not be negative, got {ms}"
-                ));
+                    "invalid sqlite plugin config: `db_path` must be a string, got {other}"
+                ))
             }
-            ms
-        }
-        Some(other) => {
-            return Err(format!(
-                "invalid sqlite plugin config: `busy_timeout_ms` must be an integer, got {other}"
-            ))
-        }
-    };
-    SqliteStore::open(path, busy_timeout_ms).map_err(|e| e.0)
+        };
+        let busy_timeout_ms = match v.get("busy_timeout_ms") {
+            None | Some(serde_json::Value::Null) => 5000,
+            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
+                let ms = n.as_i64().ok_or_else(|| {
+                    format!("invalid sqlite plugin config: `busy_timeout_ms` out of range, got {n}")
+                })?;
+                // A negative duration has no meaning and can only be a config mistake (a unit-
+                // conversion bug, a stray sign, a bad template substitution) -- unlike `0`, which is a
+                // real, deliberate SQLite setting (see `apply_pragmas`'s own doc: SQLite's own
+                // zero-second default), a negative number names nothing SQLite or an operator could
+                // sensibly mean. SQLite doesn't reject it either -- like `0`, any `busy_timeout <= 0`
+                // silently disables the busy handler entirely (every write fails instantly on the
+                // slightest lock contention instead of retrying), which reads as a healthy boot with a
+                // quietly degraded reliability posture. `0` is left as a legal, if unusual, explicit
+                // "never retry" choice; only the never-sensible negative case is rejected here, the
+                // same silent-footgun class the wrong-JSON-type check above already guards against.
+                if ms < 0 {
+                    return Err(format!(
+                        "{BAD}: `busy_timeout_ms` must not be negative, got {ms}"
+                    ));
+                }
+                ms
+            }
+            Some(other) => {
+                return Err(format!(
+                    "{BAD}: `busy_timeout_ms` must be an integer, got {other}"
+                ))
+            }
+        };
+        Ok(Self {
+            db_path: path,
+            busy_timeout_ms,
+        })
+    }
 }
 
 // ── unit tests for the door's own responsibility: adapting the engine's JSON config into a real

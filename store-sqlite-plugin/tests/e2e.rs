@@ -232,6 +232,12 @@ fn plugin_path() -> PathBuf {
     fresh
 }
 
+/// The node's one `op_id` allocator, as the kernel hands a store handle its own: the bridge's
+/// additive writes mint from it. Its node half is one no test op id uses.
+fn mint() -> busbar_contract::abi::store::OpId {
+    static N: AtomicU64 = AtomicU64::new(0);
+    busbar_contract::abi::store::OpId::from_parts(0x5e1f, N.fetch_add(1, Ordering::Relaxed) + 1)
+}
 /// THE DROPPED-IN DOOR, opened as the host opens a store: the cdylib at `path` `dlopen`ed by the
 /// loader's `load_dropped` against the Statement rendering its own door states (what
 /// `busbar-plugin-pack` signs into the manifest), bound to a real dispatcher, then `open`ed on
@@ -250,7 +256,7 @@ fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> 
         conns: None,
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
-    LoadedStore::open(plugin, d, cfg.as_bytes(), 1)
+    LoadedStore::open(plugin, d, cfg.as_bytes(), mint)
 }
 
 /// `close` the instance, as the host does at shutdown: its connections to the file close with it.

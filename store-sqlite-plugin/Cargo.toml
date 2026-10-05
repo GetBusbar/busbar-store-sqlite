@@ -16,13 +16,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # THE LOGIC, same repo: its `door::door` is the door this image exports.
 busbar-store-sqlite = { path = "../store-sqlite" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af" }
 
 [dev-dependencies]
 # The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
 # one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af" }
 serde_json = "1"
 # Dev-only: the conformance test awaits the store v3 calls (`StoreCalls`), which are futures.
 tokio = { version = "1", features = ["rt"] }

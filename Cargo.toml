@@ -23,5 +23,5 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-store-sqlite"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af" }

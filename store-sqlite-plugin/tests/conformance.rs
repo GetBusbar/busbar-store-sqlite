@@ -16,7 +16,7 @@
 //! cross-handle view), and a RESTART — every handle closed, the file reopened, everything read back
 //! and every `op_id` replayed. The two arms must agree on the whole transcript.
 //!
-//! The RED arms are in the same test: (a) the door asked for as another kind is refused, linked and
+//! The RED arms are their own tests (plugin-gates `bothways` needs a RED arm beside the both-ways test): (a) the door asked for as another kind is refused, linked and
 //! dropped in; (b) the dropped-in door opened on a file that already holds a foreign key yields a
 //! transcript that DIFFERS from the linked one — so the comparison above can see a real difference
 //! and is not vacuously equal. A missing cdylib PANICS: this test IS the dropped-in door's proof.
@@ -92,11 +92,17 @@ fn load<K: busbar_plugin_loader::dispatch::Kind>(
     }
 }
 
+/// The node's one `op_id` allocator, as the kernel hands a store handle its own: the bridge's
+/// additive writes mint from it. Its node half is one no test op id uses.
+fn mint() -> busbar_contract::abi::store::OpId {
+    static N: AtomicU64 = AtomicU64::new(0);
+    busbar_contract::abi::store::OpId::from_parts(0x5e1f, N.fetch_add(1, Ordering::Relaxed) + 1)
+}
 /// One store instance through `by`, opened on `cfg` as the host opens a store.
 fn open(by: Door, cfg: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let plugin = load::<Store>(by, &d).map_err(|e| e.to_string())?;
-    LoadedStore::open(plugin, d, cfg.as_bytes(), 1)
+    LoadedStore::open(plugin, d, cfg.as_bytes(), mint)
 }
 
 /// `close` the instance, as the host does at a restart: its connections to the file go with it.
@@ -140,6 +146,31 @@ fn record(kind: &str, id: &str, parent: Option<&str>, seq: u64, body: &str) -> P
         ts: 1_700_000_000 + seq,
         disposition: PlaneDisposition::Active,
         body: body.as_bytes().to_vec(),
+    }
+}
+
+/// A reserve's answer as the transcript compares it: each grant's slice and amount. Its
+/// `valid_until_ms` is the store's clock plus `SLICE_TTL_MS` (`abi::store::SLICE_TTL_MS` (c)), so it
+/// differs from one run to the next; it is checked bounded here instead, never `u64::MAX`.
+fn granted(
+    answer: Result<Vec<busbar_contract::abi::sdk::store::Grant>, sc::StoreFailure>,
+) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_millis() as u64;
+    match answer {
+        Ok(grants) => {
+            for g in &grants {
+                assert!(
+                    g.valid_until_ms <= now + busbar_contract::abi::store::SLICE_TTL_MS,
+                    "a durable store bounds a slice's validity: {g:?}"
+                );
+            }
+            let cells: Vec<(u64, u64)> = grants.iter().map(|g| (g.slice_id, g.granted)).collect();
+            format!("Ok({cells:?})")
+        }
+        Err(e) => format!("Err({e:?})"),
     }
 }
 
@@ -211,7 +242,7 @@ fn v3_writes(s: &LoadedStore) -> Vec<String> {
                 "caps = {:?}",
                 sc::StoreCalls::window_caps(s, op(1), &caps).await
             ),
-            format!("no cap = {:?}", {
+            format!("no cap = {}", {
                 let other = [Cell {
                     key: CellKey {
                         bucket: "vk_other",
@@ -219,23 +250,23 @@ fn v3_writes(s: &LoadedStore) -> Vec<String> {
                     },
                     amount: 1,
                 }];
-                sc::StoreCalls::reserve(s, op(2), 0, &other).await
+                granted(sc::StoreCalls::reserve(s, op(2), 0, &other).await)
             }),
             format!(
-                "reserve 6 = {:?}",
-                sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await
+                "reserve 6 = {}",
+                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
             ),
             format!(
-                "replay = {:?}",
-                sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await
+                "replay = {}",
+                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
             ),
             format!(
-                "conflict = {:?}",
-                sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await
+                "conflict = {}",
+                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await)
             ),
             format!(
-                "reserve 5 = {:?}",
-                sc::StoreCalls::reserve(s, op(4), 0, &draw(5)).await
+                "reserve 5 = {}",
+                granted(sc::StoreCalls::reserve(s, op(4), 0, &draw(5)).await)
             ),
             format!(
                 "record_put = {:?}",
@@ -264,24 +295,24 @@ fn v3_replays(s: &LoadedStore) -> Vec<String> {
     block(async {
         vec![
             format!(
-                "replay = {:?}",
-                sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await
+                "replay = {}",
+                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
             ),
             format!(
-                "conflict = {:?}",
-                sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await
+                "conflict = {}",
+                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await)
             ),
             format!(
                 "append_batch replay = {:?}",
                 sc::StoreCalls::append_batch(s, op(5), "journal", &[r(b"a"), r(b"b")]).await
             ),
             format!(
-                "reserve 4 = {:?}",
-                sc::StoreCalls::reserve(s, op(6), 0, &draw(4)).await
+                "reserve 4 = {}",
+                granted(sc::StoreCalls::reserve(s, op(6), 0, &draw(4)).await)
             ),
             format!(
-                "reserve 1 = {:?}",
-                sc::StoreCalls::reserve(s, op(7), 0, &draw(1)).await
+                "reserve 1 = {}",
+                granted(sc::StoreCalls::reserve(s, op(7), 0, &draw(1)).await)
             ),
         ]
     })
@@ -376,8 +407,8 @@ fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
     })
 }
 
-/// The sqlite store behaves as ONE store through either door — and the RED arms show the
-/// comparison can tell a different store apart.
+/// The sqlite store behaves as ONE store through either door (the RED arms below show the
+/// comparison can tell a different store apart).
 #[test]
 fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     // What the packer signs (the library's own door, read off the built cdylib) is what the
@@ -443,8 +474,11 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     assert_eq!(r(2), "append_batch replay = Ok(Head { seq: 2, epoch: 0 })");
     assert!(r(3).starts_with("reserve 4 = Ok(["), "{replays:?}");
     assert!(r(4).contains("Exhausted"), "{replays:?}");
+}
 
-    // RED (a): the store's door asked for as a secret is refused, through both doors.
+/// RED (a): the store's door asked for as a secret is refused, through both doors.
+#[test]
+fn a_store_door_loaded_as_another_kind_is_refused() {
     let d = Dispatcher::new(DispatchConfig::default());
     for by in [Door::Linked, Door::Dropped] {
         match load::<Secret>(by, &d) {
@@ -458,9 +492,13 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
             ),
         }
     }
+}
 
-    // RED (b): the dropped-in door on a file that already holds a foreign key is NOT the same
-    // transcript — the equality above is not vacuous.
+/// RED (b): the dropped-in door on a file that already holds a foreign key is NOT the same
+/// transcript as the linked one — the equality in the both-ways test is not vacuous.
+#[test]
+fn a_store_holding_a_foreign_row_does_not_compare_equal() {
+    let linked = transcript(Door::Linked, "linked-red", None);
     let red = transcript(Door::Dropped, "red", Some("vk_foreign"));
     assert_ne!(
         red, linked,
