@@ -20,7 +20,7 @@ crate-type = ["rlib"]
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
 # build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
 # contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af" }
 # `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all.
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde_json = "1"
@@ -28,6 +28,10 @@ serde_json = "1"
 # conformance suite's stand-in bodies).
 serde = { version = "1", features = ["derive"] }
 
-# NO DEV-DEPENDENCIES. The `RecordStore` contract conformance suite lives in this crate's own
-# `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins); all it needs is
-# `busbar-contract`, already a normal dependency above.
+# The `RecordStore` contract conformance suite lives in this crate's own
+# `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins). The one
+# dev-only edge is the contract's own `test-seal` feature: it compiles `busbar_contract::testkit`,
+# whose `store_v3` cases are the store kind's epoch and slice-life spec every durable store runs
+# (`abi::store::SLICE_TTL_MS`). Same pinned rev, so one contract links.
+[dev-dependencies]
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "bf32f11ba9634c77afbe1dc89a8c3986499b38af", features = ["test-seal"] }

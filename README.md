@@ -59,9 +59,7 @@ its one door (`door::door`, the store v3 table over `SqliteStore` through
 into a `SqliteStore`), and the plugin crate exports that door as
 `busbar_plugin_door` (`export_door!`), so the cdylib answers the loader
 through the same door a busbar build that LINKS `busbar-store-sqlite`
-registers — one source, both doors. The plugin crate also registers the store
-on the cold store lane (`export_store_plugin!`) that the busbar kernel at the
-pin boots a configured `store:` through.
+registers — one source, both doors. The image carries no other export.
 
 
 - The **default durable store** for busbar's governance data: virtual
