@@ -77,7 +77,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: busbar_plugin_loader::dispatch::ConnTable::NoNeeds,
     }
 }
 
@@ -504,4 +504,18 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
         red, linked,
         "a store holding a foreign row must not compare equal"
     );
+}
+
+// THE PUBLISHED CONFORMANCE SUITE, RUN BY THIS PLUGIN (THE DESIGN §2 "Each plugin tests itself";
+// Part 2 #2: each kind has ONE suite): busbar's store suite at the commit this repo pins
+// (`.busbar-ref`) drives the store two ways through the one loader, LINKED (the logic crate's
+// `door`) and DROPPED IN (this crate's built cdylib), as the kernel drives a store, over the store
+// kind's script with the inputs in `conformance.json`. Each fold opens its OWN database file (the
+// `{fold}` placeholder in `db_path` is the fold's namespace) in the workspace's target directory
+// (cargo runs a test from the package root). Every step's crossings exactly at the script's pin,
+// the two folds equal, and the suite's RED arms kept. `plugin-ci.yml` runs it under `--release`.
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_sqlite::door::door,
+    cdylib: "busbar_store_sqlite_plugin",
+    inputs: include_str!("conformance.json"),
 }

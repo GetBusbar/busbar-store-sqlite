@@ -253,7 +253,7 @@ fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> 
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: busbar_plugin_loader::dispatch::ConnTable::NoNeeds,
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
     LoadedStore::open(plugin, d, cfg.as_bytes(), mint)
@@ -388,7 +388,9 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e",
+            // The plugin's own version, the one its Statement states: the pack tool refuses any
+            // other, and first-party plugins version on their own line (no binary-version floor).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
@@ -580,7 +582,9 @@ fn pack_sqlite_tarball(
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e-admin-api",
+            // The plugin's own version, the one its Statement states: the pack tool refuses any
+            // other, and first-party plugins version on their own line (no binary-version floor).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
