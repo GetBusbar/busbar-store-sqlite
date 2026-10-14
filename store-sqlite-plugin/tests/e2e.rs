@@ -388,7 +388,9 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e",
+            // The plugin's own version, the one its Statement states: the pack tool refuses any
+            // other, and first-party plugins version on their own line (no binary-version floor).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
@@ -580,7 +582,9 @@ fn pack_sqlite_tarball(
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e-admin-api",
+            // The plugin's own version, the one its Statement states: the pack tool refuses any
+            // other, and first-party plugins version on their own line (no binary-version floor).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
