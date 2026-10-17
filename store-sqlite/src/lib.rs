@@ -1147,13 +1147,7 @@ fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<V
         .map(ScopeRef::pool)
         .collect();
     for (kind, values) in other {
-        // The key crosses back to the engine as JSON, and the contract serializes a non-pool kind
-        // only if it is registered in THIS process. The engine registers every installed plane's kinds
-        // in its own process at boot; a plugin process never sees that call. Every kind stored here
-        // came in on a key the engine itself serialized, i.e. a kind the engine had registered, so
-        // registering it on the way back out is restating the engine's own registration, never
-        // widening it.
-        busbar_contract::records::register_scope_kind(&kind);
+        // The key crosses back to the engine as JSON, every kind as data: no registry is consulted.
         list.extend(values.into_iter().map(|value| ScopeRef {
             kind: kind.clone(),
             value,
