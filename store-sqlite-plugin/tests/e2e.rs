@@ -253,7 +253,7 @@ fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> 
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: busbar_plugin_loader::dispatch::ConnTable::NoNeeds,
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
     LoadedStore::open(plugin, d, cfg.as_bytes(), mint)

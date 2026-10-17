@@ -61,7 +61,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=bf32f11ba9634c77afbe1dc89a8c3986499b38af#bf32f11ba9634c77afbe1dc89a8c3986499b38af"
+source = "git+https://github.com/GetBusbar/busbar?rev=565f24f25e42370f3f8b5d8b2d91d56950eb4866#565f24f25e42370f3f8b5d8b2d91d56950eb4866"
 dependencies = [
  "async-trait",
  "base64",
@@ -82,32 +82,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "busbar-kernel-ledger"
-version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=bf32f11ba9634c77afbe1dc89a8c3986499b38af#bf32f11ba9634c77afbe1dc89a8c3986499b38af"
-dependencies = [
- "busbar-contract",
- "ring",
- "serde",
-]
-
-[[package]]
-name = "busbar-kernel-wal"
-version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=bf32f11ba9634c77afbe1dc89a8c3986499b38af#bf32f11ba9634c77afbe1dc89a8c3986499b38af"
-dependencies = [
- "busbar-contract",
- "ring",
-]
-
-[[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=bf32f11ba9634c77afbe1dc89a8c3986499b38af#bf32f11ba9634c77afbe1dc89a8c3986499b38af"
+source = "git+https://github.com/GetBusbar/busbar?rev=565f24f25e42370f3f8b5d8b2d91d56950eb4866#565f24f25e42370f3f8b5d8b2d91d56950eb4866"
 dependencies = [
  "busbar-contract",
- "busbar-kernel-ledger",
- "busbar-kernel-wal",
  "ed25519-dalek",
  "flate2",
  "futures",
@@ -1018,9 +997,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
