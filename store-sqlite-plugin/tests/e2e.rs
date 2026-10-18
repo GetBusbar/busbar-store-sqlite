@@ -253,7 +253,7 @@ fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> 
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: busbar_plugin_loader::dispatch::ConnTable::NoNeeds,
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
     LoadedStore::open(plugin, d, cfg.as_bytes(), mint)
@@ -388,7 +388,9 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e",
+            // The release version is the plugin's own, the one its Statement states (the pack tool
+            // refuses any other).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
@@ -476,7 +478,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     }
     let child = boot_cmd
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn a real busbar boot");
     let mut child = KillOnDrop(child);
@@ -580,7 +582,9 @@ fn pack_sqlite_tarball(
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e-admin-api",
+            // The release version is the plugin's own, the one its Statement states (the pack tool
+            // refuses any other).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
@@ -717,7 +721,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn boot 1 (memory store, admin listener up)");
     let mut child1 = KillOnDrop(child1);
@@ -807,7 +811,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn boot 2 (sqlite store, over the admin-API-installed plugin)");
     let mut child2 = KillOnDrop(child2);
