@@ -478,7 +478,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     }
     let child = boot_cmd
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn a real busbar boot");
     let mut child = KillOnDrop(child);
@@ -721,7 +721,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn boot 1 (memory store, admin listener up)");
     let mut child1 = KillOnDrop(child1);
@@ -811,7 +811,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         .env("MOCK_KEY", SECRET_PLACEHOLDER)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn boot 2 (sqlite store, over the admin-API-installed plugin)");
     let mut child2 = KillOnDrop(child2);
