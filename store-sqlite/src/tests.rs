@@ -2545,10 +2545,15 @@ fn an_entry_expiring_exactly_now_is_kept_and_its_replay_refused() {
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
+    // `expires_at` saturates: u64::MAX is busbar's "never expires" for a minting claim, it is only
+    // compared by the sweep and never read back, so it is stored as i64::MAX, spent once.
+    assert!(s
+        .redeem_plane_token("ask", "n", u64::MAX, 1_700_000_000)
+        .unwrap());
     assert!(
-        s.redeem_plane_token("ask", "n", u64::MAX, 1_700_000_000)
-            .is_err(),
-        "an unstorable expires_at must be an error, never a silent 'first redemption'"
+        !s.redeem_plane_token("ask", "n", u64::MAX, 1_700_000_001)
+            .unwrap(),
+        "a never-expiring grant is spent by its first redemption"
     );
     assert!(
         s.redeem_plane_token("ask", "n", 1_700_000_900, u64::MAX)

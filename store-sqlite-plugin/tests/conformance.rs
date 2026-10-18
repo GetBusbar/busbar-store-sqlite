@@ -45,6 +45,16 @@ use busbar_plugin_loader::dispatch::{
 use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_store_sqlite::door::door;
 
+// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
+// the built cdylib, each through the one loader, driven by the store kind's script over
+// `conformance.json`; exact crossing counts, the two folds equal, its RED arms. Each fold opens its
+// own database file: `db_path` names `{fold}`, a namespace no other fold uses.
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_sqlite::door::door,
+    cdylib: "busbar_store_sqlite_plugin",
+    inputs: include_str!("conformance.json"),
+}
+
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 /// failure, never a skip: this test IS the dropped-in door's proof.
 fn cdylib() -> PathBuf {
@@ -77,7 +87,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: busbar_plugin_loader::dispatch::ConnTable::NoNeeds,
     }
 }
 

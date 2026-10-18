@@ -1147,13 +1147,7 @@ fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<V
         .map(ScopeRef::pool)
         .collect();
     for (kind, values) in other {
-        // The key crosses back to the engine as JSON, and the contract serializes a non-pool kind
-        // only if it is registered in THIS process. The engine registers every installed plane's kinds
-        // in its own process at boot; a plugin process never sees that call. Every kind stored here
-        // came in on a key the engine itself serialized, i.e. a kind the engine had registered, so
-        // registering it on the way back out is restating the engine's own registration, never
-        // widening it.
-        busbar_contract::records::register_scope_kind(&kind);
+        // The key crosses back to the engine as JSON, every kind as data: no registry is consulted.
         list.extend(values.into_iter().map(|value| ScopeRef {
             kind: kind.clone(),
             value,
@@ -2341,7 +2335,13 @@ impl RecordStore for SqliteStore {
         // and then report the insert as a first redemption — an out-of-range argument silently
         // reopening every spent grant in the deployment. The only safe answer to a value this store
         // cannot hold faithfully is an error, which the engine turns into a REFUSED redemption.
-        let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        // `expires_at` is the ONE argument that saturates: busbar's minting claims (a node's
+        // identity, a keyset period) pass `u64::MAX` for "never expires", and the column is only
+        // ever compared against `now` by the sweep below, never read back, so `i64::MAX` is the
+        // same answer (no `now` this store accepts reaches it) and nothing stored differs from
+        // what was written in any way an observer can see. Refusing it refused the boot's identity
+        // claim (BUSBAR-9007).
+        let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
         let now_i = as_storable_i64("redeem_plane_token", "now", now)?;
 
         let mut conn = self.lock_writer();
