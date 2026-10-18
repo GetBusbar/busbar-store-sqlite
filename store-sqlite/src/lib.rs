@@ -2335,7 +2335,13 @@ impl RecordStore for SqliteStore {
         // and then report the insert as a first redemption — an out-of-range argument silently
         // reopening every spent grant in the deployment. The only safe answer to a value this store
         // cannot hold faithfully is an error, which the engine turns into a REFUSED redemption.
-        let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        // `expires_at` is the ONE argument that saturates: busbar's minting claims (a node's
+        // identity, a keyset period) pass `u64::MAX` for "never expires", and the column is only
+        // ever compared against `now` by the sweep below, never read back, so `i64::MAX` is the
+        // same answer (no `now` this store accepts reaches it) and nothing stored differs from
+        // what was written in any way an observer can see. Refusing it refused the boot's identity
+        // claim (BUSBAR-9007).
+        let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
         let now_i = as_storable_i64("redeem_plane_token", "now", now)?;
 
         let mut conn = self.lock_writer();
