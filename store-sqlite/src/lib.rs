@@ -18,8 +18,8 @@
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -296,7 +296,7 @@ CREATE TABLE IF NOT EXISTS plane_records (
     CONSTRAINT plane_disposition CHECK (disposition IN ('active','terminal')),
     PRIMARY KEY (kind, identity, seq)
 ) STRICT, WITHOUT ROWID;
--- The retention sweep's access path (`purge_plane_records_before` filters on kind + ts), and the
+-- The retention sweep's access path (`purge_plane_records` filters on kind + ts), and the
 -- parent enumeration's (`list_plane_record_parents`) and a parent's scan's.
 CREATE INDEX IF NOT EXISTS plane_records_kind_ts_idx ON plane_records (kind, ts);
 CREATE INDEX IF NOT EXISTS plane_records_kind_parent_idx ON plane_records (kind, parent, seq);
@@ -1041,7 +1041,7 @@ fn migrate_legacy_plane_tables(tx: &rusqlite::Connection) -> RecordStoreResult<(
             )?;
         }
         // Takes the `tasks_cascade_events` trigger with it; the cascade now lives in
-        // `purge_plane_records_before`.
+        // `purge_plane_records`.
         tx.execute_batch("DROP TABLE tasks").store()?;
     }
 
@@ -2262,12 +2262,17 @@ impl RecordStore for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
-        // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the kind's
-        // own contract, read off the typed `disposition` column, never out of the body:
-        // - `task` drops only TERMINAL rows. An interrupted task waiting on a human is exactly the row
+    fn purge_plane_records(
+        &self,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
+        // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the rule the
+        // host passes, read off the typed `disposition` column, never out of the body:
+        // - `TerminalOnly` (the `task` kind's) drops only TERMINAL rows. An interrupted task waiting on a human is exactly the row
         //   that legitimately sits still longest; compacting it is losing the work.
-        // - every other kind drops every row older than `before`.
+        // - `Age` drops every row older than `before`.
         //
         // A purged task takes its `task_event` chain with it, and only its own. Nothing else ever
         // removes a task's events, so leaving them would grow the table forever with chains whose
@@ -2276,7 +2281,7 @@ impl RecordStore for SqliteStore {
         // `before` is clamped rather than refused, unlike the write paths: a cutoff past what SQLite
         // can hold means "everything older than the end of time", and clamping it says exactly that.
         let before = i64::try_from(before).unwrap_or(i64::MAX);
-        let terminal_only = kind == "task";
+        let terminal_only = retention == Retention::TerminalOnly;
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

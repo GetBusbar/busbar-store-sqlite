@@ -1656,7 +1656,9 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     append_call(&s, &sample_call("vk_b", 1, 150, "", "b1")).unwrap();
 
     // Strictly older than `before`, across every principal. ts=300 and ts=200 stay.
-    let purged = s.purge_plane_records_before("call", 200).unwrap();
+    let purged = s
+        .purge_plane_records("call", 200, busbar_contract::records::Retention::Age)
+        .unwrap();
     assert_eq!(
         purged, 2,
         "purge must return the number of rows it actually removed (ts=100 and ts=150), not a guess"
@@ -1675,15 +1677,24 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     );
     // `before` is STRICTLY less-than: a row exactly at the cutoff is kept.
     assert_eq!(
-        s.purge_plane_records_before("call", 200).unwrap(),
+        s.purge_plane_records("call", 200, busbar_contract::records::Retention::Age)
+            .unwrap(),
         0,
         "re-running the same purge removes nothing; ts=200 sits exactly at the cutoff and is kept"
     );
     // A purge is per KIND: sweeping another kind at a cutoff past everything touches no call.
-    assert_eq!(s.purge_plane_records_before("demotion", 1_000).unwrap(), 0);
+    assert_eq!(
+        s.purge_plane_records("demotion", 1_000, busbar_contract::records::Retention::Age)
+            .unwrap(),
+        0
+    );
     assert_eq!(list_calls(&s, "vk_a").len(), 2);
     // And the count is real: purging past everything clears the rest.
-    assert_eq!(s.purge_plane_records_before("call", 1_000).unwrap(), 2);
+    assert_eq!(
+        s.purge_plane_records("call", 1_000, busbar_contract::records::Retention::Age)
+            .unwrap(),
+        2
+    );
     assert!(list_calls(&s, "vk_a").is_empty());
 }
 
@@ -2119,7 +2130,13 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         s.upsert_plane_record(task_record(&t).view()).unwrap();
     }
 
-    let purged = s.purge_plane_records_before("task", 200).unwrap();
+    let purged = s
+        .purge_plane_records(
+            "task",
+            200,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
+        .unwrap();
     assert_eq!(
         purged, 4,
         "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
@@ -2139,7 +2156,12 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
          less-than so a row exactly at the cutoff is kept"
     );
     assert_eq!(
-        s.purge_plane_records_before("task", 200).unwrap(),
+        s.purge_plane_records(
+            "task",
+            200,
+            busbar_contract::records::Retention::TerminalOnly
+        )
+        .unwrap(),
         0,
         "re-running the same purge removes nothing"
     );
@@ -2164,7 +2186,15 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
         s.append_plane_record(event_record(&e).view()).unwrap();
     }
 
-    assert_eq!(s.purge_plane_records_before("task", 200).unwrap(), 1);
+    assert_eq!(
+        s.purge_plane_records(
+            "task",
+            200,
+            busbar_contract::records::Retention::TerminalOnly
+        )
+        .unwrap(),
+        1
+    );
     assert!(
         list_events(&s, "t-gone").is_empty(),
         "the purged task's events go with it; otherwise they grow unbounded"
@@ -2221,7 +2251,12 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
         .expect("i64::MAX is in range");
     assert!(get_task(&s, "t-1").is_some());
     assert_eq!(
-        s.purge_plane_records_before("task", u64::MAX).unwrap(),
+        s.purge_plane_records(
+            "task",
+            u64::MAX,
+            busbar_contract::records::Retention::TerminalOnly
+        )
+        .unwrap(),
         0,
         "an ACTIVE task is kept even by a sweep at the end of time"
     );
@@ -2673,7 +2708,11 @@ fn a_kind_this_build_has_never_heard_of_round_trips() {
         vec![rec.body.clone()]
     );
     // Not `task`, so its retention is every-row-older-than, active or not.
-    assert_eq!(s.purge_plane_records_before("future_kind", 6).unwrap(), 1);
+    assert_eq!(
+        s.purge_plane_records("future_kind", 6, busbar_contract::records::Retention::Age)
+            .unwrap(),
+        1
+    );
 }
 
 // ── 1.6.0 record shapes: keys, usage units, metering instants ────────────────────────────────
@@ -3377,7 +3416,12 @@ fn a_real_v9_database_from_the_pre_port_dev_build_opens_and_upgrades_losslessly(
 
     // Retention reads the migrated disposition: the terminal task goes, the interrupted one stays.
     assert_eq!(
-        s.purge_plane_records_before("task", 1_800_000_000).unwrap(),
+        s.purge_plane_records(
+            "task",
+            1_800_000_000,
+            busbar_contract::records::Retention::TerminalOnly
+        )
+        .unwrap(),
         1
     );
     assert!(get_task(&s, "task_done").is_none());

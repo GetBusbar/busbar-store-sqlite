@@ -32,14 +32,14 @@ use std::collections::HashMap;
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
+    Scanned, Step, StoreSlots, Tail, DURABLE_CLAIMED,
 };
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS, SLICE_TTL_MS};
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger,
-    VirtualKey,
+    PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, Retention, UsageDelta,
+    UsageLedger, VirtualKey,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -737,7 +737,7 @@ impl SqliteStore {
 /// is exactly the code v1.0.6 shipped.
 impl StoreSlots for SqliteStore {
     const TAIL: Tail = Tail {
-        ephemeral: false,
+        durable: DURABLE_CLAIMED,
         durable_plane: true,
         fork_refusal: true,
     };
@@ -1081,13 +1081,16 @@ impl StoreSlots for SqliteStore {
         Step::Ready(RecordStore::list_plane_record_parents(self, kind))
     }
 
-    fn purge_plane_records_before(
+    fn purge_plane_records(
         &self,
         _: &mut Op<'_>,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(RecordStore::purge_plane_records_before(self, kind, before))
+        Step::Ready(RecordStore::purge_plane_records(
+            self, kind, before, retention,
+        ))
     }
 
     fn delete_plane_record(
