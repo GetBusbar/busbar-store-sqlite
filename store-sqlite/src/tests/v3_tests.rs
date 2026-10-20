@@ -113,7 +113,7 @@ fn the_sqlite_store_states_it_is_durable_and_refuses_forks() {
     assert_eq!(
         <SqliteStore as StoreSlots>::TAIL,
         Tail {
-            ephemeral: false,
+            durable: busbar_contract::abi::sdk::store::DURABLE_CLAIMED,
             durable_plane: true,
             fork_refusal: true,
         }
