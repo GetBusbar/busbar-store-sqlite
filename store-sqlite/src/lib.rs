@@ -7,7 +7,7 @@
 //! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
 //! Depends only on the `busbar-contract` crate (plus rusqlite), never on the engine.
 //!
-//! THE DOOR: [`door::door`] answers the store v3 table (`busbar_contract::abi::store`) over
+//! THE DOOR: [`door`] answers the store v3 table (`busbar_contract::abi::store`) over
 //! [`SqliteStore`] through the contract's safe store SDK — the 1.5.5 op set is the
 //! [`RecordStore`] implementation below, the v3 additions are in `v3`. The crate exports no
 //! symbol: a build that links it registers `door`, and the `busbar-store-sqlite-plugin` cdylib
