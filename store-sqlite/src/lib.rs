@@ -606,8 +606,8 @@ impl SqliteStore {
         self.writer.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The filesystem path (or `:memory:`) this store was opened against — for operator-facing
-    /// diagnostics (e.g. a boot-log line naming which file governance is persisted to).
+    /// The filesystem path (or `:memory:`) this store was opened against. Test-only: the tests read
+    /// it to check which file a store was opened on; nothing outside `cfg(test)` calls it.
     #[cfg(test)]
     pub fn path(&self) -> &str {
         &self.path
