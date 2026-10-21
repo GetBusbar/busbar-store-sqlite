@@ -499,6 +499,50 @@ fn a_v11_slice_crosses_to_v12_never_expiring() {
     reserve(&s, op(4), 0, &[cell(Dimension::Requests, 10)]).expect("the release freed all 4");
 }
 
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release returns 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let zero = CellKey {
+        bucket: "window-0",
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    let s = fresh();
+    s.v3_window_caps(
+        op(1),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("caps");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(2), 0, &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(3), 0, &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(4), 0, &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(5), 0, &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(6), 0, &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let s = capped(Dimension::Requests, 10);
+    let g = reserve(&s, op(1), 0, &[cell(Dimension::Requests, 6)]).expect("draw");
+    assert_eq!(release(&s, op(2), 0, &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(3), 0, &[(g[0].slice_id, 4)]), Ok(vec![4]));
+}
+
 #[test]
 fn slice_release_is_clamped_deduped_and_frees_headroom() {
     let s = capped(Dimension::Requests, 10);
