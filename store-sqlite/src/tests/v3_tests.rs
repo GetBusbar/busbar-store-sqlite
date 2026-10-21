@@ -499,6 +499,50 @@ fn a_v11_slice_crosses_to_v12_never_expiring() {
     reserve(&s, op(4), 0, &[cell(Dimension::Requests, 10)]).expect("the release freed all 4");
 }
 
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release returns 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let zero = CellKey {
+        bucket: "window-0",
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    let s = fresh();
+    s.v3_window_caps(
+        op(1),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("caps");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(2), 0, &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(3), 0, &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(4), 0, &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(5), 0, &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(6), 0, &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let s = capped(Dimension::Requests, 10);
+    let g = reserve(&s, op(1), 0, &[cell(Dimension::Requests, 6)]).expect("draw");
+    assert_eq!(release(&s, op(2), 0, &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(3), 0, &[(g[0].slice_id, 4)]), Ok(vec![4]));
+}
+
 #[test]
 fn slice_release_is_clamped_deduped_and_frees_headroom() {
     let s = capped(Dimension::Requests, 10);
@@ -668,6 +712,49 @@ fn schema_records_upsert_read_back_and_scan_a_prefix_in_key_order() {
         "an empty prefix is the whole schema"
     );
     assert_eq!(keys(b"k\xff", 10), vec![b"k\xff".to_vec()]);
+}
+
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let s = fresh();
+    let held = || -> i64 {
+        s.lock_reader()
+            .query_row("SELECT COUNT(*) FROM schema_records", [], |r| r.get(0))
+            .expect("count")
+    };
+    s.v3_record_put("a", b"a/1", b"one").expect("put");
+    s.v3_record_put("a", b"a/2", b"two").expect("put");
+    assert_eq!(held(), 2);
+
+    s.v3_record_put("a", b"a/1", b"").expect("strike");
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert_eq!(s.v3_record_get("a", b"a/1").expect("get"), None);
+    let scanned: Vec<(Vec<u8>, Vec<u8>)> = s
+        .v3_record_scan("a", b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scanned,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.v3_record_put("a", b"a/9", b"")
+        .expect("a strike of nothing is Ok");
+    assert_eq!(held(), 1);
+    s.v3_record_put("a", b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.v3_record_get("a", b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
 }
 
 #[test]

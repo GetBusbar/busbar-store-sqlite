@@ -75,6 +75,15 @@ fn slot_of(k: &CellKey<'_>) -> (String, u32) {
     (key.to_string(), dimension)
 }
 
+/// The `window_start` a slot key ([`slot_of`]) names: its last element.
+fn window_of(slot: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(slot)
+        .ok()?
+        .as_array()?
+        .last()?
+        .as_u64()
+}
+
 /// The 1.5.5 admission test for one cell (`abi::store::ReserveIn`, GRANT SIZE): whether drawing
 /// `amount` onto `used` under `cap` is refused. `used + amount` is checked: an overflow refuses.
 fn exhausted(dimension: u32, used: u64, amount: u64, cap: u64) -> bool {
@@ -420,12 +429,25 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     pub(crate) fn v3_record_put(
         &self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        if value.is_empty() {
+            return self
+                .lock_writer()
+                .execute(
+                    "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
+                    params![schema, key],
+                )
+                .map(drop)
+                .map_err(|e| e.to_string());
+        }
         self.lock_writer()
             .execute(
                 "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
@@ -627,9 +649,18 @@ impl SqliteStore {
                 expire(tx, &slot, now).map_err(failed)?;
                 let (_, left) = held(id)?.ok_or_else(gone)?;
                 let back = unspent.min(left);
+                // A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): window 0
+                // never rolls, so the slice CLOSES now. Its spent rest stays counted against the
+                // cap, and another release of it returns 0. On a rolling window a partial release
+                // leaves the rest open.
+                let after = if window_of(&slot) == Some(0) {
+                    0
+                } else {
+                    left - back
+                };
                 tx.execute(
                     "UPDATE money_slices SET remaining=?2 WHERE slice_id=?1",
-                    params![to_db(id), to_db(left - back)],
+                    params![to_db(id), to_db(after)],
                 )
                 .store()
                 .map_err(failed)?;
