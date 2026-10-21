@@ -745,7 +745,8 @@ fn an_empty_put_removes_the_row() {
         "a scan never returns a struck row"
     );
 
-    s.v3_record_put("a", b"a/9", b"").expect("a strike of nothing is Ok");
+    s.v3_record_put("a", b"a/9", b"")
+        .expect("a strike of nothing is Ok");
     assert_eq!(held(), 1);
     s.v3_record_put("a", b"a/1", b"again").expect("put again");
     assert_eq!(
