@@ -670,6 +670,48 @@ fn schema_records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     assert_eq!(keys(b"k\xff", 10), vec![b"k\xff".to_vec()]);
 }
 
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let s = fresh();
+    let held = || -> i64 {
+        s.lock_reader()
+            .query_row("SELECT COUNT(*) FROM schema_records", [], |r| r.get(0))
+            .expect("count")
+    };
+    s.v3_record_put("a", b"a/1", b"one").expect("put");
+    s.v3_record_put("a", b"a/2", b"two").expect("put");
+    assert_eq!(held(), 2);
+
+    s.v3_record_put("a", b"a/1", b"").expect("strike");
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert_eq!(s.v3_record_get("a", b"a/1").expect("get"), None);
+    let scanned: Vec<(Vec<u8>, Vec<u8>)> = s
+        .v3_record_scan("a", b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scanned,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.v3_record_put("a", b"a/9", b"").expect("a strike of nothing is Ok");
+    assert_eq!(held(), 1);
+    s.v3_record_put("a", b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.v3_record_get("a", b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
+}
+
 #[test]
 fn prefix_successor_bounds_every_key_the_prefix_starts() {
     assert_eq!(prefix_successor(b"ab"), Some(b"ac".to_vec()));
