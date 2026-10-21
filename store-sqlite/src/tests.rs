@@ -23,6 +23,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         idp_subject: None,
         binding_mode: None,
         minted_by: None,
+        idp_provider: None,
     }
 }
 
@@ -2751,6 +2752,42 @@ fn the_1_6_attribution_fields_round_trip() {
     assert_eq!(
         (plain.idp_subject, plain.binding_mode, plain.minted_by),
         (None, None, None)
+    );
+}
+
+/// THE MINTING PROVIDER (Q128 u31, busbar `VirtualKey::idp_provider`): a kernel-only provenance
+/// field persisted with the row. RED before the column existed: the write dropped it and the key
+/// read back `None`, so a second provider asserting the same subject was never refused.
+#[test]
+fn the_minting_provider_persists_with_the_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_prov", "g");
+    k.idp_provider = Some("okta-prod".into());
+    s.put_key(&k).unwrap();
+    assert_eq!(
+        s.get_key("vk_prov")
+            .unwrap()
+            .unwrap()
+            .idp_provider
+            .as_deref(),
+        Some("okta-prod")
+    );
+    let listed = s.list_keys().unwrap();
+    assert_eq!(listed[0].idp_provider.as_deref(), Some("okta-prod"));
+    // An update that clears it clears it.
+    k.idp_provider = None;
+    s.put_key(&k).unwrap();
+    assert_eq!(s.get_key("vk_prov").unwrap().unwrap().idp_provider, None);
+}
+
+/// GREEN twin: a key minted without a provider (every non-self-serve key) reads back `None`.
+#[test]
+fn a_key_minted_without_a_provider_reads_none() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_plain_prov", "g")).unwrap();
+    assert_eq!(
+        s.get_key("vk_plain_prov").unwrap().unwrap().idp_provider,
+        None
     );
 }
 
