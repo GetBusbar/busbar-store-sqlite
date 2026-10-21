@@ -502,10 +502,12 @@ fn with_full_sync<T>(
 /// read-then-write and `DEFERRED`'s upgrade-on-first-write can return `SQLITE_BUSY_SNAPSHOT`, which
 /// bypasses the busy handler entirely) plus a small round-robin pool of `query_only` reader
 /// connections, so a long billing report or retention sweep never blocks the hot-path usage flush.
-pub struct SqliteStore {
+struct SqliteStore {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    /// The file (or `:memory:`) this store was opened against; read by `path` (the tests').
+    #[cfg_attr(not(test), allow(dead_code))]
     path: String,
     /// The clock this store reads, in ms since the epoch: `None` (always, outside its own tests) is
     /// the wall clock; its tests hand it one they hold still and move to expire a slice
@@ -604,6 +606,7 @@ impl SqliteStore {
 
     /// The filesystem path (or `:memory:`) this store was opened against — for operator-facing
     /// diagnostics (e.g. a boot-log line naming which file governance is persisted to).
+    #[cfg(test)]
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -2565,11 +2568,13 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// THE DOOR: the settings parser and the store v3 table over [`SqliteStore`] (`door::door`), the one
-/// function a build that links this crate registers and the `busbar-store-sqlite-plugin` cdylib
-/// exports.
-pub mod door;
+mod door;
 mod v3;
+
+/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape). The settings parser and
+/// the store v3 table over [`SqliteStore`], the one function a build that links this crate registers
+/// and the `busbar-store-sqlite-plugin` cdylib exports.
+pub use door::door;
 
 #[cfg(test)]
 mod tests;

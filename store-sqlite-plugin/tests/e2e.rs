@@ -56,7 +56,6 @@ use busbar_plugin_loader::dispatch::{
     NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_store_sqlite::SqliteStore;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -257,6 +256,11 @@ fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> 
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
     LoadedStore::open(plugin, d, cfg.as_bytes(), mint)
+}
+
+/// The settings a direct open of `db_path` states: the file and SQLite's busy timeout.
+fn direct_cfg(db_path: &std::path::Path) -> String {
+    serde_json::json!({ "db_path": db_path.to_str().unwrap(), "busy_timeout_ms": 5000 }).to_string()
 }
 
 /// `close` the instance, as the host does at shutdown: its connections to the file close with it.
@@ -504,16 +508,16 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     );
 
     // PROOF the real on-disk file was actually initialized by the REAL busbar process, through the
-    // REAL file-drop path: an independent `SqliteStore::open` (bypassing the plugin/ABI/loader
-    // entirely) confirms the schema now exists -- the real boot's own plugin-open call ran
-    // SqliteStore::open, which runs migrate().
-    let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
-        .expect("open the real file directly with the plain SqliteStore, bypassing the plugin");
+    // REAL file-drop path: an independent open through a fresh door (bypassing the busbar process)
+    // confirms the schema now exists -- the real boot's own plugin-open call ran the store's open,
+    // which runs migrate().
+    let direct = door_store(&plugin_path(), &direct_cfg(&db_path))
+        .expect("open the real file through a fresh door, bypassing the busbar process");
     assert!(
         RecordStore::list_keys(&direct).unwrap().is_empty(),
         "a freshly migrated, never-written store must have zero keys, not error out"
     );
-    drop(direct);
+    close(direct);
 
     // Now prove persistence actually round-trips through the same real file across a full
     // close + reopen — a bug shared by both `open` calls (e.g. always resolving to `:memory:`)
@@ -529,13 +533,14 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         }],
     };
     {
-        let writer = SqliteStore::open(db_path.to_str().unwrap(), 5000)
+        let writer = door_store(&plugin_path(), &direct_cfg(&db_path))
             .expect("reopen the real file to write usage");
         writer.put_usage("vk_filedrop", 200, &ledger).unwrap();
-        // `writer` drops here, closing its connection -- the file must hold the committed data
+        // The writer closes here, closing its connection -- the file must hold the committed data
         // after this, not just an in-process cache.
+        close(writer);
     }
-    let reopened = SqliteStore::open(db_path.to_str().unwrap(), 5000)
+    let reopened = door_store(&plugin_path(), &direct_cfg(&db_path))
         .expect("reopen the real file after the writer closed");
     let usage = reopened.get_usage("vk_filedrop", 200).unwrap();
     assert_eq!(
@@ -548,6 +553,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         .find(|m| m.model == "gpt-5")
         .expect("model row survives reopen");
     assert_eq!((t.tier(UNIT_INPUT), t.tier(UNIT_OUTPUT)), (20, 8));
+    close(reopened);
 }
 
 /// Bind an ephemeral loopback port and immediately drop the listener, handing the bare port number
@@ -866,8 +872,9 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     // ── INDEPENDENT VERIFICATION: a second, brand-new `SqliteStore::open` on the real file,
     // bypassing the plugin/ABI/admin-API/loader entirely, must see the exact key + credential the
     // live admin API just wrote. ──
-    let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
-        .expect("open the real file directly, bypassing the plugin and the admin API");
+    let direct = door_store(&plugin_path(), &direct_cfg(&db_path)).expect(
+        "open the real file through a fresh door, bypassing the plugin install and the admin API",
+    );
     let key = RecordStore::get_key(&direct, &key_id).unwrap().expect(
         "the virtual key minted over the admin API must be readable directly from the file",
     );
@@ -879,6 +886,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
              from the file, keyed by the same access-key-id the admin API returned",
     );
     assert_eq!(cred.kind, "sigv4");
+    close(direct);
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct door

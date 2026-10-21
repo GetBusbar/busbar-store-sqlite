@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE DOOR: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`, the contract's store
+//! THE DOOR: `door`, the store v3 table over [`SqliteStore`] (`store_door!`, the contract's store
 //! SDK), and [`open`], the settings parser its `open` slot runs. A busbar build that links this crate
 //! registers `door` as its compiled-in row; the `busbar-store-sqlite-plugin` cdylib exports the same
 //! `door` as `busbar_plugin_door`. Compiled in or dropped in, the host reaches one table. The store
@@ -11,9 +11,23 @@
 use crate::SqliteStore;
 
 /// The store's name, as its Statement states it and its signed manifest names it.
-pub const NAME: &str = "busbar-store-sqlite";
+const NAME: &str = "busbar-store-sqlite";
 
-busbar_contract::store_door!(SqliteStore, NAME, env!("CARGO_PKG_VERSION"), 64);
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json"),
+    )]
+);
+
+busbar_contract::store_door!(
+    SqliteStore,
+    NAME,
+    env!("CARGO_PKG_VERSION"),
+    64,
+    extensions: EXTENSIONS
+);
 
 /// Construct a SQLite store from the settings the host passes through `open`. Shape (both keys
 /// optional, sensible defaults so an empty `{}` works):
@@ -29,7 +43,7 @@ busbar_contract::store_door!(SqliteStore, NAME, env!("CARGO_PKG_VERSION"), 64);
 /// not silently defaulted: a template variable that resolves to a number for `db_path` must never
 /// be swallowed into quietly opening the default relative path — that reads as a healthy boot
 /// against an empty governance database (data loss), not a config error.
-pub fn open(cfg: &str) -> Result<SqliteStore, String> {
+fn open(cfg: &str) -> Result<SqliteStore, String> {
     let Settings {
         db_path,
         busy_timeout_ms,
@@ -40,7 +54,7 @@ pub fn open(cfg: &str) -> Result<SqliteStore, String> {
 /// The operator's settings, PARSED and nothing more: the store's `validate` slot runs this alone
 /// (`--validate` opens, connects to and migrates no store), and [`open`] opens what it read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Settings {
+struct Settings {
     /// The database file (or an in-memory spelling).
     pub db_path: String,
     /// SQLite's busy timeout, in ms; never negative.
