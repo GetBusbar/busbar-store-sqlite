@@ -7,7 +7,7 @@
 //! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
 //! Depends only on the `busbar-contract` crate (plus rusqlite), never on the engine.
 //!
-//! THE DOOR: [`door::door`] answers the store v3 table (`busbar_contract::abi::store`) over
+//! THE DOOR: [`door`] answers the store v3 table (`busbar_contract::abi::store`) over
 //! [`SqliteStore`] through the contract's safe store SDK — the 1.5.5 op set is the
 //! [`RecordStore`] implementation below, the v3 additions are in `v3`. The crate exports no
 //! symbol: a build that links it registers `door`, and the `busbar-store-sqlite-plugin` cdylib
@@ -82,7 +82,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 ///   framed digest stream the engine seals and no backend can reconstruct, so its rows are LEFT IN
 ///   PLACE, unread, rather than destroyed or forged (busbar ships no `call` migration either).
 /// - `keys` gains `scope_grants` (the non-pool scope kinds, which the pool-only column used to
-///   silently turn into POOL grants), `idp_subject`, `binding_mode` and `minted_by` — nullable
+///   silently turn into POOL grants), `idp_subject`, `binding_mode`, `minted_by` and `idp_provider` — nullable
 ///   `ADD COLUMN`s, so every existing row reads back exactly as before.
 /// - `usage_metering` gains `priced_from_ms` INTO ITS PRIMARY KEY (a rate-card edit splits the day's
 ///   cell), which SQLite can only do by rebuilding the table: every existing row is copied across at
@@ -502,10 +502,12 @@ fn with_full_sync<T>(
 /// read-then-write and `DEFERRED`'s upgrade-on-first-write can return `SQLITE_BUSY_SNAPSHOT`, which
 /// bypasses the busy handler entirely) plus a small round-robin pool of `query_only` reader
 /// connections, so a long billing report or retention sweep never blocks the hot-path usage flush.
-pub struct SqliteStore {
+struct SqliteStore {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    /// The file (or `:memory:`) this store was opened against; read by `path` (the tests').
+    #[cfg(test)]
     path: String,
     /// The clock this store reads, in ms since the epoch: `None` (always, outside its own tests) is
     /// the wall clock; its tests hand it one they hold still and move to expire a slice
@@ -556,6 +558,7 @@ impl SqliteStore {
             writer: Mutex::new(writer_conn),
             readers,
             next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
             path: path.to_string(),
             test_clock_ms: None,
         };
@@ -573,6 +576,7 @@ impl SqliteStore {
             writer: Mutex::new(conn),
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
             path: ":memory:".to_string(),
             test_clock_ms: None,
         };
@@ -602,8 +606,9 @@ impl SqliteStore {
         self.writer.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The filesystem path (or `:memory:`) this store was opened against — for operator-facing
-    /// diagnostics (e.g. a boot-log line naming which file governance is persisted to).
+    /// The filesystem path (or `:memory:`) this store was opened against. Test-only: the tests read
+    /// it to check which file a store was opened on; nothing outside `cfg(test)` calls it.
+    #[cfg(test)]
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -850,7 +855,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 /// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
 /// attribution fields, which is what the contract says a key minted before them carries.
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
-    const COLUMNS: [(&str, &str); 4] = [
+    const COLUMNS: [(&str, &str); 5] = [
         // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
         // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
         // grant. See `scopes_to_storage` for why pools keep their own column.
@@ -862,6 +867,9 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
         ("idp_subject", "TEXT"),
         ("binding_mode", "TEXT"),
         ("minted_by", "TEXT"),
+        // The identity-provider instance that minted a self-serve key (KERNEL-ONLY provenance,
+        // Q128 u31: persisted with the row, never served).
+        ("idp_provider", "TEXT"),
     ];
     for (name, decl) in COLUMNS {
         if !column_exists(tx, "keys", name)? {
@@ -1178,11 +1186,12 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         idp_subject: r.get(12)?,
         binding_mode: r.get(13)?,
         minted_by: r.get(14)?,
+        idp_provider: r.get(15)?,
     })
 }
 
 const KEY_COLS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
-     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by";
+     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by,idp_provider";
 
 fn secret_form_to_str(f: SecretForm) -> &'static str {
     match f {
@@ -1266,14 +1275,15 @@ fn put_key_inner(
     let (allowed_pools, scope_grants) = scopes_to_storage(&key.allowed_scopes);
     let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
-                           scope_grants,idp_subject,binding_mode,minted_by)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16)
+                           scope_grants,idp_subject,binding_mode,minted_by,idp_provider)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
             expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11,
             scope_grants=excluded.scope_grants, idp_subject=excluded.idp_subject,
-            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by
+            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by,
+            idp_provider=excluded.idp_provider
          WHERE excluded.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
         params![
             key.id,
@@ -1292,6 +1302,7 @@ fn put_key_inner(
             key.idp_subject,
             key.binding_mode,
             key.minted_by,
+            key.idp_provider,
         ],
     )
     .store()?;
@@ -2565,11 +2576,13 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// THE DOOR: the settings parser and the store v3 table over [`SqliteStore`] (`door::door`), the one
-/// function a build that links this crate registers and the `busbar-store-sqlite-plugin` cdylib
-/// exports.
-pub mod door;
+mod door;
 mod v3;
+
+/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape). The settings parser and
+/// the store v3 table over [`SqliteStore`], the one function a build that links this crate registers
+/// and the `busbar-store-sqlite-plugin` cdylib exports.
+pub use door::door;
 
 #[cfg(test)]
 mod tests;

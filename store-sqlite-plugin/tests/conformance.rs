@@ -5,7 +5,7 @@
 //! store kind's memory ABI (THE DESIGN §11, store v3), run against the busbar rev this repo pins
 //! (`.busbar-ref`).
 //!
-//! The store is held two ways at once: LINKED (the logic crate's `door::door`, through the loader's
+//! The store is held two ways at once: LINKED (the logic crate's `door`, through the loader's
 //! `load_linked`, the row a busbar build that compiles it in registers) and DROPPED IN (this crate's
 //! built cdylib, `dlopen`ed by the loader's `load_dropped` against the Statement rendering the door
 //! states, which is what `busbar-plugin-pack` signs into the manifest). Each is bound to a real
@@ -39,18 +39,24 @@ use busbar_contract::store_calls as sc;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    in_head, load_dropped, load_linked, out_head, rendering_of, rendering_of_library, Bind,
-    DispatchConfig, Dispatcher, Frame, LinkedRow, LoadError, NoSink, Plugin,
+    in_head, load_dropped, load_linked, out_head, rendering_of_library, rendering_of_loaded, Bind,
+    DispatchConfig, Dispatcher, Frame, LinkedRow, LoadError, LoadedDoor, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_store_sqlite::door::door;
+
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { LoadedDoor::from_raw(busbar_store_sqlite::door) }
+}
 
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
 // the built cdylib, each through the one loader, driven by the store kind's script over
 // `conformance.json`; exact crossing counts, the two folds equal, its RED arms. Each fold opens its
 // own database file: `db_path` names `{fold}`, a namespace no other fold uses.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_sqlite::door::door,
+    loaded: loaded(),
     cdylib: "busbar_store_sqlite_plugin",
     inputs: include_str!("conformance.json"),
 }
@@ -97,8 +103,8 @@ fn load<K: busbar_plugin_loader::dispatch::Kind>(
     d: &Dispatcher,
 ) -> Result<Plugin<K>, LoadError> {
     match by {
-        Door::Linked => load_linked::<K>(&LinkedRow::of(door)?, bind(d)),
-        Door::Dropped => load_dropped::<K>(&cdylib(), &rendering_of(door)?, bind(d)),
+        Door::Linked => load_linked::<K>(&LinkedRow::of_loaded(loaded())?, bind(d)),
+        Door::Dropped => load_dropped::<K>(&cdylib(), &rendering_of_loaded(loaded())?, bind(d)),
     }
 }
 
@@ -425,7 +431,7 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     // compiled-in row states.
     assert_eq!(
         rendering_of_library(&cdylib()).expect("the cdylib loads"),
-        Some(rendering_of(door).expect("the door renders")),
+        Some(rendering_of_loaded(loaded()).expect("the door renders")),
         "the dropped-in library must state exactly the linked door's Statement"
     );
 
@@ -513,5 +519,15 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
     assert_ne!(
         red, linked,
         "a store holding a foreign row must not compare equal"
+    );
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = LinkedRow::of_loaded(loaded()).expect("the door states itself");
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../store-sqlite/declares.json")[..]),
     );
 }
