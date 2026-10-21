@@ -8,19 +8,20 @@
 //!
 //! `load_and_exercise_sqlite_plugin_via_file_drop` instead: packs the built cdylib into a real
 //! tarball (the same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real
-//! `plugins.dir`, and runs the REAL `busbar --validate` binary against a config naming
-//! `store: { module: sqlite }` — the documented file-drop install path (see
-//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` genuinely
-//! exercises the trust gate + ABI dlopen + `Store::open`/schema migration, so a successful validate
-//! is real proof the plugin loads and initializes through busbar's own boot path, not a proxy for
-//! it. Mirrors the pattern `GetBusbar/busbar-store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
+//! `plugins.dir`, and runs the REAL `busbar --validate` binary and then a REAL boot against a
+//! config naming `store: { module: sqlite }` — the documented file-drop install path (see
+//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` is
+//! manifest-only (no server, no network, no state, no dlopen, no `Store::open`, no migration): a
+//! clean validate proves the file-dropped plugin passes the trust/manifest gate. The REAL BOOT is
+//! what dlopens the plugin and runs `Store::open`/schema migration, so a successful boot is real
+//! proof the plugin loads and initializes through busbar's own boot path, not a proxy for it. Mirrors the pattern `GetBusbar/busbar-store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
 //! (see that file's module doc for the fuller rationale); SQLite needs no external service, so
 //! there is no `postgres_url()`-style skip gate here.
 //!
 //! Persistence is then proven two independent ways:
-//!   1. `--validate` itself (via the plugin's `open()`) causes a real `SqliteStore::open`, which
-//!      runs the real schema migration against a real file on disk — confirmed by checking the
-//!      configured `db_path` now exists and has the schema.
+//!   1. The real boot (not `--validate`, which never opens the store) causes a real
+//!      `SqliteStore::open`, which runs the real schema migration against a real file on disk —
+//!      confirmed by checking the configured `db_path` now exists and has the schema.
 //!   2. A raw `rusqlite` connection (bypassing the plugin, the ABI and the loader entirely) reads
 //!      the file's tables and confirms the data physically landed in it, not in an in-process
 //!      cache.

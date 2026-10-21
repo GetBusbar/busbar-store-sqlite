@@ -43,7 +43,7 @@ busbar_contract::store_door!(
 /// not silently defaulted: a template variable that resolves to a number for `db_path` must never
 /// be swallowed into quietly opening the default relative path — that reads as a healthy boot
 /// against an empty governance database (data loss), not a config error.
-fn open(cfg: &str) -> Result<SqliteStore, String> {
+pub(crate) fn open(cfg: &str) -> Result<SqliteStore, String> {
     let Settings {
         db_path,
         busy_timeout_ms,
@@ -54,7 +54,7 @@ fn open(cfg: &str) -> Result<SqliteStore, String> {
 /// The operator's settings, PARSED and nothing more: the store's `validate` slot runs this alone
 /// (`--validate` opens, connects to and migrates no store), and [`open`] opens what it read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Settings {
+pub(crate) struct Settings {
     /// The database file (or an in-memory spelling).
     pub db_path: String,
     /// SQLite's busy timeout, in ms; never negative.

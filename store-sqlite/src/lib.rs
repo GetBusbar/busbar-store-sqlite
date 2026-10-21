@@ -507,7 +507,7 @@ struct SqliteStore {
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     /// The file (or `:memory:`) this store was opened against; read by `path` (the tests').
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     path: String,
     /// The clock this store reads, in ms since the epoch: `None` (always, outside its own tests) is
     /// the wall clock; its tests hand it one they hold still and move to expire a slice
@@ -558,6 +558,7 @@ impl SqliteStore {
             writer: Mutex::new(writer_conn),
             readers,
             next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
             path: path.to_string(),
             test_clock_ms: None,
         };
@@ -575,6 +576,7 @@ impl SqliteStore {
             writer: Mutex::new(conn),
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
             path: ":memory:".to_string(),
             test_clock_ms: None,
         };
