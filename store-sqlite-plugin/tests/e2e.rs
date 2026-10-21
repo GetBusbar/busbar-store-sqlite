@@ -17,13 +17,13 @@
 //! (see that file's module doc for the fuller rationale); SQLite needs no external service, so
 //! there is no `postgres_url()`-style skip gate here.
 //!
-//! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
-//! this part was always sound, only the LOADING mechanism was wrong):
+//! Persistence is then proven two independent ways:
 //!   1. `--validate` itself (via the plugin's `open()`) causes a real `SqliteStore::open`, which
 //!      runs the real schema migration against a real file on disk — confirmed by checking the
 //!      configured `db_path` now exists and has the schema.
-//!   2. A second, independent `SqliteStore::open` (bypassing the plugin/ABI/loader entirely)
-//!      confirms the data physically landed in the file, not an in-process cache.
+//!   2. A raw `rusqlite` connection (bypassing the plugin, the ABI and the loader entirely) reads
+//!      the file's tables and confirms the data physically landed in it, not in an in-process
+//!      cache.
 //!
 //! The bad-config-path test below is DELIBERATELY left opening the dropped-in door directly — it tests
 //! the loader's own error-surface contract in isolation (a legitimate internal unit-test target:
@@ -42,7 +42,7 @@
 //! admin-API-installed tarball is the real mechanism, not an invented shortcut), mints a virtual
 //! key + an attached AWS SigV4 credential through THAT live instance's own `POST
 //! /api/v1/admin/keys`, and independently verifies both landed in the real on-disk file with a
-//! second `SqliteStore::open` that never touches the plugin/ABI/admin-API/loader.
+//! raw `rusqlite` connection that never touches the plugin/ABI/admin-API/loader.
 
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::slot as lc;
@@ -263,6 +263,17 @@ fn direct_cfg(db_path: &std::path::Path) -> String {
     serde_json::json!({ "db_path": db_path.to_str().unwrap(), "busy_timeout_ms": 5000 }).to_string()
 }
 
+/// A raw `rusqlite` connection on the store's file: no plugin, no ABI, no loader between the test
+/// and the bytes on disk. The independent witness for what the plugin under test persisted.
+fn raw_open(db_path: &std::path::Path) -> rusqlite::Connection {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .expect("open the real file raw");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("set the raw connection's busy timeout");
+    conn
+}
+
 /// `close` the instance, as the host does at shutdown: its connections to the file close with it.
 fn close(store: LoadedStore) {
     let mut f: Frame<InHead, OutHead> = Frame::new(in_head(), out_head());
@@ -365,7 +376,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 /// real `busbar --validate` against a config naming `store: { module: sqlite }`, and confirm the
 /// real on-disk sqlite file was actually initialized — via the documented file-drop mechanism,
 /// never a direct `load_store()` call. Persistence is then proven through the real file across a
-/// full close + reopen, using an independent connection that never touches the plugin/ABI/loader.
+/// full close + reopen, read back by a raw `rusqlite` connection that never touches the plugin/ABI/loader.
 #[test]
 fn load_and_exercise_sqlite_plugin_via_file_drop() {
     let so_path = plugin_path();
@@ -508,16 +519,31 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     );
 
     // PROOF the real on-disk file was actually initialized by the REAL busbar process, through the
-    // REAL file-drop path: an independent open through a fresh door (bypassing the busbar process)
-    // confirms the schema now exists -- the real boot's own plugin-open call ran the store's open,
-    // which runs migrate().
-    let direct = door_store(&plugin_path(), &direct_cfg(&db_path))
-        .expect("open the real file through a fresh door, bypassing the busbar process");
-    assert!(
-        RecordStore::list_keys(&direct).unwrap().is_empty(),
-        "a freshly migrated, never-written store must have zero keys, not error out"
-    );
-    close(direct);
+    // REAL file-drop path: a raw `rusqlite` connection (no plugin, no ABI, no loader) confirms the
+    // schema now exists -- the real boot's own plugin-open call ran the store's open, which runs
+    // migrate().
+    {
+        let raw = raw_open(&db_path);
+        let tables: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' \
+                 AND name IN ('keys','credentials','usage_windows')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read sqlite_master");
+        assert_eq!(
+            tables, 3,
+            "the real boot must have migrated the schema into the file"
+        );
+        let keys: i64 = raw
+            .query_row("SELECT count(*) FROM keys", [], |r| r.get(0))
+            .expect("count keys");
+        assert_eq!(
+            keys, 0,
+            "a freshly migrated, never-written store must have zero keys"
+        );
+    }
 
     // Now prove persistence actually round-trips through the same real file across a full
     // close + reopen — a bug shared by both `open` calls (e.g. always resolving to `:memory:`)
@@ -540,6 +566,32 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         // after this, not just an in-process cache.
         close(writer);
     }
+    // Independent of the plugin: the committed rows, read raw.
+    {
+        let raw = raw_open(&db_path);
+        let requests: i64 = raw
+            .query_row(
+                "SELECT requests FROM usage_windows \
+                 WHERE window_start=200 AND bucket_id='vk_filedrop' AND model=''",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the usage row is in the file");
+        assert_eq!(
+            requests, 5,
+            "the committed request count must be in the file itself"
+        );
+        let (input, output): (i64, i64) = raw
+            .query_row(
+                "SELECT tokens_input, tokens_output FROM usage_windows \
+                 WHERE window_start=200 AND bucket_id='vk_filedrop' AND model='gpt-5'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the per-model usage row is in the file");
+        assert_eq!((input, output), (20, 8));
+    }
+    // And through a fresh door: the plugin reads back what it wrote after a full close + reopen.
     let reopened = door_store(&plugin_path(), &direct_cfg(&db_path))
         .expect("reopen the real file after the writer closed");
     let usage = reopened.get_usage("vk_filedrop", 200).unwrap();
@@ -641,7 +693,7 @@ fn wait_for_admin_ready(
 /// listener, never file-drop, never a direct `load_store()`/loader call — then EXERCISED through
 /// that same live instance's own admin API (mint a virtual key + an attached AWS SigV4 credential
 /// via `POST /api/v1/admin/keys`), with the write independently verified by opening the real sqlite
-/// file on disk with a SECOND, completely independent connection that never touches the
+/// file on disk with a raw `rusqlite` connection that never touches the
 /// plugin/ABI/admin-API/loader at all.
 ///
 /// Two-boot shape, because `store:` is documented as restart-to-apply (busbar never hot-swaps the
@@ -869,24 +921,28 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     let _ = child2.kill();
     let _ = child2.wait();
 
-    // ── INDEPENDENT VERIFICATION: a second, brand-new `SqliteStore::open` on the real file,
-    // bypassing the plugin/ABI/admin-API/loader entirely, must see the exact key + credential the
-    // live admin API just wrote. ──
-    let direct = door_store(&plugin_path(), &direct_cfg(&db_path)).expect(
-        "open the real file through a fresh door, bypassing the plugin install and the admin API",
-    );
-    let key = RecordStore::get_key(&direct, &key_id).unwrap().expect(
-        "the virtual key minted over the admin API must be readable directly from the file",
-    );
-    assert_eq!(key.name, "e2e-admin-api-key");
+    // ── INDEPENDENT VERIFICATION: a raw `rusqlite` connection on the real file, bypassing the
+    // plugin/ABI/admin-API/loader entirely, must see the exact key + credential the live admin API
+    // just wrote. ──
+    let raw = raw_open(&db_path);
+    let name: String = raw
+        .query_row("SELECT name FROM keys WHERE id=?1", [&key_id], |r| r.get(0))
+        .expect(
+            "the virtual key minted over the admin API must be readable directly from the file",
+        );
+    assert_eq!(name, "e2e-admin-api-key");
 
-    let creds = RecordStore::list_credentials(&direct, &key_id).unwrap();
-    let cred = creds.iter().find(|c| c.public_id == access_key_id).expect(
-        "the AWS SigV4 credential minted over the admin API must be readable directly \
+    let kind: String = raw
+        .query_row(
+            "SELECT kind FROM credentials WHERE key_id=?1 AND public_id=?2",
+            [&key_id, &access_key_id],
+            |r| r.get(0),
+        )
+        .expect(
+            "the AWS SigV4 credential minted over the admin API must be readable directly \
              from the file, keyed by the same access-key-id the admin API returned",
-    );
-    assert_eq!(cred.kind, "sigv4");
-    close(direct);
+        );
+    assert_eq!(kind, "sigv4");
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct door
