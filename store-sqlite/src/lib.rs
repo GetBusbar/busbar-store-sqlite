@@ -850,7 +850,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 /// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
 /// attribution fields, which is what the contract says a key minted before them carries.
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
-    const COLUMNS: [(&str, &str); 4] = [
+    const COLUMNS: [(&str, &str); 5] = [
         // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
         // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
         // grant. See `scopes_to_storage` for why pools keep their own column.
