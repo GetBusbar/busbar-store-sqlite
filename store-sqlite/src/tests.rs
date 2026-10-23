@@ -23,6 +23,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         idp_subject: None,
         binding_mode: None,
         minted_by: None,
+        idp_provider: None,
     }
 }
 
@@ -2727,6 +2728,17 @@ fn non_pool_scope_grants_round_trip_with_their_kind() {
     // non-pool kind on the wire; a kind read from this store is registered on the way out).
     serde_json::to_string(&got).expect("a stored non-pool grant must re-serialize");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `idp_provider` is persisted with the row and read back.
+#[test]
+fn idp_provider_round_trips() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_idp", "g");
+    k.idp_provider = Some("github".into());
+    s.put_key(&k).unwrap();
+    let got = s.get_key("vk_idp").unwrap().unwrap();
+    assert_eq!(got.idp_provider.as_deref(), Some("github"));
 }
 
 /// The three 1.6.0 attribution fields round-trip, and a key written without them reads `None`.
