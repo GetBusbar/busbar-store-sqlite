@@ -850,7 +850,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 /// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
 /// attribution fields, which is what the contract says a key minted before them carries.
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
-    const COLUMNS: [(&str, &str); 4] = [
+    const COLUMNS: [(&str, &str); 5] = [
         // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
         // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
         // grant. See `scopes_to_storage` for why pools keep their own column.
@@ -862,6 +862,7 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
         ("idp_subject", "TEXT"),
         ("binding_mode", "TEXT"),
         ("minted_by", "TEXT"),
+        ("idp_provider", "TEXT"),
     ];
     for (name, decl) in COLUMNS {
         if !column_exists(tx, "keys", name)? {
@@ -1178,11 +1179,12 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         idp_subject: r.get(12)?,
         binding_mode: r.get(13)?,
         minted_by: r.get(14)?,
+        idp_provider: r.get(15)?,
     })
 }
 
 const KEY_COLS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
-     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by";
+     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by,idp_provider";
 
 fn secret_form_to_str(f: SecretForm) -> &'static str {
     match f {
@@ -1266,14 +1268,14 @@ fn put_key_inner(
     let (allowed_pools, scope_grants) = scopes_to_storage(&key.allowed_scopes);
     let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
-                           scope_grants,idp_subject,binding_mode,minted_by)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16)
+                           scope_grants,idp_subject,binding_mode,minted_by,idp_provider)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
             expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11,
             scope_grants=excluded.scope_grants, idp_subject=excluded.idp_subject,
-            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by
+            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by, idp_provider=excluded.idp_provider
          WHERE excluded.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
         params![
             key.id,
@@ -1292,6 +1294,7 @@ fn put_key_inner(
             key.idp_subject,
             key.binding_mode,
             key.minted_by,
+            key.idp_provider,
         ],
     )
     .store()?;
@@ -2260,6 +2263,20 @@ impl RecordStore for SqliteStore {
             .store()?;
         let rows = stmt.query_map([kind], |r| r.get::<_, String>(0)).store()?;
         rows.collect::<Result<Vec<_>, _>>().store()
+    }
+
+    fn purge_plane_records(
+        &self,
+        kind: &str,
+        before: u64,
+        retention: busbar_contract::records::Retention,
+    ) -> RecordStoreResult<u64> {
+        match retention {
+            busbar_contract::records::Retention::Age => {
+                RecordStore::purge_plane_records_before(self, kind, before)
+            }
+            busbar_contract::records::Retention::TerminalOnly => Ok(0),
+        }
     }
 
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
