@@ -75,6 +75,15 @@ fn slot_of(k: &CellKey<'_>) -> (String, u32) {
     (key.to_string(), dimension)
 }
 
+/// The `window_start` a stored slot key names (its last element), if the key parses.
+fn slot_window_start(slot: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(slot)
+        .ok()?
+        .as_array()?
+        .last()?
+        .as_u64()
+}
+
 /// The 1.5.5 admission test for one cell (`abi::store::ReserveIn`, GRANT SIZE): whether drawing
 /// `amount` onto `used` under `cap` is refused. `used + amount` is checked: an overflow refuses.
 fn exhausted(dimension: u32, used: u64, amount: u64, cap: u64) -> bool {
@@ -627,9 +636,17 @@ impl SqliteStore {
                 expire(tx, &slot, now).map_err(failed)?;
                 let (_, left) = held(id)?.ok_or_else(gone)?;
                 let back = unspent.min(left);
+                // A release on window 0 is final (`abi::store` slice life (e)): window 0 never
+                // rolls, so the slice closes now (remaining 0, a later release returns 0) and its
+                // spent rest stays counted against the cap.
+                let kept = if slot_window_start(&slot) == Some(0) {
+                    0
+                } else {
+                    left - back
+                };
                 tx.execute(
                     "UPDATE money_slices SET remaining=?2 WHERE slice_id=?1",
-                    params![to_db(id), to_db(left - back)],
+                    params![to_db(id), to_db(kept)],
                 )
                 .store()
                 .map_err(failed)?;
