@@ -11,8 +11,8 @@
 //! states, which is what `busbar-plugin-pack` signs into the manifest). Each is bound to a real
 //! dispatcher and opened as the host opens a store (`LoadedStore`), and driven through ONE scenario
 //! against its own real database file: the config refusals, a key, a usage window, plane records of
-//! an upsert and an append-only kind, the v3 slots (caps, a reserve and its replay and conflict,
-//! schema records, a ledger stream, a session), a SECOND live handle on the same file (the
+//! an upsert and an append-only kind, the v3 slots (a count batch and its replay and conflict, and
+//! schema records), a SECOND live handle on the same file (the
 //! cross-handle view), and a RESTART — every handle closed, the file reopened, everything read back
 //! and every `op_id` replayed. The two arms must agree on the whole transcript.
 //!
@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::slot as lc;
-use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
@@ -159,39 +158,6 @@ fn record(kind: &str, id: &str, parent: Option<&str>, seq: u64, body: &str) -> P
     }
 }
 
-/// A reserve's answer as the transcript compares it: each grant's slice and amount. Its
-/// `valid_until_ms` is the store's clock plus `SLICE_TTL_MS` (`abi::store::SLICE_TTL_MS` (c)), so it
-/// differs from one run to the next; it is checked bounded here instead, never `u64::MAX`.
-fn granted(
-    answer: Result<Vec<busbar_contract::abi::sdk::store::Grant>, sc::StoreFailure>,
-) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_millis() as u64;
-    match answer {
-        Ok(grants) => {
-            for g in &grants {
-                assert!(
-                    g.valid_until_ms <= now + busbar_contract::abi::store::SLICE_TTL_MS,
-                    "a durable store bounds a slice's validity: {g:?}"
-                );
-            }
-            let cells: Vec<(u64, u64)> = grants.iter().map(|g| (g.slice_id, g.granted)).collect();
-            format!("Ok({cells:?})")
-        }
-        Err(e) => format!("Err({e:?})"),
-    }
-}
-
-/// The slot the scenario draws from and caps.
-const SLOT: CellKey<'static> = CellKey {
-    bucket: "vk_conf",
-    pool: None,
-    dimension: Dimension::Requests,
-    window_start: 60_000,
-};
-
 fn op(n: u64) -> OpId {
     OpId::from_parts(42, n)
 }
@@ -212,12 +178,10 @@ fn contents(s: &LoadedStore) -> serde_json::Value {
     };
     let bytes =
         |r: Option<RecordBytes>| r.map(|r| String::from_utf8_lossy(r.as_slice()).into_owned());
-    let (record, scan, heads, sessions) = block(async {
+    let (record, scan) = block(async {
         (
             sc::StoreCalls::record_get(s, "conf", b"k1").await,
             sc::StoreCalls::record_scan(s, "conf", b"k", 10).await,
-            sc::StoreCalls::heads(s).await,
-            sc::StoreCalls::sessions_for(s, "alice").await,
         )
     });
     serde_json::json!({
@@ -232,51 +196,39 @@ fn contents(s: &LoadedStore) -> serde_json::Value {
         "scan": format!("{:?}", scan.map(|rows| rows.into_iter()
             .map(|(k, v)| (String::from_utf8_lossy(&k).into_owned(), bytes(Some(v))))
             .collect::<Vec<_>>())),
-        "heads": format!("{heads:?}"),
-        "sessions": format!("{sessions:?}"),
+        "batched": s.get_usage("vk_batch", 60).expect("get_usage"),
     })
+}
+
+/// The usage batch the scenario writes, and replays after the restart.
+fn batch() -> [(&'static str, u64, UsageDelta); 1] {
+    [(
+        "vk_batch",
+        60,
+        UsageDelta {
+            requests: 2,
+            billable_requests: 2,
+            models: vec![],
+        },
+    )]
 }
 
 /// The v3 writes, through the door's table: one line per answer.
 fn v3_writes(s: &LoadedStore) -> Vec<String> {
     let r = |v: &[u8]| RecordBytes::new(v.to_vec()).expect("a record");
-    let caps = [Cap {
-        key: SLOT,
-        cap: 10,
-        config_gen: 1,
-    }];
-    let draw = |amount| [Cell { key: SLOT, amount }];
     block(async {
         vec![
             format!(
-                "caps = {:?}",
-                sc::StoreCalls::window_caps(s, op(1), &caps).await
-            ),
-            format!("no cap = {}", {
-                let other = [Cell {
-                    key: CellKey {
-                        bucket: "vk_other",
-                        ..SLOT
-                    },
-                    amount: 1,
-                }];
-                granted(sc::StoreCalls::reserve(s, op(2), 0, &other).await)
-            }),
-            format!(
-                "reserve 6 = {}",
-                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
+                "usage batch = {:?}",
+                sc::StoreCalls::add_usage_batch(s, op(1), &batch()).await
             ),
             format!(
-                "replay = {}",
-                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
+                "replay = {:?}",
+                sc::StoreCalls::add_usage_batch(s, op(1), &batch()).await
             ),
             format!(
-                "conflict = {}",
-                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await)
-            ),
-            format!(
-                "reserve 5 = {}",
-                granted(sc::StoreCalls::reserve(s, op(4), 0, &draw(5)).await)
+                "conflict = {:?}",
+                sc::StoreCalls::add_usage_batch(s, op(1), &[]).await
             ),
             format!(
                 "record_put = {:?}",
@@ -286,43 +238,21 @@ fn v3_writes(s: &LoadedStore) -> Vec<String> {
                 "record_put k2 = {:?}",
                 sc::StoreCalls::record_put(s, "conf", b"k2", &r(b"two")).await
             ),
-            format!(
-                "append_batch = {:?}",
-                sc::StoreCalls::append_batch(s, op(5), "journal", &[r(b"a"), r(b"b")]).await
-            ),
-            format!(
-                "session_put = {:?}",
-                sc::StoreCalls::session_put(s, 7, "node-1", "alice").await
-            ),
         ]
     })
 }
 
 /// The `op_id`s replayed after the restart: each answers its original, applying nothing.
 fn v3_replays(s: &LoadedStore) -> Vec<String> {
-    let r = |v: &[u8]| RecordBytes::new(v.to_vec()).expect("a record");
-    let draw = |amount| [Cell { key: SLOT, amount }];
     block(async {
         vec![
             format!(
-                "replay = {}",
-                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(6)).await)
+                "replay = {:?}",
+                sc::StoreCalls::add_usage_batch(s, op(1), &batch()).await
             ),
             format!(
-                "conflict = {}",
-                granted(sc::StoreCalls::reserve(s, op(3), 0, &draw(1)).await)
-            ),
-            format!(
-                "append_batch replay = {:?}",
-                sc::StoreCalls::append_batch(s, op(5), "journal", &[r(b"a"), r(b"b")]).await
-            ),
-            format!(
-                "reserve 4 = {}",
-                granted(sc::StoreCalls::reserve(s, op(6), 0, &draw(4)).await)
-            ),
-            format!(
-                "reserve 1 = {}",
-                granted(sc::StoreCalls::reserve(s, op(7), 0, &draw(1)).await)
+                "conflict = {:?}",
+                sc::StoreCalls::add_usage_batch(s, op(1), &[]).await
             ),
         ]
     })
@@ -449,11 +379,7 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     );
     assert_eq!(restarted["parents"], serde_json::json!(["t1"]));
     assert_eq!(restarted["record"], "Ok(Some(\"one\"))");
-    assert_eq!(
-        restarted["heads"],
-        "Ok([(\"journal\", Head { seq: 2, epoch: 0 })])"
-    );
-    assert_eq!(restarted["sessions"], "Ok([(7, \"node-1\")])");
+    assert_eq!(restarted["batched"]["requests"], 2);
     assert_eq!(linked["cross"]["b_sees"]["task"], restarted["task"]);
     assert!(
         linked["cross"]["dup"].as_str().unwrap().starts_with("Err("),
@@ -467,23 +393,18 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
             .all(|r| r.as_str().unwrap().contains("invalid sqlite plugin config")),
         "every bad config is refused in the store's own words: {refusals:?}"
     );
-    // The money slots: the reserve drew 6 of 10, its replay answered the same grant, a reused id
-    // with another body was a conflict, and 5 more did not fit. After the restart the replay still
-    // answers the original (dedupe is durable) and exactly 4 more fit.
+    // The count batch applied once, its replay answered the original, a reused id with another
+    // body was a conflict; after the restart the replay still answers the original (dedupe is
+    // durable) and the count is unchanged.
     let writes = linked["writes"].as_array().unwrap();
     let w = |i: usize| writes[i].as_str().unwrap().to_string();
-    assert!(w(1).contains("NoCap"), "{writes:?}");
-    assert!(w(2).starts_with("reserve 6 = Ok(["), "{writes:?}");
-    assert_eq!(w(3)["replay = ".len()..], w(2)["reserve 6 = ".len()..]);
-    assert!(w(4).contains("Conflict"), "{writes:?}");
-    assert!(w(5).contains("Exhausted"), "{writes:?}");
+    assert_eq!(w(0), "usage batch = Ok(())", "{writes:?}");
+    assert_eq!(w(1), "replay = Ok(())", "{writes:?}");
+    assert!(w(2).contains("Conflict"), "{writes:?}");
     let replays = linked["replays"].as_array().unwrap();
     let r = |i: usize| replays[i].as_str().unwrap().to_string();
-    assert_eq!(r(0)["replay = ".len()..], w(2)["reserve 6 = ".len()..]);
+    assert_eq!(r(0), "replay = Ok(())", "{replays:?}");
     assert!(r(1).contains("Conflict"), "{replays:?}");
-    assert_eq!(r(2), "append_batch replay = Ok(Head { seq: 2, epoch: 0 })");
-    assert!(r(3).starts_with("reserve 4 = Ok(["), "{replays:?}");
-    assert!(r(4).contains("Exhausted"), "{replays:?}");
 }
 
 /// RED (a): the store's door asked for as a secret is refused, through both doors.
