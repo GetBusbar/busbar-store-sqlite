@@ -22,8 +22,8 @@ use busbar_contract::records::{
     UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 // rusqlite error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays storage-free,
 // so the `From` impl that powers `?` cannot live there). Replace `<rusqlite call>?` with `<call>.store()?`.
@@ -111,7 +111,13 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// the upgrade instant. Only rows the `ADD COLUMN` just defaulted are stamped, so a re-open is a
 /// no-op and a fresh v12 database never holds a `-1`. The two `money_slices` indexes (`slot`,
 /// `valid_until_ms`) are created by `SCHEMA` on every open.
-const SCHEMA_VERSION: i64 = 12;
+///
+/// v13 (busbar 1.6.0, money is counts x the rate card, derived in core): the store keeps no money
+/// state and the store table has no slot for the ledger streams or the session directory, so
+/// `money_caps`, `money_used`, `money_slices`, `money_epoch`, `journal` and `sessions` are DROPPED,
+/// and every `store_ops` record whose answer is not `"Done"` (only the deleted slots answered
+/// anything else) is deleted with them. Destructive by intent: nothing reads those rows.
+const SCHEMA_VERSION: i64 = 13;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
 /// sidecar on a task row copied out of the legacy typed `tasks` table (a live 1.6.0 engine sets it
@@ -332,55 +338,6 @@ CREATE TABLE IF NOT EXISTS store_ops (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS store_ops_recorded_idx ON store_ops (recorded_at);
 
--- The money slots. A `slot` is `(bucket, pool, dimension, class_key, window_start)`, kept as its
--- JSON array so `pool`'s None and Some('') stay apart. Amounts are u64 stored bit-for-bit in the
--- signed column and compared in Rust, never in SQL.
-CREATE TABLE IF NOT EXISTS money_caps (
-    slot       TEXT NOT NULL PRIMARY KEY,
-    cap        INTEGER NOT NULL,
-    config_gen INTEGER NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS money_used (
-    slot TEXT NOT NULL PRIMARY KEY,
-    used INTEGER NOT NULL
-) STRICT, WITHOUT ROWID;
--- AUTOINCREMENT: a slice id is never reused, so a late release of a closed slice can never land on
--- a newer one.
--- A slice stays a row once it is closed (`remaining` 0): any further release of it answers 0 and is
--- not refused as never granted -- and `sqlite_sequence` (AUTOINCREMENT's high-water) outlives the
--- sweep that deletes the row, so an id at or below the highest ever granted still answers 0.
--- `valid_until_ms` is a u64 kept bit-for-bit; the migrate stamps a v11 slice (`-1`) with a real expiry.
-CREATE TABLE IF NOT EXISTS money_slices (
-    slice_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    slot           TEXT NOT NULL,
-    remaining      INTEGER NOT NULL,
-    valid_until_ms INTEGER NOT NULL DEFAULT -1
-) STRICT;
--- `slot` serves `expire` (per-cell select/update); `valid_until_ms` serves `sweep_closed`'s delete.
-CREATE INDEX IF NOT EXISTS money_slices_slot_idx ON money_slices (slot);
-CREATE INDEX IF NOT EXISTS money_slices_valid_idx ON money_slices (valid_until_ms);
--- The ONE fleet epoch (v12, `abi::store::SLICE_TTL_MS` (a)): 0 before any reserve; only a reserve
--- raises it, nothing lowers it.
-CREATE TABLE IF NOT EXISTS money_epoch (
-    id    INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    epoch INTEGER NOT NULL
-) STRICT;
-
--- The ledger streams: `seq` counts from 1 per stream, so a stream's head is its MAX(seq).
-CREATE TABLE IF NOT EXISTS journal (
-    stream TEXT NOT NULL,
-    seq    INTEGER NOT NULL,
-    record BLOB NOT NULL,
-    PRIMARY KEY (stream, seq)
-) STRICT, WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS sessions (
-    session   INTEGER NOT NULL PRIMARY KEY,
-    node      TEXT NOT NULL,
-    principal TEXT NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS sessions_principal_idx ON sessions (principal);
-
 -- A plane's kernel-held durable records, by `(schema, key)`; a scan reads a key prefix in byte order.
 CREATE TABLE IF NOT EXISTS schema_records (
     schema     TEXT NOT NULL,
@@ -525,10 +482,6 @@ pub struct SqliteStore {
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     path: String,
-    /// The clock this store reads, in ms since the epoch: `None` (always, outside its own tests) is
-    /// the wall clock; its tests hand it one they hold still and move to expire a slice
-    /// (`busbar_contract::testkit::store_v3::Harness`).
-    test_clock_ms: Option<Arc<AtomicU64>>,
 }
 
 impl SqliteStore {
@@ -575,7 +528,6 @@ impl SqliteStore {
             readers,
             next_reader: AtomicUsize::new(0),
             path: path.to_string(),
-            test_clock_ms: None,
         };
         store.migrate()?;
         Ok(store)
@@ -592,28 +544,9 @@ impl SqliteStore {
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
             path: ":memory:".to_string(),
-            test_clock_ms: None,
         };
         store.migrate()?;
         Ok(store)
-    }
-
-    /// This store's clock, in ms since the epoch.
-    fn now_ms(&self) -> u64 {
-        if let Some(clock) = &self.test_clock_ms {
-            return clock.load(Ordering::Relaxed);
-        }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0)
-    }
-
-    /// Run this store on `clock` (its tests' clock, in ms).
-    #[cfg(test)]
-    fn on_clock(mut self, clock: Arc<AtomicU64>) -> Self {
-        self.test_clock_ms = Some(clock);
-        self
     }
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -717,34 +650,20 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
-        // v12: a v11 `money_slices` gains `valid_until_ms` (its default is the never-expiring
-        // validity v11 granted). Keyed on the column's absence, so a re-run is a no-op, and run
-        // BEFORE `SCHEMA` for the same reason as the v10 rebuild above.
-        if table_exists(&tx, "money_slices")?
-            && !column_exists(&tx, "money_slices", "valid_until_ms")?
-        {
-            tx.execute(
-                "ALTER TABLE money_slices ADD COLUMN valid_until_ms INTEGER NOT NULL DEFAULT -1",
-                [],
-            )
-            .store()?;
-            // Every row the column was just added to still reads the `-1` default (the only rows
-            // this runs on, so it cannot restamp a later grant). A slice still open was granted by
-            // a build that never expired one: it expires one `SLICE_TTL_MS` after this upgrade on
-            // the store's clock, so money a crashed node stranded is returned, not held forever
-            // (the postgres store's rule). A closed one is stamped at the upgrade instant so the
-            // sweep can forget it; nothing is left at `-1`.
-            let now = self.now_ms();
-            let ttl = busbar_contract::abi::store::SLICE_TTL_MS;
-            tx.execute(
-                "UPDATE money_slices SET valid_until_ms = CASE WHEN remaining <> 0 THEN ?1 ELSE ?2 END \
-                 WHERE valid_until_ms = -1",
-                params![
-                    i64::try_from(now.saturating_add(ttl)).unwrap_or(i64::MAX),
-                    i64::try_from(now).unwrap_or(i64::MAX)
-                ],
-            )
-            .store()?;
+        // v13: the money state and the dead slots' tables go (`SCHEMA_VERSION`'s doc). Idempotent
+        // (`IF EXISTS`), so a re-run and a fresh database pass straight through.
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS money_caps;
+             DROP TABLE IF EXISTS money_used;
+             DROP TABLE IF EXISTS money_slices;
+             DROP TABLE IF EXISTS money_epoch;
+             DROP TABLE IF EXISTS journal;
+             DROP TABLE IF EXISTS sessions;",
+        )
+        .store()?;
+        if table_exists(&tx, "store_ops")? {
+            tx.execute("DELETE FROM store_ops WHERE answer <> '\"Done\"'", [])
+                .store()?;
         }
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
@@ -1655,35 +1574,6 @@ impl RecordStore for SqliteStore {
         })
     }
 
-    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
-        let mut conn = self.lock_writer();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .store()?;
-        let deleted_at: Option<i64> = tx
-            .query_row(
-                "SELECT deleted_at FROM keys WHERE id=?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()
-            .store()?
-            .flatten();
-        if deleted_at.is_none() {
-            return Err(RecordStoreError(format!(
-                "scrub_key: key {id} is unknown or not yet tombstoned — delete_key it first"
-            )));
-        }
-        let rev = Self::bump_revision(&tx)?;
-        tx.execute(
-            "UPDATE keys SET name='', labels='{}', updated_at=?2, revision=?3 WHERE id=?1",
-            params![id, now_secs(), rev],
-        )
-        .store()?;
-        tx.commit().store()?;
-        Ok(())
-    }
-
     fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
         with_full_sync(&mut conn, |conn| {
@@ -1723,21 +1613,6 @@ impl RecordStore for SqliteStore {
             .store()?;
         let rows = stmt.query_map(params![key_id], row_to_cred_meta).store()?;
         rows.collect::<Result<Vec<_>, _>>().store()
-    }
-
-    fn lookup_credential_secret(
-        &self,
-        kind: &str,
-        public_id: &str,
-    ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let conn = self.lock_reader();
-        conn.query_row(
-            &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE kind=?1 AND public_id=?2"),
-            params![kind, public_id],
-            row_to_cred_secret,
-        )
-        .optional()
-        .store()
     }
 
     fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
@@ -1948,111 +1823,6 @@ impl RecordStore for SqliteStore {
         add_usage_in(&tx, bucket_id, window_start, delta)?;
         tx.commit().store()?;
         Ok(())
-    }
-
-    fn purge_windows_before(&self, before: u64) -> RecordStoreResult<u64> {
-        // Chunked: a single unchunked DELETE on the highest-churn table would transiently balloon
-        // the WAL and monopolize the write lock. LIMIT on DELETE needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT
-        // (not in the default rusqlite bundled build) — use the subquery form instead.
-        let mut total = 0u64;
-        loop {
-            let mut conn = self.lock_writer();
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .store()?;
-            // Count the WINDOWS this batch removes, not the rows. A window is stored as one
-            // reserved `model = ''` sentinel row plus one row per model, so a row count is the
-            // window count multiplied by that window's model cardinality. The contract is "returns
-            // the number of windows purged", and a figure that moves with model cardinality cannot
-            // be reconciled against the retention the caller asked for. A window is counted by its
-            // SENTINEL row, which every window has exactly one of (`put_usage`/`add_usage` always
-            // write it): a window whose rows straddle two batches is then counted once, in the
-            // batch that deletes its sentinel, never once per batch. Read off the rows the DELETE
-            // itself reports, so it matches exactly what this batch removes.
-            let (changed, windows_in_batch) = {
-                let mut stmt = tx
-                    .prepare(
-                        "DELETE FROM usage_windows WHERE (window_start, bucket_id, model) IN (
-                            SELECT window_start, bucket_id, model FROM usage_windows
-                            WHERE window_start < ?1 LIMIT 5000)
-                         RETURNING model = ''",
-                    )
-                    .store()?;
-                let sentinels = stmt
-                    .query_map(params![before as i64], |r| r.get::<_, bool>(0))
-                    .store()?
-                    .collect::<Result<Vec<bool>, _>>()
-                    .store()?;
-                let windows = sentinels.iter().filter(|s| **s).count() as u64;
-                (sentinels.len(), windows)
-            };
-            tx.commit().store()?;
-            total += windows_in_batch;
-            if changed < 5000 {
-                break;
-            }
-        }
-        // The same windows' open-unit rows, chunked the same way. Not counted: a window is counted
-        // once, off its `usage_windows` rows above, however many units it carried.
-        loop {
-            let changed = self
-                .lock_writer()
-                .execute(
-                    "DELETE FROM usage_window_units WHERE (window_start, bucket_id, model, unit) IN (
-                        SELECT window_start, bucket_id, model, unit FROM usage_window_units
-                        WHERE window_start < ?1 LIMIT 5000)",
-                    params![before as i64],
-                )
-                .store()?;
-            if changed < 5000 {
-                break;
-            }
-        }
-        Ok(total)
-    }
-
-    fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
-        // The column is an integer; a bucket that is not one names no row and is refused (as the
-        // postgres store does) rather than silently purging nothing.
-        if bucket.parse::<i64>().is_err() {
-            return Err(RecordStoreError(format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            )));
-        }
-        let mut total = 0u64;
-        loop {
-            let mut conn = self.lock_writer();
-            let changed = with_full_sync(&mut conn, |conn| {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .store()?;
-                let changed = tx
-                    .execute(
-                        "DELETE FROM usage_metering WHERE (bucket, key_id, provider, model, priced_from_ms) IN (
-                            SELECT bucket, key_id, provider, model, priced_from_ms FROM usage_metering
-                            WHERE bucket = ?1 LIMIT 5000)",
-                        params![bucket],
-                    )
-                    .store()?;
-                tx.commit().store()?;
-                Ok(changed)
-            })?;
-            total += changed as u64;
-            if changed < 5000 {
-                break;
-            }
-        }
-        // The purged cells' open-unit rows go too; the count is the metering rows', as before.
-        let mut conn = self.lock_writer();
-        with_full_sync(&mut conn, |conn| {
-            conn.execute(
-                "DELETE FROM usage_metering_units WHERE bucket = ?1",
-                params![bucket],
-            )
-            .store()?;
-            Ok(())
-        })?;
-        Ok(total)
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {

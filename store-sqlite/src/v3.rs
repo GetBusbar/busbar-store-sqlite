@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
-//! `op_id`-carrying writes, the ledger streams, the session directory, a plane's kernel-held
-//! records, the money slots and `window_caps`. Every one is DURABLE: its state lives in the v11
-//! tables (`SCHEMA`), on the writer connection.
+//! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. Every
+//! one is DURABLE: its state lives in the tables `SCHEMA` creates, on the writer connection. It
+//! holds no money: money is counts x the rate card, derived in busbar's core.
 //!
 //! DEDUPE (`abi::store` S1-S4): an `op_id` that APPLIED is recorded in `store_ops` with the op's
 //! value fields and its answer, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect, so
@@ -13,29 +13,11 @@
 //! restart answers the original. A replay with the same value fields applies nothing; different
 //! value fields are a conflict; a refusal or a failure rolls back and records nothing. Records
 //! older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
-//!
-//! EPOCH AND SLICE LIFE (`abi::store::SLICE_TTL_MS` (a)-(c)): this store is durable (no
-//! `MARK_EPHEMERAL`) and every node that shares the file draws against the same rows, so it is a
-//! store a FLEET shares. It persists ONE epoch (`money_epoch`), raised only by a reserve presenting
-//! a higher one, atomically with its draw; a reserve below it is `StaleEpoch` and applies nothing.
-//! Every slice is valid until `now + SLICE_TTL_MS` on this store's clock; past that it is EXPIRED
-//! and its unreturned remainder goes back to its window's headroom (applied lazily, inside the next
-//! reserve or release that touches it, under the write lock). `slice_release` always applies,
-//! whatever the epoch, capped at what the slice has left; a closed slice stays a row, so any
-//! further release of it answers 0.
-//!
-//! GRANT SIZE: a cell grants its whole `amount` or the reserve fails; the per-dimension test is
-//! 1.5.5's, cited on `abi::store::ReserveIn`.
-
-use std::collections::HashMap;
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
-};
-use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS, SLICE_TTL_MS};
-use busbar_contract::kinds::{Head, RecordBytes};
+use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
+use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
+use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
     PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger,
@@ -45,171 +27,18 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    add_metering_in, add_usage_in, append_audit_in, append_plane_record_in, now_secs,
-    with_full_sync, IntoStoreResult, SqliteStore,
+    add_metering_in, add_usage_in, append_plane_record_in, now_secs, with_full_sync,
+    IntoStoreResult, SqliteStore,
 };
 
 /// What an applied op answered, stored with it and replayed verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Answer {
     Done,
-    Head {
-        seq: u64,
-        epoch: u64,
-    },
-    /// `(slice_id, granted, valid_until_ms)` per cell, in order.
-    Grants(Vec<(u64, u64, u64)>),
-    Released(Vec<u64>),
-}
-
-/// The slot a cell draws from and a cap bounds, as its stored key: the JSON array
-/// `[bucket, pool, dimension, class_key, window_start]` (`pool` stays `null` apart from `""`).
-fn slot_of(k: &CellKey<'_>) -> (String, u32) {
-    let (dimension, class_key) = match k.dimension {
-        Dimension::NanoUnits => (0, ""),
-        Dimension::Requests => (1, ""),
-        Dimension::Concurrency => (2, ""),
-        Dimension::Class(c) => (3, c),
-    };
-    let key = serde_json::json!([k.bucket, k.pool, dimension, class_key, k.window_start]);
-    (key.to_string(), dimension)
-}
-
-/// The `window_start` a stored slot key names (its last element), if the key parses.
-fn slot_window_start(slot: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(slot)
-        .ok()?
-        .as_array()?
-        .last()?
-        .as_u64()
-}
-
-/// The 1.5.5 admission test for one cell (`abi::store::ReserveIn`, GRANT SIZE): whether drawing
-/// `amount` onto `used` under `cap` is refused. `used + amount` is checked: an overflow refuses.
-fn exhausted(dimension: u32, used: u64, amount: u64, cap: u64) -> bool {
-    let Some(after) = used.checked_add(amount) else {
-        return true;
-    };
-    match dimension {
-        // DIM_CLASS: `tokens >= cap` — the draw that crosses the cap is granted whole.
-        3 => used >= cap,
-        // DIM_NANO_UNITS: `derived >= cap || derived + fee > cap`.
-        0 => used >= cap || after > cap,
-        // DIM_REQUESTS / DIM_CONCURRENCY: `used + amount > cap`.
-        _ => after > cap,
-    }
-}
-
-/// A `u64` amount or id kept bit-for-bit in SQLite's signed column (and back).
-fn to_db(v: u64) -> i64 {
-    v as i64
-}
-fn from_db(v: i64) -> u64 {
-    v as u64
 }
 
 fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
-}
-
-/// `(cap, config_gen)` stored for `slot`.
-fn stored_cap(tx: &Transaction<'_>, slot: &str) -> Result<Option<(u64, u64)>, RecordStoreError> {
-    tx.query_row(
-        "SELECT cap, config_gen FROM money_caps WHERE slot=?1",
-        [slot],
-        |r| Ok((from_db(r.get(0)?), from_db(r.get(1)?))),
-    )
-    .optional()
-    .store()
-}
-
-/// What is drawn and not released on `slot`.
-fn stored_used(tx: &Transaction<'_>, slot: &str) -> Result<u64, RecordStoreError> {
-    tx.query_row("SELECT used FROM money_used WHERE slot=?1", [slot], |r| {
-        r.get::<_, i64>(0)
-    })
-    .optional()
-    .store()
-    .map(|u| u.map_or(0, from_db))
-}
-
-/// Return every EXPIRED slice's unreturned remainder on `slot` to its headroom (`SLICE_TTL_MS` (c)):
-/// each such slice closes (`remaining` 0) and `used` drops by what it still held. A slice granted
-/// `u64::MAX` (stored `-1`) never expires; the v12 migrate leaves none, the guard only keeps the
-/// statement safe against a hand-written row.
-fn expire(tx: &Transaction<'_>, slot: &str, now_ms: u64) -> Result<(), RecordStoreError> {
-    let back: i64 = tx
-        .query_row(
-            "SELECT COALESCE(SUM(remaining), 0) FROM money_slices WHERE slot=?1 AND remaining > 0 \
-             AND valid_until_ms >= 0 AND valid_until_ms < ?2",
-            params![slot, to_db(now_ms)],
-            |r| r.get(0),
-        )
-        .store()?;
-    if back == 0 {
-        return Ok(());
-    }
-    tx.execute(
-        "UPDATE money_slices SET remaining=0 WHERE slot=?1 AND remaining > 0 \
-         AND valid_until_ms >= 0 AND valid_until_ms < ?2",
-        params![slot, to_db(now_ms)],
-    )
-    .store()?;
-    let used = stored_used(tx, slot)?;
-    set_used(tx, slot, used.saturating_sub(from_db(back)))
-}
-
-/// Forget closed slices whose validity ended more than `OP_ID_RETENTION_SECS` ago: past that a
-/// release of one is a replay the dedupe log has forgotten too.
-fn sweep_closed(tx: &Transaction<'_>, now_ms: u64) -> Result<(), RecordStoreError> {
-    let horizon = now_ms.saturating_sub(OP_ID_RETENTION_SECS.saturating_mul(1000));
-    tx.execute(
-        "DELETE FROM money_slices WHERE remaining = 0 AND valid_until_ms >= 0 \
-         AND valid_until_ms < ?1",
-        params![to_db(horizon)],
-    )
-    .store()
-    .map(drop)
-}
-
-/// The highest slice id ever granted (0 if none): AUTOINCREMENT's `sqlite_sequence` row, which a
-/// delete (the sweep) does not lower and a reopen keeps.
-fn highest_granted(tx: &Transaction<'_>) -> Result<u64, RecordStoreError> {
-    tx.query_row(
-        "SELECT seq FROM sqlite_sequence WHERE name = 'money_slices'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .store()
-    .map(|s| s.map_or(0, from_db))
-}
-
-/// `ReserveRefused::Unavailable` carries no payload, so the underlying reason is logged here before
-/// it is dropped. SQLite error text names no secret (no credential reaches this module's SQL).
-fn unavailable(e: RecordStoreError) -> ReserveRefused {
-    tracing::warn!(target: "busbar_store_sqlite", error = %e.0, "reserve answered Unavailable");
-    ReserveRefused::Unavailable
-}
-
-/// The persisted fleet epoch (`SLICE_TTL_MS` (a)): 0 before any reserve.
-fn stored_epoch(tx: &Transaction<'_>) -> Result<u64, RecordStoreError> {
-    tx.query_row("SELECT epoch FROM money_epoch WHERE id=0", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .optional()
-    .store()
-    .map(|e| e.map_or(0, from_db))
-}
-
-fn set_used(tx: &Transaction<'_>, slot: &str, used: u64) -> Result<(), RecordStoreError> {
-    tx.execute(
-        "INSERT INTO money_used (slot, used) VALUES (?1, ?2) \
-         ON CONFLICT(slot) DO UPDATE SET used=excluded.used",
-        params![slot, to_db(used)],
-    )
-    .store()
-    .map(drop)
 }
 
 /// Whether `op` is new, a replay (its original answer), or a conflict, read inside `tx`.
@@ -311,39 +140,6 @@ impl SqliteStore {
 /// The store v3 slots' own bodies: each op's ONE body, which the table's slot answers Ready (the
 /// store is local-disk-bound and never pends).
 impl SqliteStore {
-    pub(crate) fn v3_add_usage_op(
-        &self,
-        op: OpId,
-        bucket: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> OpResult<()> {
-        let body = format!("add_usage:{bucket:?}:{window_start}:{delta:?}");
-        self.op(op, &body, |tx| {
-            add_usage_in(tx, bucket, window_start, delta).map_err(failed)?;
-            Ok(Answer::Done)
-        })
-        .map(drop)
-    }
-
-    pub(crate) fn v3_add_metering_op(&self, op: OpId, delta: &MeteringDelta) -> OpResult<()> {
-        let body = format!("add_metering:{delta:?}");
-        self.op(op, &body, |tx| {
-            add_metering_in(tx, delta).map_err(failed)?;
-            Ok(Answer::Done)
-        })
-        .map(drop)
-    }
-
-    pub(crate) fn v3_append_audit_op(&self, op: OpId, entry: &AuditRecord) -> OpResult<()> {
-        let body = format!("append_audit:{entry:?}");
-        self.op(op, &body, |tx| {
-            append_audit_in(tx, entry).map_err(failed)?;
-            Ok(Answer::Done)
-        })
-        .map(drop)
-    }
-
     pub(crate) fn v3_append_plane_record_op(
         &self,
         op: OpId,
@@ -355,99 +151,6 @@ impl SqliteStore {
             Ok(Answer::Done)
         })
         .map(drop)
-    }
-
-    pub(crate) fn v3_append_batch(
-        &self,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> OpResult<Head> {
-        let body = format!("append_batch:{stream:?}:{records:?}");
-        let answer = self.op(op, &body, |tx| {
-            let mut seq: u64 = tx
-                .query_row(
-                    "SELECT COALESCE(MAX(seq), 0) FROM journal WHERE stream=?1",
-                    [stream],
-                    |r| r.get::<_, i64>(0),
-                )
-                .store()
-                .map(from_db)
-                .map_err(failed)?;
-            for r in records {
-                seq += 1;
-                tx.execute(
-                    "INSERT INTO journal (stream, seq, record) VALUES (?1, ?2, ?3)",
-                    params![stream, to_db(seq), r.as_slice()],
-                )
-                .store()
-                .map_err(failed)?;
-            }
-            Ok(Answer::Head { seq, epoch: 0 })
-        })?;
-        match answer {
-            Answer::Head { seq, epoch } => Ok(Head { seq, epoch }),
-            _ => Err(OpRefused::Conflict),
-        }
-    }
-
-    pub(crate) fn v3_heads(&self) -> Result<Vec<(String, Head)>, String> {
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare("SELECT stream, MAX(seq) FROM journal GROUP BY stream ORDER BY stream")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    Head {
-                        seq: from_db(r.get(1)?),
-                        epoch: 0,
-                    },
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
-    }
-
-    pub(crate) fn v3_session_put(
-        &self,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Result<(), String> {
-        self.lock_writer()
-            .execute(
-                "INSERT INTO sessions (session, node, principal) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(session) DO UPDATE SET node=excluded.node, principal=excluded.principal",
-                params![to_db(session), node, principal],
-            )
-            .map(drop)
-            .map_err(|e| e.to_string())
-    }
-
-    pub(crate) fn v3_session_remove(&self, session: u64) -> Result<(), String> {
-        self.lock_writer()
-            .execute(
-                "DELETE FROM sessions WHERE session=?1",
-                params![to_db(session)],
-            )
-            .map(drop)
-            .map_err(|e| e.to_string())
-    }
-
-    pub(crate) fn v3_sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String> {
-        let conn = self.lock_reader();
-        let mut stmt = conn
-            .prepare("SELECT session, node FROM sessions WHERE principal=?1")
-            .map_err(|e| e.to_string())?;
-        let mut rows: Vec<(u64, String)> = stmt
-            .query_map([principal], |r| Ok((from_db(r.get(0)?), r.get(1)?)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        rows.sort_unstable();
-        Ok(rows)
     }
 
     /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
@@ -545,164 +248,6 @@ impl SqliteStore {
             .collect()
     }
 
-    pub(crate) fn v3_reserve<'c>(
-        &self,
-        op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>> + Clone,
-        grants: &mut impl Extend<Grant>,
-    ) -> Result<(), ReserveRefused> {
-        let cells: Vec<Cell<'_>> = cells.collect();
-        let body = format!("reserve:{epoch}:{cells:?}");
-        let answer = self.deduped(op, &body, ReserveRefused::Conflict, unavailable, |tx| {
-            let now = self.now_ms();
-            // The epoch fences the draw (`SLICE_TTL_MS` (b)): below the stored one applies
-            // nothing; above it raises the stored one, in this same transaction.
-            let fleet = stored_epoch(tx).map_err(unavailable)?;
-            if epoch < fleet {
-                return Err(ReserveRefused::StaleEpoch);
-            }
-            // The chain draw is all or nothing: test every cell against what the cells before
-            // it in THIS draw add, and apply only when every cell passes. Each slot's expired
-            // slices go back to its headroom first (`SLICE_TTL_MS` (c)).
-            let mut drawn: HashMap<String, u64> = HashMap::new();
-            let mut slots = Vec::with_capacity(cells.len());
-            for (i, c) in cells.iter().enumerate() {
-                let (slot, dimension) = slot_of(&c.key);
-                expire(tx, &slot, now).map_err(unavailable)?;
-                let Some((cap, _)) = stored_cap(tx, &slot).map_err(unavailable)? else {
-                    return Err(ReserveRefused::NoCap { cell: i as u32 });
-                };
-                let used = stored_used(tx, &slot).map_err(unavailable)?;
-                let used = used.saturating_add(drawn.get(&slot).copied().unwrap_or(0));
-                if exhausted(dimension, used, c.amount, cap) {
-                    return Err(ReserveRefused::Exhausted { cell: i as u32 });
-                }
-                *drawn.entry(slot.clone()).or_default() += c.amount;
-                slots.push(slot);
-            }
-            if epoch > fleet {
-                tx.execute(
-                    "INSERT INTO money_epoch (id, epoch) VALUES (0, ?1) \
-                         ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch",
-                    params![to_db(epoch)],
-                )
-                .store()
-                .map_err(unavailable)?;
-            }
-            sweep_closed(tx, now).map_err(unavailable)?;
-            let valid_until_ms = now.saturating_add(SLICE_TTL_MS);
-            let mut granted = Vec::with_capacity(cells.len());
-            for (c, slot) in cells.iter().zip(slots) {
-                let used = stored_used(tx, &slot).map_err(unavailable)?;
-                set_used(tx, &slot, used.saturating_add(c.amount)).map_err(unavailable)?;
-                let slice_id: i64 = tx
-                    .query_row(
-                        "INSERT INTO money_slices (slot, remaining, valid_until_ms) \
-                             VALUES (?1, ?2, ?3) RETURNING slice_id",
-                        params![slot, to_db(c.amount), to_db(valid_until_ms)],
-                        |r| r.get(0),
-                    )
-                    .store()
-                    .map_err(unavailable)?;
-                granted.push((from_db(slice_id), c.amount, valid_until_ms));
-            }
-            Ok(Answer::Grants(granted))
-        })?;
-        match answer {
-            Answer::Grants(g) => {
-                grants.extend(
-                    g.into_iter()
-                        .map(|(slice_id, granted, valid_until_ms)| Grant {
-                            slice_id,
-                            granted,
-                            valid_until_ms,
-                        }),
-                );
-                Ok(())
-            }
-            _ => Err(ReserveRefused::Conflict),
-        }
-    }
-
-    pub(crate) fn v3_slice_release(
-        &self,
-        op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)> + Clone,
-        released: &mut impl Extend<u64>,
-    ) -> OpResult<()> {
-        let items: Vec<(u64, u64)> = items.collect();
-        let body = format!("slice_release:{epoch}:{items:?}");
-        let answer = self.op(op, &body, |tx| {
-            let now = self.now_ms();
-            let held = |id: u64| -> OpResult<Option<(String, u64)>> {
-                tx.query_row(
-                    "SELECT slot, remaining FROM money_slices WHERE slice_id=?1",
-                    params![to_db(id)],
-                    |r| Ok((r.get(0)?, from_db(r.get(1)?))),
-                )
-                .optional()
-                .store()
-                .map_err(failed)
-            };
-            // A closed slice the sweep forgot is still known: any id from 1 to the highest ever
-            // granted answers 0 (below), only an id above it (or 0) was never granted.
-            let high = highest_granted(tx).map_err(failed)?;
-            let known = |id: u64| id >= 1 && id <= high;
-            for &(id, _) in &items {
-                if !known(id) {
-                    return Err(OpRefused::Failed(format!(
-                        "slice_release: slice {id} was never granted"
-                    )));
-                }
-            }
-            let mut back_all = Vec::with_capacity(items.len());
-            for &(id, unspent) in &items {
-                let gone =
-                    || OpRefused::Failed(format!("slice_release: slice {id} was never granted"));
-                let Some((slot, _)) = held(id)? else {
-                    // Granted, closed and swept: nothing left to return.
-                    if known(id) {
-                        back_all.push(0);
-                        continue;
-                    }
-                    return Err(gone());
-                };
-                // An expired slice's remainder went back to its headroom at expiry, so a release
-                // after it returns nothing more (`SLICE_TTL_MS`: each unit at most once).
-                expire(tx, &slot, now).map_err(failed)?;
-                let (_, left) = held(id)?.ok_or_else(gone)?;
-                let back = unspent.min(left);
-                // A release on window 0 is final (`abi::store` slice life (e)): window 0 never
-                // rolls, so the slice closes now (remaining 0, a later release returns 0) and its
-                // spent rest stays counted against the cap.
-                let kept = if slot_window_start(&slot) == Some(0) {
-                    0
-                } else {
-                    left - back
-                };
-                tx.execute(
-                    "UPDATE money_slices SET remaining=?2 WHERE slice_id=?1",
-                    params![to_db(id), to_db(kept)],
-                )
-                .store()
-                .map_err(failed)?;
-                let used = stored_used(tx, &slot).map_err(failed)?;
-                set_used(tx, &slot, used.saturating_sub(back)).map_err(failed)?;
-                back_all.push(back);
-            }
-            Ok(Answer::Released(back_all))
-        })?;
-        match answer {
-            Answer::Released(r) => {
-                released.extend(r);
-                Ok(())
-            }
-            _ => Err(OpRefused::Conflict),
-        }
-    }
-
     pub(crate) fn v3_add_usage_batch(
         &self,
         op: OpId,
@@ -728,61 +273,6 @@ impl SqliteStore {
         })
         .map(drop)
     }
-
-    pub(crate) fn v3_append_audit_batch(&self, op: OpId, entries: &[AuditRecord]) -> OpResult<()> {
-        let body = format!("append_audit_batch:{entries:?}");
-        // One transaction: a fork anywhere (against the log, or inside the batch, which the fork
-        // check sees because the earlier entries are already written in it) rolls back the whole.
-        self.op(op, &body, |tx| {
-            for e in entries {
-                append_audit_in(tx, e).map_err(failed)?;
-            }
-            Ok(Answer::Done)
-        })
-        .map(drop)
-    }
-
-    pub(crate) fn v3_window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused> {
-        let body = format!("window_caps:{caps:?}");
-        self.deduped(
-            op,
-            &body,
-            CapsRefused::Conflict,
-            |e| CapsRefused::Failed(e.0),
-            |tx| {
-                let fail = |e: RecordStoreError| CapsRefused::Failed(e.0);
-                // Atomic per push: find the first conflict before applying any cap.
-                let mut pushed: HashMap<String, (u64, u64)> = HashMap::new();
-                for (index, c) in caps.iter().enumerate() {
-                    let (slot, _) = slot_of(&c.key);
-                    let stored = match pushed.get(&slot) {
-                        Some(p) => Some(*p),
-                        None => stored_cap(tx, &slot).map_err(fail)?,
-                    };
-                    match stored {
-                        Some((cap, gen)) if gen == c.config_gen && cap != c.cap => {
-                            return Err(CapsRefused::CapConflict { index });
-                        }
-                        Some((_, gen)) if gen >= c.config_gen => {}
-                        _ => {
-                            pushed.insert(slot, (c.cap, c.config_gen));
-                        }
-                    }
-                }
-                for (slot, (cap, gen)) in &pushed {
-                    tx.execute(
-                        "INSERT INTO money_caps (slot, cap, config_gen) VALUES (?1, ?2, ?3) \
-                         ON CONFLICT(slot) DO UPDATE SET cap=excluded.cap, config_gen=excluded.config_gen",
-                        params![slot, to_db(*cap), to_db(*gen)],
-                    )
-                    .store()
-                    .map_err(fail)?;
-                }
-                Ok(Answer::Done)
-            },
-        )
-        .map(drop)
-    }
 }
 
 /// THE STORE v3 TABLE over this store (`abi::sdk::store::StoreSlots`): every slot answers
@@ -805,30 +295,6 @@ impl StoreSlots for SqliteStore {
         crate::door::open(settings_str(settings)?)
     }
 
-    fn add_usage_op(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        bucket: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_add_usage_op(op, bucket, window_start, delta))
-    }
-
-    fn add_metering_op(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        delta: &MeteringDelta,
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_add_metering_op(op, delta))
-    }
-
-    fn append_audit_op(&self, _: &mut Op<'_>, op: OpId, entry: &AuditRecord) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_append_audit_op(op, entry))
-    }
-
     fn append_plane_record_op(
         &self,
         _: &mut Op<'_>,
@@ -836,42 +302,6 @@ impl StoreSlots for SqliteStore {
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
         Step::Ready(self.v3_append_plane_record_op(op, record))
-    }
-
-    fn append_batch(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> Step<OpResult<Head>> {
-        Step::Ready(self.v3_append_batch(op, stream, records))
-    }
-
-    fn heads(&self, _: &mut Op<'_>) -> Step<Result<Vec<(String, Head)>, String>> {
-        Step::Ready(self.v3_heads())
-    }
-
-    fn session_put(
-        &self,
-        _: &mut Op<'_>,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Step<Result<(), String>> {
-        Step::Ready(self.v3_session_put(session, node, principal))
-    }
-
-    fn session_remove(&self, _: &mut Op<'_>, session: u64) -> Step<Result<(), String>> {
-        Step::Ready(self.v3_session_remove(session))
-    }
-
-    fn sessions_for(
-        &self,
-        _: &mut Op<'_>,
-        principal: &str,
-    ) -> Step<Result<Vec<(u64, String)>, String>> {
-        Step::Ready(self.v3_sessions_for(principal))
     }
 
     fn record_put(
@@ -903,28 +333,6 @@ impl StoreSlots for SqliteStore {
         Step::Ready(self.v3_record_scan(schema, prefix, limit))
     }
 
-    fn reserve<'c>(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>> + Clone,
-        grants: &mut impl Extend<Grant>,
-    ) -> Step<Result<(), ReserveRefused>> {
-        Step::Ready(self.v3_reserve(op, epoch, cells, grants))
-    }
-
-    fn slice_release(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)> + Clone,
-        released: &mut impl Extend<u64>,
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_slice_release(op, epoch, items, released))
-    }
-
     fn add_usage_batch(
         &self,
         _: &mut Op<'_>,
@@ -943,24 +351,6 @@ impl StoreSlots for SqliteStore {
         Step::Ready(self.v3_add_metering_batch(op, deltas))
     }
 
-    fn append_audit_batch(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        entries: &[AuditRecord],
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_append_audit_batch(op, entries))
-    }
-
-    fn window_caps(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        caps: &[Cap<'_>],
-    ) -> Step<Result<(), CapsRefused>> {
-        Step::Ready(self.v3_window_caps(op, caps))
-    }
-
     // ── the 1.5.5 op set (slots 0-32): the RecordStore impl, one body each ───────────────────────
 
     fn put_key(&self, _: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
@@ -977,10 +367,6 @@ impl StoreSlots for SqliteStore {
 
     fn delete_key(&self, _: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
         Step::Ready(RecordStore::delete_key(self, id))
-    }
-
-    fn scrub_key(&self, _: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::scrub_key(self, id))
     }
 
     fn list_keys_since(
@@ -1023,14 +409,6 @@ impl StoreSlots for SqliteStore {
         Step::Ready(RecordStore::list_metering(self, bucket))
     }
 
-    fn purge_windows_before(&self, _: &mut Op<'_>, before: u64) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(RecordStore::purge_windows_before(self, before))
-    }
-
-    fn purge_metering_before(&self, _: &mut Op<'_>, bucket: &str) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(RecordStore::purge_metering_before(self, bucket))
-    }
-
     fn put_credential(
         &self,
         _: &mut Op<'_>,
@@ -1054,15 +432,6 @@ impl StoreSlots for SqliteStore {
         key_id: &str,
     ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
         Step::Ready(RecordStore::list_credentials(self, key_id))
-    }
-
-    fn lookup_credential_secret(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        public_id: &str,
-    ) -> Step<RecordStoreResult<Option<CredentialSecret>>> {
-        Step::Ready(RecordStore::lookup_credential_secret(self, kind, public_id))
     }
 
     fn revoke_credential(
