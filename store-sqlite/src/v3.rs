@@ -75,8 +75,8 @@ fn slot_of(k: &CellKey<'_>) -> (String, u32) {
     (key.to_string(), dimension)
 }
 
-/// The `window_start` a slot key ([`slot_of`]) names: its last element.
-fn window_of(slot: &str) -> Option<u64> {
+/// The `window_start` a stored slot key names (its last element), if the key parses.
+fn slot_window_start(slot: &str) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(slot)
         .ok()?
         .as_array()?
@@ -649,18 +649,17 @@ impl SqliteStore {
                 expire(tx, &slot, now).map_err(failed)?;
                 let (_, left) = held(id)?.ok_or_else(gone)?;
                 let back = unspent.min(left);
-                // A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): window 0
-                // never rolls, so the slice CLOSES now. Its spent rest stays counted against the
-                // cap, and another release of it returns 0. On a rolling window a partial release
-                // leaves the rest open.
-                let after = if window_of(&slot) == Some(0) {
+                // A release on window 0 is final (`abi::store` slice life (e)): window 0 never
+                // rolls, so the slice closes now (remaining 0, a later release returns 0) and its
+                // spent rest stays counted against the cap.
+                let kept = if slot_window_start(&slot) == Some(0) {
                     0
                 } else {
                     left - back
                 };
                 tx.execute(
                     "UPDATE money_slices SET remaining=?2 WHERE slice_id=?1",
-                    params![to_db(id), to_db(after)],
+                    params![to_db(id), to_db(kept)],
                 )
                 .store()
                 .map_err(failed)?;
@@ -1110,6 +1109,26 @@ impl StoreSlots for SqliteStore {
         kind: &str,
     ) -> Step<RecordStoreResult<Vec<String>>> {
         Step::Ready(RecordStore::list_plane_record_parents(self, kind))
+    }
+
+    fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
+        let _ = cx;
+        Step::Ready(Ok(()))
+    }
+
+    fn purge_plane_records(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        before: u64,
+        retention: busbar_contract::records::Retention,
+    ) -> Step<RecordStoreResult<u64>> {
+        match retention {
+            busbar_contract::records::Retention::Age => {
+                StoreSlots::purge_plane_records_before(self, cx, kind, before)
+            }
+            busbar_contract::records::Retention::TerminalOnly => Step::Ready(Ok(0)),
+        }
     }
 
     fn purge_plane_records_before(

@@ -43,7 +43,7 @@ pub fn open(cfg: &str) -> Result<SqliteStore, String> {
 pub struct Settings {
     /// The database file (or an in-memory spelling).
     pub db_path: String,
-    /// SQLite's busy timeout, in ms; never negative.
+    /// SQLite's busy timeout, in ms; never negative, at most `i32::MAX`.
     pub busy_timeout_ms: i64,
 }
 
@@ -87,6 +87,12 @@ impl Settings {
                 if ms < 0 {
                     return Err(format!(
                         "{BAD}: `busy_timeout_ms` must not be negative, got {ms}"
+                    ));
+                }
+                if ms > i64::from(i32::MAX) {
+                    return Err(format!(
+                        "{BAD}: `busy_timeout_ms` must be at most 2147483647 (SQLite's busy_timeout is a \
+                         32-bit millisecond count; a larger value silently disables it), got {ms}"
                     ));
                 }
                 ms
