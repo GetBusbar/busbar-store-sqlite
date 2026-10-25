@@ -76,7 +76,7 @@ registers — one source, both doors. The image carries no other export.
 | Setting | Required | Default | Notes |
 |---|---|---|---|
 | `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
-| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value is rejected as a config error, since it can only be a mistake. |
+| `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value, or one above 2147483647 (SQLite's 32-bit limit; larger silently disables the timeout), is rejected as a config error. |
 
 **`db_path` must be an explicit absolute path in any real deployment.** The
 `busbar-governance.db` default is resolved relative to the engine
