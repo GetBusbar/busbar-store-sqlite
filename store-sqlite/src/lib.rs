@@ -2085,20 +2085,6 @@ impl RecordStore for SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().store()
     }
 
-    fn purge_plane_records(
-        &self,
-        kind: &str,
-        before: u64,
-        retention: busbar_contract::records::Retention,
-    ) -> RecordStoreResult<u64> {
-        match retention {
-            busbar_contract::records::Retention::Age => {
-                RecordStore::purge_plane_records_before(self, kind, before)
-            }
-            busbar_contract::records::Retention::TerminalOnly => Ok(0),
-        }
-    }
-
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the kind's
         // own contract, read off the typed `disposition` column, never out of the body:
