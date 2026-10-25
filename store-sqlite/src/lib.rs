@@ -405,12 +405,6 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ";
 
-/// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
-/// switching a not-yet-WAL file into WAL mode itself briefly acquires the database, so the timeout
-/// must already be configured or that acquisition is subject to SQLite's zero-second default).
-/// `is_writer` gates the writer-only pragmas (`journal_size_limit`, `wal_autocheckpoint`) and
-/// `query_only` (readers only — NOT `SQLITE_OPEN_READ_ONLY`, which cannot create the `-wal`/`-shm`
-/// files on a fresh database and would race the writer's first open).
 /// True for any SQLite path spelling that opens a private in-memory database: the exact `:memory:`
 /// literal, or a `file:` URI naming `:memory:` or using `mode=memory` (e.g. `file::memory:?cache=shared`,
 /// `file:foo?mode=memory`). A plain filesystem path that merely contains those characters (e.g.
@@ -424,6 +418,12 @@ fn is_memory_path(path: &str) -> bool {
             && (path.contains("mode=memory") || path.contains(":memory:")))
 }
 
+/// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
+/// switching a not-yet-WAL file into WAL mode itself briefly acquires the database, so the timeout
+/// must already be configured or that acquisition is subject to SQLite's zero-second default).
+/// `is_writer` gates the writer-only pragmas (`journal_size_limit`, `wal_autocheckpoint`) and
+/// `query_only` (readers only — NOT `SQLITE_OPEN_READ_ONLY`, which cannot create the `-wal`/`-shm`
+/// files on a fresh database and would race the writer's first open).
 fn apply_pragmas(
     conn: &Connection,
     path: &str,
