@@ -2082,14 +2082,21 @@ impl RecordStore for SqliteStore {
             .store()?
             .collect::<Result<Vec<_>, _>>()
             .store()?;
+        let mut index: std::collections::HashMap<(String, String, String, u64), usize> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for (i, m) in rows.iter().enumerate() {
+            index
+                .entry((
+                    m.key_id.clone(),
+                    m.provider.clone(),
+                    m.model.clone(),
+                    m.priced_from_ms,
+                ))
+                .or_insert(i);
+        }
         for (key_id, provider, model, priced_from_ms, unit, count) in units {
-            if let Some(row) = rows.iter_mut().find(|m| {
-                m.key_id == key_id
-                    && m.provider == provider
-                    && m.model == model
-                    && m.priced_from_ms == priced_from_ms
-            }) {
-                row.usage_units.insert(unit, count);
+            if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms)) {
+                rows[i].usage_units.insert(unit, count);
             }
         }
         Ok(rows)
