@@ -1154,6 +1154,34 @@ fn migrate_v5_to_v6_backfills_billable_requests_without_wiping_data() {
 }
 
 #[test]
+fn migrate_v5_to_v6_backfills_usage_metering_billable_requests() {
+    // Same hand-built v5 shape as the usage_windows test above, seeding the OTHER table the v6
+    // backfill covers: a `usage_metering` cell stuck at billable_requests=0 with real requests.
+    let dir = tempdir();
+    let file = dir.join("v5_metering.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, requests, billable_requests) \
+             VALUES ('100', 'vk_m', 'p', 'm', 9, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    let rows = s.list_metering(100).unwrap();
+    assert_eq!(rows.len(), 1, "the seeded metering cell must survive");
+    assert_eq!(rows[0].requests, 9);
+    assert_eq!(
+        rows[0].billable_requests, 9,
+        "a v5-era usage_metering cell stuck at billable_requests=0 must be backfilled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn migrate_v5_to_v6_does_not_touch_an_already_nonzero_billable_requests_row() {
     // The backfill's WHERE clause (`billable_requests = 0 AND requests > 0`) must not touch a row
     // that already carries a real, independently-tracked billable_requests value — only the
@@ -3522,4 +3550,63 @@ fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
         "a refused open must not restamp the file's version"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plain filesystem path that merely CONTAINS `mode=memory` (or starts like `:memory:`) is a file,
+/// not an in-memory database: SQLite gives in-memory meaning only to the exact `:memory:` or to a
+/// `file:` URI.
+#[test]
+fn a_plain_path_containing_mode_memory_is_a_real_file() {
+    assert!(!is_memory_path("/srv/mode=memory/governance.db"));
+    assert!(!is_memory_path(":memory:-archive.db"));
+    // Inside a `file:` URI the trigger text counts only where SQLite reads it: `mode=memory` as a
+    // query parameter, `:memory:` as the whole path.
+    assert!(!is_memory_path("file:/srv/mode=memory/gov.db"));
+    assert!(!is_memory_path("file:/data/:memory:/gov.db"));
+    for memory in [
+        ":memory:",
+        "file::memory:",
+        "file::memory:?cache=shared",
+        "file:foo?mode=memory",
+        "file:foo?cache=shared&mode=memory",
+    ] {
+        assert!(is_memory_path(memory), "{memory} is an in-memory spelling");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "store-sqlite-modemem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sub = dir.join("mode=memory");
+    std::fs::create_dir_all(&sub).unwrap();
+    let path = sub.join("gov.db").display().to_string();
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    s.put_key(&sample_key("vk_file", "g1")).unwrap();
+    drop(s);
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    assert!(
+        s.get_key("vk_file").unwrap().is_some(),
+        "the key must persist in the operator's file"
+    );
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A NULL `allowed_pools` with a PRESENT but unparseable `scope_grants` must read as the empty
+/// (most restrictive) grant, never as the omitted-grant wildcard (`None`).
+#[test]
+fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_bad_scopes", "g1")).unwrap();
+    s.lock_writer()
+        .execute(
+            "UPDATE keys SET allowed_pools=NULL, scope_grants='{\"mcp_server\":\"x\"}' WHERE id='vk_bad_scopes'",
+            [],
+        )
+        .unwrap();
+    let k = s.get_key("vk_bad_scopes").unwrap().unwrap();
+    assert_eq!(k.allowed_scopes, Some(vec![]));
 }
