@@ -135,7 +135,8 @@ fn stored_used(tx: &Transaction<'_>, slot: &str) -> Result<u64, RecordStoreError
 
 /// Return every EXPIRED slice's unreturned remainder on `slot` to its headroom (`SLICE_TTL_MS` (c)):
 /// each such slice closes (`remaining` 0) and `used` drops by what it still held. A slice granted
-/// `u64::MAX` (stored `-1`, a v11 grant) never expires.
+/// `u64::MAX` (stored `-1`) never expires; the v12 migrate leaves none, the guard only keeps the
+/// statement safe against a hand-written row.
 fn expire(tx: &Transaction<'_>, slot: &str, now_ms: u64) -> Result<(), RecordStoreError> {
     let back: i64 = tx
         .query_row(
@@ -169,6 +170,26 @@ fn sweep_closed(tx: &Transaction<'_>, now_ms: u64) -> Result<(), RecordStoreErro
     )
     .store()
     .map(drop)
+}
+
+/// The highest slice id ever granted (0 if none): AUTOINCREMENT's `sqlite_sequence` row, which a
+/// delete (the sweep) does not lower and a reopen keeps.
+fn highest_granted(tx: &Transaction<'_>) -> Result<u64, RecordStoreError> {
+    tx.query_row(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'money_slices'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .store()
+    .map(|s| s.map_or(0, from_db))
+}
+
+/// `ReserveRefused::Unavailable` carries no payload, so the underlying reason is logged here before
+/// it is dropped. SQLite error text names no secret (no credential reaches this module's SQL).
+fn unavailable(e: RecordStoreError) -> ReserveRefused {
+    tracing::warn!(target: "busbar_store_sqlite", error = %e.0, "reserve answered Unavailable");
+    ReserveRefused::Unavailable
 }
 
 /// The persisted fleet epoch (`SLICE_TTL_MS` (a)): 0 before any reserve.
@@ -533,68 +554,61 @@ impl SqliteStore {
     ) -> Result<(), ReserveRefused> {
         let cells: Vec<Cell<'_>> = cells.collect();
         let body = format!("reserve:{epoch}:{cells:?}");
-        let answer = self.deduped(
-            op,
-            &body,
-            ReserveRefused::Conflict,
-            |_| ReserveRefused::Unavailable,
-            |tx| {
-                let unavailable = |_: RecordStoreError| ReserveRefused::Unavailable;
-                let now = self.now_ms();
-                // The epoch fences the draw (`SLICE_TTL_MS` (b)): below the stored one applies
-                // nothing; above it raises the stored one, in this same transaction.
-                let fleet = stored_epoch(tx).map_err(unavailable)?;
-                if epoch < fleet {
-                    return Err(ReserveRefused::StaleEpoch);
+        let answer = self.deduped(op, &body, ReserveRefused::Conflict, unavailable, |tx| {
+            let now = self.now_ms();
+            // The epoch fences the draw (`SLICE_TTL_MS` (b)): below the stored one applies
+            // nothing; above it raises the stored one, in this same transaction.
+            let fleet = stored_epoch(tx).map_err(unavailable)?;
+            if epoch < fleet {
+                return Err(ReserveRefused::StaleEpoch);
+            }
+            // The chain draw is all or nothing: test every cell against what the cells before
+            // it in THIS draw add, and apply only when every cell passes. Each slot's expired
+            // slices go back to its headroom first (`SLICE_TTL_MS` (c)).
+            let mut drawn: HashMap<String, u64> = HashMap::new();
+            let mut slots = Vec::with_capacity(cells.len());
+            for (i, c) in cells.iter().enumerate() {
+                let (slot, dimension) = slot_of(&c.key);
+                expire(tx, &slot, now).map_err(unavailable)?;
+                let Some((cap, _)) = stored_cap(tx, &slot).map_err(unavailable)? else {
+                    return Err(ReserveRefused::NoCap { cell: i as u32 });
+                };
+                let used = stored_used(tx, &slot).map_err(unavailable)?;
+                let used = used.saturating_add(drawn.get(&slot).copied().unwrap_or(0));
+                if exhausted(dimension, used, c.amount, cap) {
+                    return Err(ReserveRefused::Exhausted { cell: i as u32 });
                 }
-                // The chain draw is all or nothing: test every cell against what the cells before
-                // it in THIS draw add, and apply only when every cell passes. Each slot's expired
-                // slices go back to its headroom first (`SLICE_TTL_MS` (c)).
-                let mut drawn: HashMap<String, u64> = HashMap::new();
-                let mut slots = Vec::with_capacity(cells.len());
-                for (i, c) in cells.iter().enumerate() {
-                    let (slot, dimension) = slot_of(&c.key);
-                    expire(tx, &slot, now).map_err(unavailable)?;
-                    let Some((cap, _)) = stored_cap(tx, &slot).map_err(unavailable)? else {
-                        return Err(ReserveRefused::NoCap { cell: i as u32 });
-                    };
-                    let used = stored_used(tx, &slot).map_err(unavailable)?;
-                    let used = used.saturating_add(drawn.get(&slot).copied().unwrap_or(0));
-                    if exhausted(dimension, used, c.amount, cap) {
-                        return Err(ReserveRefused::Exhausted { cell: i as u32 });
-                    }
-                    *drawn.entry(slot.clone()).or_default() += c.amount;
-                    slots.push(slot);
-                }
-                if epoch > fleet {
-                    tx.execute(
-                        "INSERT INTO money_epoch (id, epoch) VALUES (0, ?1) \
+                *drawn.entry(slot.clone()).or_default() += c.amount;
+                slots.push(slot);
+            }
+            if epoch > fleet {
+                tx.execute(
+                    "INSERT INTO money_epoch (id, epoch) VALUES (0, ?1) \
                          ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch",
-                        params![to_db(epoch)],
+                    params![to_db(epoch)],
+                )
+                .store()
+                .map_err(unavailable)?;
+            }
+            sweep_closed(tx, now).map_err(unavailable)?;
+            let valid_until_ms = now.saturating_add(SLICE_TTL_MS);
+            let mut granted = Vec::with_capacity(cells.len());
+            for (c, slot) in cells.iter().zip(slots) {
+                let used = stored_used(tx, &slot).map_err(unavailable)?;
+                set_used(tx, &slot, used.saturating_add(c.amount)).map_err(unavailable)?;
+                let slice_id: i64 = tx
+                    .query_row(
+                        "INSERT INTO money_slices (slot, remaining, valid_until_ms) \
+                             VALUES (?1, ?2, ?3) RETURNING slice_id",
+                        params![slot, to_db(c.amount), to_db(valid_until_ms)],
+                        |r| r.get(0),
                     )
                     .store()
                     .map_err(unavailable)?;
-                }
-                sweep_closed(tx, now).map_err(unavailable)?;
-                let valid_until_ms = now.saturating_add(SLICE_TTL_MS);
-                let mut granted = Vec::with_capacity(cells.len());
-                for (c, slot) in cells.iter().zip(slots) {
-                    let used = stored_used(tx, &slot).map_err(unavailable)?;
-                    set_used(tx, &slot, used.saturating_add(c.amount)).map_err(unavailable)?;
-                    let slice_id: i64 = tx
-                        .query_row(
-                            "INSERT INTO money_slices (slot, remaining, valid_until_ms) \
-                             VALUES (?1, ?2, ?3) RETURNING slice_id",
-                            params![slot, to_db(c.amount), to_db(valid_until_ms)],
-                            |r| r.get(0),
-                        )
-                        .store()
-                        .map_err(unavailable)?;
-                    granted.push((from_db(slice_id), c.amount, valid_until_ms));
-                }
-                Ok(Answer::Grants(granted))
-            },
-        )?;
+                granted.push((from_db(slice_id), c.amount, valid_until_ms));
+            }
+            Ok(Answer::Grants(granted))
+        })?;
         match answer {
             Answer::Grants(g) => {
                 grants.extend(
@@ -632,8 +646,12 @@ impl SqliteStore {
                 .store()
                 .map_err(failed)
             };
+            // A closed slice the sweep forgot is still known: any id from 1 to the highest ever
+            // granted answers 0 (below), only an id above it (or 0) was never granted.
+            let high = highest_granted(tx).map_err(failed)?;
+            let known = |id: u64| id >= 1 && id <= high;
             for &(id, _) in &items {
-                if held(id)?.is_none() {
+                if !known(id) {
                     return Err(OpRefused::Failed(format!(
                         "slice_release: slice {id} was never granted"
                     )));
@@ -643,7 +661,14 @@ impl SqliteStore {
             for &(id, unspent) in &items {
                 let gone =
                     || OpRefused::Failed(format!("slice_release: slice {id} was never granted"));
-                let (slot, _) = held(id)?.ok_or_else(gone)?;
+                let Some((slot, _)) = held(id)? else {
+                    // Granted, closed and swept: nothing left to return.
+                    if known(id) {
+                        back_all.push(0);
+                        continue;
+                    }
+                    return Err(gone());
+                };
                 // An expired slice's remainder went back to its headroom at expiry, so a release
                 // after it returns nothing more (`SLICE_TTL_MS`: each unit at most once).
                 expire(tx, &slot, now).map_err(failed)?;
