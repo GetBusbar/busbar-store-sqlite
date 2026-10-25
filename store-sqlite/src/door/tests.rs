@@ -253,6 +253,13 @@ fn null_db_path_and_busy_timeout_read_as_absent() {
         cwd.scratch.join("busbar-governance.db").exists(),
         "`db_path: null` must have opened the default-named db in the scratch cwd"
     );
+    assert_eq!(
+        super::Settings::parse(r#"{"db_path": null, "busy_timeout_ms": null}"#).unwrap(),
+        super::Settings {
+            db_path: "busbar-governance.db".into(),
+            busy_timeout_ms: 5000
+        }
+    );
 }
 
 /// `0` is a legal, deliberate "never retry" setting (only a negative value is refused), so it must
@@ -274,4 +281,21 @@ fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
         err.contains("busy_timeout_ms") && err.contains("out of range"),
         "error should name the offending field and say it is out of range: {err}"
     );
+}
+
+/// SQLite parses `PRAGMA busy_timeout` as a 32-bit int; a larger value reads back as 0 and silently
+/// disables the busy handler, so anything above `i32::MAX` is refused (and `i32::MAX` itself is fine).
+#[test]
+fn busy_timeout_ms_above_i32_max_is_refused() {
+    use super::Settings;
+    for ms in ["2147483648", "3000000000"] {
+        let err = Settings::parse(&format!(r#"{{"busy_timeout_ms": {ms}}}"#))
+            .expect_err("a busy_timeout_ms above i32::MAX must be refused");
+        assert!(
+            err.contains("busy_timeout_ms"),
+            "error should name the field: {err}"
+        );
+    }
+    let ok = Settings::parse(r#"{"busy_timeout_ms": 2147483647}"#).expect("i32::MAX is accepted");
+    assert_eq!(ok.busy_timeout_ms, 2147483647);
 }

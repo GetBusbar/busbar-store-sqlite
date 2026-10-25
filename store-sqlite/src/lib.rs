@@ -104,7 +104,8 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// v12 (busbar 1.6.0, the store kind's epoch and slice life, `abi::store::SLICE_TTL_MS` (a)-(c)):
 /// the ONE persisted fleet epoch (`money_epoch`) and each slice's `valid_until_ms`. Additive: a new
 /// table, and a nullable-free `ADD COLUMN` whose default (`-1`, `u64::MAX` bit-for-bit) is exactly the
-/// never-expiring validity every v11 slice was granted, so no open slice changes meaning.
+/// never-expiring validity every v11 slice was granted, so no open slice changes meaning. The two
+/// `money_slices` indexes (`slot`, `valid_until_ms`) are likewise created by `SCHEMA` on every open.
 const SCHEMA_VERSION: i64 = 12;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
@@ -349,6 +350,9 @@ CREATE TABLE IF NOT EXISTS money_slices (
     remaining      INTEGER NOT NULL,
     valid_until_ms INTEGER NOT NULL DEFAULT -1
 ) STRICT;
+-- `slot` serves `expire` (per-cell select/update); `valid_until_ms` serves `sweep_closed`'s delete.
+CREATE INDEX IF NOT EXISTS money_slices_slot_idx ON money_slices (slot);
+CREATE INDEX IF NOT EXISTS money_slices_valid_idx ON money_slices (valid_until_ms);
 -- The ONE fleet epoch (v12, `abi::store::SLICE_TTL_MS` (a)): 0 before any reserve; only a reserve
 -- raises it, nothing lowers it.
 CREATE TABLE IF NOT EXISTS money_epoch (
@@ -401,24 +405,32 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ";
 
+/// True for any SQLite path spelling that opens a private in-memory database: the exact `:memory:`
+/// literal, or a `file:` URI whose path is `:memory:` or whose query carries `mode=memory` (e.g.
+/// `file::memory:?cache=shared`, `file:foo?mode=memory`). A path that merely contains those
+/// characters elsewhere (`/srv/mode=memory/gov.db`, `file:/srv/mode=memory/gov.db`) is a real file:
+/// SQLite gives them meaning only in the forms above. Every caller that needs to special-case in-memory routing (pragma
+/// selection here, and `SqliteStore::open`'s single-connection routing) MUST share this check —
+/// two independent, drifting definitions is exactly how `open()` missed URI spellings that
+/// `apply_pragmas` already recognized (see `SqliteStore::open`'s doc comment).
+fn is_memory_path(path: &str) -> bool {
+    if path == ":memory:" {
+        return true;
+    }
+    let Some(uri) = path.strip_prefix("file:") else {
+        return false;
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (file, query) = uri.split_once('?').unwrap_or((uri, ""));
+    file == ":memory:" || query.split('&').any(|param| param == "mode=memory")
+}
+
 /// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
 /// switching a not-yet-WAL file into WAL mode itself briefly acquires the database, so the timeout
 /// must already be configured or that acquisition is subject to SQLite's zero-second default).
 /// `is_writer` gates the writer-only pragmas (`journal_size_limit`, `wal_autocheckpoint`) and
 /// `query_only` (readers only — NOT `SQLITE_OPEN_READ_ONLY`, which cannot create the `-wal`/`-shm`
 /// files on a fresh database and would race the writer's first open).
-/// True for any SQLite path spelling that opens a private in-memory database: the bare `:memory:`
-/// literal, or a URI filename using `mode=memory` (e.g. `file::memory:?cache=shared`,
-/// `file:foo?mode=memory`). Every caller that needs to special-case in-memory routing (pragma
-/// selection here, and `SqliteStore::open`'s single-connection routing) MUST share this check —
-/// two independent, drifting definitions is exactly how `open()` missed URI spellings that
-/// `apply_pragmas` already recognized (see `SqliteStore::open`'s doc comment).
-fn is_memory_path(path: &str) -> bool {
-    path.starts_with(":memory:")
-        || path.contains("mode=memory")
-        || (path.starts_with("file:") && path.contains(":memory:"))
-}
-
 fn apply_pragmas(
     conn: &Connection,
     path: &str,
@@ -850,7 +862,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 /// no non-pool scope grant (the pool-only column was the whole grant), and `None` for the three 1.6.0
 /// attribution fields, which is what the contract says a key minted before them carries.
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
-    const COLUMNS: [(&str, &str); 4] = [
+    const COLUMNS: [(&str, &str); 5] = [
         // The NON-POOL scope grants, `{kind: [value, ...]}`. NULL when the key grants no scope of any
         // kind but `pool` — including every pre-v10 row, whose `allowed_pools` column was the whole
         // grant. See `scopes_to_storage` for why pools keep their own column.
@@ -862,6 +874,7 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
         ("idp_subject", "TEXT"),
         ("binding_mode", "TEXT"),
         ("minted_by", "TEXT"),
+        ("idp_provider", "TEXT"),
     ];
     for (name, decl) in COLUMNS {
         if !column_exists(tx, "keys", name)? {
@@ -1133,13 +1146,14 @@ fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
 // grant, never a silent widen: an unparseable `allowed_pools` is the empty set, and an unparseable
 // `scope_grants` adds nothing.
 fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<Vec<ScopeRef>> {
+    // The wildcard is decided on the RAW columns: a present-but-unparseable column is restrictive.
+    if pools.is_none() && other.is_none() {
+        return None;
+    }
     let other: std::collections::BTreeMap<String, Vec<String>> = other
         .as_deref()
         .map(|o| serde_json::from_str(o.trim()).unwrap_or_default())
         .unwrap_or_default();
-    if pools.is_none() && other.is_empty() {
-        return None;
-    }
     let mut list: Vec<ScopeRef> = pools
         .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
         .unwrap_or_default()
@@ -1178,11 +1192,12 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         idp_subject: r.get(12)?,
         binding_mode: r.get(13)?,
         minted_by: r.get(14)?,
+        idp_provider: r.get(15)?,
     })
 }
 
 const KEY_COLS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
-     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by";
+     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by,idp_provider";
 
 fn secret_form_to_str(f: SecretForm) -> &'static str {
     match f {
@@ -1266,14 +1281,14 @@ fn put_key_inner(
     let (allowed_pools, scope_grants) = scopes_to_storage(&key.allowed_scopes);
     let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
-                           scope_grants,idp_subject,binding_mode,minted_by)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16)
+                           scope_grants,idp_subject,binding_mode,minted_by,idp_provider)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?6,?11,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO UPDATE SET
             generation_hash=excluded.generation_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
             enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels,
             expires_at=excluded.expires_at, deleted_at=excluded.deleted_at, updated_at=?12, revision=?11,
             scope_grants=excluded.scope_grants, idp_subject=excluded.idp_subject,
-            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by
+            binding_mode=excluded.binding_mode, minted_by=excluded.minted_by, idp_provider=excluded.idp_provider
          WHERE excluded.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
         params![
             key.id,
@@ -1292,6 +1307,7 @@ fn put_key_inner(
             key.idp_subject,
             key.binding_mode,
             key.minted_by,
+            key.idp_provider,
         ],
     )
     .store()?;
@@ -2073,14 +2089,21 @@ impl RecordStore for SqliteStore {
             .store()?
             .collect::<Result<Vec<_>, _>>()
             .store()?;
+        let mut index: std::collections::HashMap<(String, String, String, u64), usize> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for (i, m) in rows.iter().enumerate() {
+            index
+                .entry((
+                    m.key_id.clone(),
+                    m.provider.clone(),
+                    m.model.clone(),
+                    m.priced_from_ms,
+                ))
+                .or_insert(i);
+        }
         for (key_id, provider, model, priced_from_ms, unit, count) in units {
-            if let Some(row) = rows.iter_mut().find(|m| {
-                m.key_id == key_id
-                    && m.provider == provider
-                    && m.model == model
-                    && m.priced_from_ms == priced_from_ms
-            }) {
-                row.usage_units.insert(unit, count);
+            if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms)) {
+                rows[i].usage_units.insert(unit, count);
             }
         }
         Ok(rows)
@@ -2260,6 +2283,20 @@ impl RecordStore for SqliteStore {
             .store()?;
         let rows = stmt.query_map([kind], |r| r.get::<_, String>(0)).store()?;
         rows.collect::<Result<Vec<_>, _>>().store()
+    }
+
+    fn purge_plane_records(
+        &self,
+        kind: &str,
+        before: u64,
+        retention: busbar_contract::records::Retention,
+    ) -> RecordStoreResult<u64> {
+        match retention {
+            busbar_contract::records::Retention::Age => {
+                RecordStore::purge_plane_records_before(self, kind, before)
+            }
+            busbar_contract::records::Retention::TerminalOnly => Ok(0),
+        }
     }
 
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
