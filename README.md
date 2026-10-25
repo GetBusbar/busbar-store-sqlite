@@ -12,7 +12,7 @@ First-party signed kind:store plugin cdylib: the SQLite governance store package
 
 ## What it is for
 
-**This plugin's version: v1.0.0.** (Independently versioned from busbar
+**This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml)
@@ -29,7 +29,7 @@ built library into busbar's plugins folder, set
 
 ### Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.0` here says
+This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
 stated separately: **requires busbar 1.6.0+** — the release whose store
 interface this crate implements (the kind-tagged plane-record verbs that
@@ -41,7 +41,7 @@ not assume they move together.
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-later, to v10). Nothing an operator already has is dropped: keys,
+later, to v12). Nothing an operator already has is dropped: keys,
 credentials, tombstones, usage and metering counts, the audit log and the
 denylist all read back exactly as before, and existing metering rows are
 attributed to the opening rate card. Back the file up before the first
@@ -103,10 +103,9 @@ one more reason to set it explicitly.
 
 ## Build
 
-Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbar](https://github.com/GetBusbar/busbar) ships publicly —
-a sibling checkout of `busbar` at `../busbar` (see
-[Dependencies](#dependencies) below).
+Needs a Rust toolchain ([rustup](https://rustup.rs)). No sibling busbar
+checkout is needed to build or unit-test; only the end-to-end tests need one
+(see [Dependencies](#dependencies) below).
 
 ```sh
 cargo build --release      # cdylib: target/release/libbusbar_store_sqlite_plugin.{so,dylib}
@@ -142,9 +141,9 @@ in busbar for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_sqlite_plugin.so \
     --name busbar-store-sqlite-plugin --alias sqlite --kind store \
-    --version 1.0.0 --publisher busbar \
+    --version 1.6.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-sqlite-plugin-1.0.0-x86_64-linux.tar.gz
+    --out busbar-store-sqlite-plugin-1.6.0-x86_64-linux.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack
