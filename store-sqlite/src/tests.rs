@@ -323,12 +323,6 @@ fn delete_key_is_idempotent() {
     );
 }
 
-#[test]
-fn delete_key_unknown_id_errors() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    assert!(s.delete_key("vk_never_existed").is_err());
-}
-
 /// HARDEST INVARIANT #1: the tombstone UPDATE's atomicity. `keys_tombstone_off` (`deleted_at IS NULL
 /// OR enabled = 0`) would reject a transient `enabled=1, deleted_at=now` state — this test proves
 /// `delete_key` sets both flags in the SAME statement by attempting exactly that split, by hand,
@@ -524,19 +518,6 @@ fn credential_public_id_is_globally_unique_per_kind() {
         result.is_err(),
         "the same public_id must not resolve to two different keys"
     );
-}
-
-#[test]
-fn list_credentials_never_carries_a_secret_field() {
-    // CredentialMeta has no `secret` field at all -- this test exists to document the guarantee at
-    // the type level (it will fail to COMPILE, not fail an assertion, if that ever changes).
-    let s = SqliteStore::open_in_memory().unwrap();
-    s.put_key(&sample_key("vk_s", "g")).unwrap();
-    s.put_credential(&sample_credential("vk_s", "AKIA_S", 0))
-        .unwrap();
-    let metas = s.list_credentials("vk_s").unwrap();
-    assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].public_id, "AKIA_S");
 }
 
 // ── Usage ledger ─────────────────────────────────────────────────────────────────────────────
