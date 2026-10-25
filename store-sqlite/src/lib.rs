@@ -411,16 +411,17 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
 /// `is_writer` gates the writer-only pragmas (`journal_size_limit`, `wal_autocheckpoint`) and
 /// `query_only` (readers only — NOT `SQLITE_OPEN_READ_ONLY`, which cannot create the `-wal`/`-shm`
 /// files on a fresh database and would race the writer's first open).
-/// True for any SQLite path spelling that opens a private in-memory database: the bare `:memory:`
-/// literal, or a URI filename using `mode=memory` (e.g. `file::memory:?cache=shared`,
-/// `file:foo?mode=memory`). Every caller that needs to special-case in-memory routing (pragma
+/// True for any SQLite path spelling that opens a private in-memory database: the exact `:memory:`
+/// literal, or a `file:` URI naming `:memory:` or using `mode=memory` (e.g. `file::memory:?cache=shared`,
+/// `file:foo?mode=memory`). A plain filesystem path that merely contains those characters (e.g.
+/// `/srv/mode=memory/gov.db`) is a real file: SQLite gives them meaning only in the forms above. Every caller that needs to special-case in-memory routing (pragma
 /// selection here, and `SqliteStore::open`'s single-connection routing) MUST share this check —
 /// two independent, drifting definitions is exactly how `open()` missed URI spellings that
 /// `apply_pragmas` already recognized (see `SqliteStore::open`'s doc comment).
 fn is_memory_path(path: &str) -> bool {
-    path.starts_with(":memory:")
-        || path.contains("mode=memory")
-        || (path.starts_with("file:") && path.contains(":memory:"))
+    path == ":memory:"
+        || (path.starts_with("file:")
+            && (path.contains("mode=memory") || path.contains(":memory:")))
 }
 
 fn apply_pragmas(
