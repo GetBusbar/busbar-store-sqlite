@@ -299,3 +299,28 @@ fn busy_timeout_ms_above_i32_max_is_refused() {
     let ok = Settings::parse(r#"{"busy_timeout_ms": 2147483647}"#).expect("i32::MAX is accepted");
     assert_eq!(ok.busy_timeout_ms, 2147483647);
 }
+
+/// An unknown top-level key is refused (a typo such as `dbpath` would otherwise silently open the
+/// default relative path), naming the accepted keys.
+#[test]
+fn an_unknown_setting_is_refused() {
+    let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
+    assert_eq!(
+        err,
+        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms)"
+    );
+}
+
+/// An empty or whitespace-only `db_path` is refused with an explanation, not an obscure WAL error.
+#[test]
+fn an_empty_or_blank_db_path_is_refused() {
+    for p in ["", "   ", "\t"] {
+        let err = expect_err(open(&format!(r#"{{"db_path": {p:?}}}"#)));
+        assert!(
+            err.starts_with("invalid sqlite plugin config:")
+                && err.contains("db_path")
+                && err.contains("empty"),
+            "{p:?}: {err}"
+        );
+    }
+}
