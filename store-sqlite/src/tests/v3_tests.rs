@@ -822,3 +822,38 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
         vec![b"{}".to_vec()]
     );
 }
+
+/// The expiry statements of `v3.rs` (`expire`, `sweep_closed`) run under the writer lock on every
+/// reserve; they must be served by an index on `money_slices`, never a full scan.
+#[test]
+fn slice_expiry_statements_use_an_index() {
+    let s = fresh();
+    let conn = s.lock_writer();
+    let plan = |sql: &str| -> String {
+        let mut st = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare");
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .map(|r| r.expect("row"))
+            .collect();
+        rows.join(" | ")
+    };
+    for sql in [
+        "SELECT COALESCE(SUM(remaining), 0) FROM money_slices WHERE slot='a' AND remaining > 0 \
+         AND valid_until_ms >= 0 AND valid_until_ms < 5",
+        "UPDATE money_slices SET remaining=0 WHERE slot='a' AND remaining > 0 \
+         AND valid_until_ms >= 0 AND valid_until_ms < 5",
+    ] {
+        let p = plan(sql);
+        assert!(
+            p.contains("USING INDEX money_slices_slot_idx"),
+            "{sql}: {p}"
+        );
+    }
+    let p = plan(
+        "DELETE FROM money_slices WHERE remaining = 0 AND valid_until_ms >= 0 AND valid_until_ms < 5",
+    );
+    assert!(p.contains("USING INDEX money_slices_valid_idx"), "{p}");
+}
