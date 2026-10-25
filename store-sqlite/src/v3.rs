@@ -429,12 +429,25 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     pub(crate) fn v3_record_put(
         &self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        if value.is_empty() {
+            return self
+                .lock_writer()
+                .execute(
+                    "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
+                    params![schema, key],
+                )
+                .map(drop)
+                .map_err(|e| e.to_string());
+        }
         self.lock_writer()
             .execute(
                 "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
