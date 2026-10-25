@@ -253,6 +253,13 @@ fn null_db_path_and_busy_timeout_read_as_absent() {
         cwd.scratch.join("busbar-governance.db").exists(),
         "`db_path: null` must have opened the default-named db in the scratch cwd"
     );
+    assert_eq!(
+        super::Settings::parse(r#"{"db_path": null, "busy_timeout_ms": null}"#).unwrap(),
+        super::Settings {
+            db_path: "busbar-governance.db".into(),
+            busy_timeout_ms: 5000
+        }
+    );
 }
 
 /// `0` is a legal, deliberate "never retry" setting (only a negative value is refused), so it must
