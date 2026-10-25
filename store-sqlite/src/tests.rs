@@ -3523,3 +3523,33 @@ fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A plain filesystem path that merely CONTAINS `mode=memory` (or starts like `:memory:`) is a file,
+/// not an in-memory database: SQLite gives in-memory meaning only to the exact `:memory:` or to a
+/// `file:` URI.
+#[test]
+fn a_plain_path_containing_mode_memory_is_a_real_file() {
+    assert!(!is_memory_path("/srv/mode=memory/governance.db"));
+    assert!(!is_memory_path(":memory:-archive.db"));
+    let dir = std::env::temp_dir().join(format!(
+        "store-sqlite-modemem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sub = dir.join("mode=memory");
+    std::fs::create_dir_all(&sub).unwrap();
+    let path = sub.join("gov.db").display().to_string();
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    s.put_key(&sample_key("vk_file", "g1")).unwrap();
+    drop(s);
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    assert!(
+        s.get_key("vk_file").unwrap().is_some(),
+        "the key must persist in the operator's file"
+    );
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
