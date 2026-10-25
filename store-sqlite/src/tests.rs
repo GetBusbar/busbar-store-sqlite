@@ -3559,6 +3559,19 @@ fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
 fn a_plain_path_containing_mode_memory_is_a_real_file() {
     assert!(!is_memory_path("/srv/mode=memory/governance.db"));
     assert!(!is_memory_path(":memory:-archive.db"));
+    // Inside a `file:` URI the trigger text counts only where SQLite reads it: `mode=memory` as a
+    // query parameter, `:memory:` as the whole path.
+    assert!(!is_memory_path("file:/srv/mode=memory/gov.db"));
+    assert!(!is_memory_path("file:/data/:memory:/gov.db"));
+    for memory in [
+        ":memory:",
+        "file::memory:",
+        "file::memory:?cache=shared",
+        "file:foo?mode=memory",
+        "file:foo?cache=shared&mode=memory",
+    ] {
+        assert!(is_memory_path(memory), "{memory} is an in-memory spelling");
+    }
     let dir = std::env::temp_dir().join(format!(
         "store-sqlite-modemem-{}-{}",
         std::process::id(),

@@ -406,16 +406,23 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
 ";
 
 /// True for any SQLite path spelling that opens a private in-memory database: the exact `:memory:`
-/// literal, or a `file:` URI naming `:memory:` or using `mode=memory` (e.g. `file::memory:?cache=shared`,
-/// `file:foo?mode=memory`). A plain filesystem path that merely contains those characters (e.g.
-/// `/srv/mode=memory/gov.db`) is a real file: SQLite gives them meaning only in the forms above. Every caller that needs to special-case in-memory routing (pragma
+/// literal, or a `file:` URI whose path is `:memory:` or whose query carries `mode=memory` (e.g.
+/// `file::memory:?cache=shared`, `file:foo?mode=memory`). A path that merely contains those
+/// characters elsewhere (`/srv/mode=memory/gov.db`, `file:/srv/mode=memory/gov.db`) is a real file:
+/// SQLite gives them meaning only in the forms above. Every caller that needs to special-case in-memory routing (pragma
 /// selection here, and `SqliteStore::open`'s single-connection routing) MUST share this check —
 /// two independent, drifting definitions is exactly how `open()` missed URI spellings that
 /// `apply_pragmas` already recognized (see `SqliteStore::open`'s doc comment).
 fn is_memory_path(path: &str) -> bool {
-    path == ":memory:"
-        || (path.starts_with("file:")
-            && (path.contains("mode=memory") || path.contains(":memory:")))
+    if path == ":memory:" {
+        return true;
+    }
+    let Some(uri) = path.strip_prefix("file:") else {
+        return false;
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (file, query) = uri.split_once('?').unwrap_or((uri, ""));
+    file == ":memory:" || query.split('&').any(|param| param == "mode=memory")
 }
 
 /// Apply the fixed pragma set to a connection, in the documented order (`busy_timeout` FIRST:
