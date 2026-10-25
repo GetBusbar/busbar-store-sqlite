@@ -3553,3 +3553,19 @@ fn a_plain_path_containing_mode_memory_is_a_real_file() {
     assert!(std::path::Path::new(&path).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A NULL `allowed_pools` with a PRESENT but unparseable `scope_grants` must read as the empty
+/// (most restrictive) grant, never as the omitted-grant wildcard (`None`).
+#[test]
+fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_bad_scopes", "g1")).unwrap();
+    s.lock_writer()
+        .execute(
+            "UPDATE keys SET allowed_pools=NULL, scope_grants='{\"mcp_server\":\"x\"}' WHERE id='vk_bad_scopes'",
+            [],
+        )
+        .unwrap();
+    let k = s.get_key("vk_bad_scopes").unwrap().unwrap();
+    assert_eq!(k.allowed_scopes, Some(vec![]));
+}

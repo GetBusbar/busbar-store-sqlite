@@ -1139,13 +1139,14 @@ fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
 // grant, never a silent widen: an unparseable `allowed_pools` is the empty set, and an unparseable
 // `scope_grants` adds nothing.
 fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<Vec<ScopeRef>> {
+    // The wildcard is decided on the RAW columns: a present-but-unparseable column is restrictive.
+    if pools.is_none() && other.is_none() {
+        return None;
+    }
     let other: std::collections::BTreeMap<String, Vec<String>> = other
         .as_deref()
         .map(|o| serde_json::from_str(o.trim()).unwrap_or_default())
         .unwrap_or_default();
-    if pools.is_none() && other.is_empty() {
-        return None;
-    }
     let mut list: Vec<ScopeRef> = pools
         .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
         .unwrap_or_default()
