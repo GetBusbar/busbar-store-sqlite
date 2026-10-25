@@ -103,9 +103,14 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 ///
 /// v12 (busbar 1.6.0, the store kind's epoch and slice life, `abi::store::SLICE_TTL_MS` (a)-(c)):
 /// the ONE persisted fleet epoch (`money_epoch`) and each slice's `valid_until_ms`. Additive: a new
-/// table, and a nullable-free `ADD COLUMN` whose default (`-1`, `u64::MAX` bit-for-bit) is exactly the
-/// never-expiring validity every v11 slice was granted, so no open slice changes meaning. The two
-/// `money_slices` indexes (`slot`, `valid_until_ms`) are likewise created by `SCHEMA` on every open.
+/// table, and a `NOT NULL` `ADD COLUMN` (default `-1`, `u64::MAX` bit-for-bit, the never-expiring
+/// validity a v11 slice was granted). The same migrate transaction then stamps every slice still
+/// open (`remaining <> 0`) to expire one `SLICE_TTL_MS` after the upgrade on the store's clock, as
+/// the postgres store does, so money a crashed node stranded under the old never-expires grant is
+/// returned rather than held forever (v11 never shipped in a release); a closed one is stamped at
+/// the upgrade instant. Only rows the `ADD COLUMN` just defaulted are stamped, so a re-open is a
+/// no-op and a fresh v12 database never holds a `-1`. The two `money_slices` indexes (`slot`,
+/// `valid_until_ms`) are created by `SCHEMA` on every open.
 const SCHEMA_VERSION: i64 = 12;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
@@ -342,8 +347,9 @@ CREATE TABLE IF NOT EXISTS money_used (
 -- AUTOINCREMENT: a slice id is never reused, so a late release of a closed slice can never land on
 -- a newer one.
 -- A slice stays a row once it is closed (`remaining` 0): any further release of it answers 0 and is
--- not refused as never granted. `valid_until_ms` is a u64 kept bit-for-bit (-1 = never expires, a
--- v11 slice).
+-- not refused as never granted -- and `sqlite_sequence` (AUTOINCREMENT's high-water) outlives the
+-- sweep that deletes the row, so an id at or below the highest ever granted still answers 0.
+-- `valid_until_ms` is a u64 kept bit-for-bit; the migrate stamps a v11 slice (`-1`) with a real expiry.
 CREATE TABLE IF NOT EXISTS money_slices (
     slice_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     slot           TEXT NOT NULL,
@@ -720,6 +726,23 @@ impl SqliteStore {
             tx.execute(
                 "ALTER TABLE money_slices ADD COLUMN valid_until_ms INTEGER NOT NULL DEFAULT -1",
                 [],
+            )
+            .store()?;
+            // Every row the column was just added to still reads the `-1` default (the only rows
+            // this runs on, so it cannot restamp a later grant). A slice still open was granted by
+            // a build that never expired one: it expires one `SLICE_TTL_MS` after this upgrade on
+            // the store's clock, so money a crashed node stranded is returned, not held forever
+            // (the postgres store's rule). A closed one is stamped at the upgrade instant so the
+            // sweep can forget it; nothing is left at `-1`.
+            let now = self.now_ms();
+            let ttl = busbar_contract::abi::store::SLICE_TTL_MS;
+            tx.execute(
+                "UPDATE money_slices SET valid_until_ms = CASE WHEN remaining <> 0 THEN ?1 ELSE ?2 END \
+                 WHERE valid_until_ms = -1",
+                params![
+                    i64::try_from(now.saturating_add(ttl)).unwrap_or(i64::MAX),
+                    i64::try_from(now).unwrap_or(i64::MAX)
+                ],
             )
             .store()?;
         }
@@ -1989,6 +2012,13 @@ impl RecordStore for SqliteStore {
     }
 
     fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
+        // The column is an integer; a bucket that is not one names no row and is refused (as the
+        // postgres store does) rather than silently purging nothing.
+        if bucket.parse::<i64>().is_err() {
+            return Err(RecordStoreError(format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            )));
+        }
         let mut total = 0u64;
         loop {
             let mut conn = self.lock_writer();

@@ -2,11 +2,15 @@
 [package]
 name = "busbar-store-sqlite-plugin"
 version = "1.6.0"
-publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
-edition = "2021"
-rust-version = "1.97"
+publish.workspace = true   # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
+edition.workspace = true
+rust-version.workspace = true
 description = "First-party signed kind:store plugin cdylib: the SQLite governance store packaged as a droppable busbar plugin exporting the store C ABI. Drop the built library into the plugins folder and set store.module: sqlite."
-license = "Apache-2.0"
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 # cdylib: the DROPPED-IN door (a signed tarball in `plugins/`), exporting `busbar_plugin_door`.

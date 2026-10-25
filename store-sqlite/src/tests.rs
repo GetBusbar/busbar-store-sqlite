@@ -3610,3 +3610,16 @@ fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
     let k = s.get_key("vk_bad_scopes").unwrap().unwrap();
     assert_eq!(k.allowed_scopes, Some(vec![]));
 }
+
+/// A non-integer bucket is refused (as the postgres store does), not silently matched to 0 rows.
+#[test]
+fn purge_metering_before_refuses_a_non_integer_bucket() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    for bad in ["", "abc", "2026-01-01", "1.5"] {
+        let err = s.purge_metering_before(bad).expect_err("refused").0;
+        assert_eq!(
+            err,
+            format!("purge_metering_before: invalid bucket {bad:?}, expected an integer")
+        );
+    }
+}

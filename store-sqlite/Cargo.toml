@@ -2,11 +2,15 @@
 [package]
 name = "busbar-store-sqlite"
 version = "1.6.0"
-publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
-edition = "2021"
-rust-version = "1.97"
+publish.workspace = true   # a first-party plugin crate; shipped linked into busbar or as a signed tarball
+edition.workspace = true
+rust-version.workspace = true
 description = "The SQLite backend for busbar's durable governance store: implements busbar_contract::records::RecordStore on rusqlite (bundled)."
-license = "Apache-2.0"
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 # rlib: THE LOGIC and its one door (`store_door!`, `door::door`, the store v3 table), which exports
@@ -27,6 +31,8 @@ serde_json = { workspace = true }
 # `derive` for the v10 migration's legacy row encoders, the v3 dedupe log's stored answers (and the
 # conformance suite's stand-in bodies).
 serde = { workspace = true }
+# `warn!` for a reason the ABI refusal cannot carry (an `Unavailable` reserve); the host captures it.
+tracing = { workspace = true }
 
 # The `RecordStore` contract conformance suite lives in this crate's own
 # `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins). The one
@@ -35,3 +41,5 @@ serde = { workspace = true }
 # (`abi::store::SLICE_TTL_MS`). Same pinned rev, so one contract links.
 [dev-dependencies]
 busbar-contract = { workspace = true, features = ["test-seal"] }
+# Dev-only: a test subscriber asserts the dropped-reason warning is emitted.
+tracing-subscriber = { workspace = true }

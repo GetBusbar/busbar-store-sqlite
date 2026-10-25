@@ -452,14 +452,17 @@ fn a_grant_is_valid_for_slice_ttl_on_the_stores_clock() {
     reserve(&s, op(3), 0, &[cell(Dimension::Requests, 10)]).expect("all 10 drawable again");
 }
 
-/// v11 -> v12: a slice granted before the crossing keeps the never-expiring validity it was granted,
-/// and the file gains the epoch row's table.
+/// v11 -> v12: a slice a v11 build left open is stamped to expire one `SLICE_TTL_MS` after the
+/// upgrade (as the postgres store does), so money a crashed node stranded under the old
+/// never-expires grant is returned rather than held forever; nothing is left at the `-1` sentinel,
+/// and a second open does not restamp.
 #[test]
-fn a_v11_slice_crosses_to_v12_never_expiring() {
+fn a_v11_slice_expires_one_ttl_after_the_v12_upgrade() {
     let (s, path) = on_file("v11");
     s.v3_window_caps(op(1), &[cap(Dimension::Requests, 10, 1)])
         .expect("caps");
     drop(s);
+    let (slot, _) = slot_of(&key(Dimension::Requests));
     {
         let conn = rusqlite::Connection::open(&path).expect("raw open");
         conn.execute_batch(
@@ -473,30 +476,186 @@ fn a_v11_slice_crosses_to_v12_never_expiring() {
              PRAGMA user_version = 11;",
         )
         .expect("a v11 file");
-        let (slot, _) = slot_of(&key(Dimension::Requests));
         conn.execute(
             "INSERT INTO money_slices (slot, remaining) VALUES (?1, 4)",
             [&slot],
         )
         .expect("a v11 slice");
+        // A closed one, which must not be left at the sentinel either.
+        conn.execute(
+            "INSERT INTO money_slices (slot, remaining) VALUES (?1, 0)",
+            [&slot],
+        )
+        .expect("a v11 closed slice");
         conn.execute(
             "INSERT INTO money_used (slot, used) VALUES (?1, 4)",
             [&slot],
         )
         .expect("its draw");
     }
-    let skew = still_clock();
-    let s = SqliteStore::open(&path, 5000)
-        .expect("reopen at v12")
-        .on_clock(std::sync::Arc::clone(&skew));
-    skew.fetch_add(10 * SLICE_TTL_MS, std::sync::atomic::Ordering::Relaxed);
-    // Still drawn: 6 fit, 7 do not.
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let before = wall();
+    let s = SqliteStore::open(&path, 5000).expect("reopen at v12");
+    let after = wall();
+    {
+        let conn = s.lock_writer();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM money_slices WHERE valid_until_ms = -1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "no slice may be left never-expiring");
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT valid_until_ms FROM money_slices WHERE slice_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (before + SLICE_TTL_MS..=after + SLICE_TTL_MS).contains(&(stamped as u64)),
+            "the open slice expires one TTL after the upgrade: {stamped}"
+        );
+    }
+    drop(s);
+    // A reopen at v12 restamps nothing.
+    let s = SqliteStore::open(&path, 5000).expect("reopen again");
+    let again: i64 = s
+        .lock_writer()
+        .query_row(
+            "SELECT valid_until_ms FROM money_slices WHERE slice_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(again as u64 <= after + SLICE_TTL_MS, "idempotent: {again}");
+    let skew = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(before + SLICE_TTL_MS - 1));
+    let s = s.on_clock(std::sync::Arc::clone(&skew));
+    // Within the TTL it is still drawn: 6 fit, 7 do not.
     assert_eq!(
         reserve(&s, op(2), 0, &[cell(Dimension::Requests, 7)]),
         Err(ReserveRefused::Exhausted { cell: 0 })
     );
-    assert_eq!(release(&s, op(3), 0, &[(1, 4)]), Ok(vec![4]));
-    reserve(&s, op(4), 0, &[cell(Dimension::Requests, 10)]).expect("the release freed all 4");
+    // One TTL past the upgrade its remainder is back in the headroom, and a release returns 0.
+    skew.store(
+        after + SLICE_TTL_MS + 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    assert_eq!(release(&s, op(3), 0, &[(1, 4)]), Ok(vec![0]));
+    reserve(&s, op(4), 0, &[cell(Dimension::Requests, 10)]).expect("the expiry freed all 4");
+}
+
+/// A closed slice answers 0 forever: the sweep forgets the row, but the durable high-water of
+/// granted ids keeps a late release answering 0, while an id never granted still fails.
+#[test]
+fn a_closed_slice_releases_zero_even_after_the_sweep_forgot_it() {
+    let (s, path) = on_file("hwm");
+    let skew = still_clock();
+    let s = s.on_clock(std::sync::Arc::clone(&skew));
+    s.v3_window_caps(op(1), &[cap(Dimension::Requests, 10, 1)])
+        .expect("caps");
+    let g = reserve(&s, op(2), 0, &[cell(Dimension::Requests, 3)]).expect("draw");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(3), 0, &[(id, 3)]), Ok(vec![3]));
+    // Past its validity plus the dedupe retention, the next reserve sweeps the closed row.
+    skew.fetch_add(
+        SLICE_TTL_MS + OP_ID_RETENTION_SECS * 1000 + 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let g2 = reserve(&s, op(4), 0, &[cell(Dimension::Requests, 1)]).expect("draw again");
+    let rows: i64 = s
+        .lock_writer()
+        .query_row(
+            "SELECT COUNT(*) FROM money_slices WHERE slice_id = ?1",
+            [id as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "the sweep forgot the closed row");
+    assert_eq!(release(&s, op(5), 0, &[(id, 3)]), Ok(vec![0]));
+    // Above the highest id ever granted, and zero, were never granted.
+    for bad in [g2[0].slice_id + 1, 0] {
+        assert_eq!(
+            release(&s, op(6), 0, &[(bad, 1)]),
+            Err(OpRefused::Failed(format!(
+                "slice_release: slice {bad} was never granted"
+            )))
+        );
+    }
+    // The high-water survives a reopen.
+    drop(s);
+    let s = SqliteStore::open(&path, 5000)
+        .expect("reopen")
+        .on_clock(std::sync::Arc::clone(&skew));
+    assert_eq!(release(&s, op(7), 0, &[(id, 3)]), Ok(vec![0]));
+    assert!(release(&s, op(8), 0, &[(g2[0].slice_id + 1, 1)]).is_err());
+}
+
+/// A release of an EXPIRED slice returns 0 (expiry already gave the remainder back), and the
+/// headroom is back exactly once.
+#[test]
+fn a_release_of_an_expired_slice_returns_zero_and_headroom_comes_back_once() {
+    let skew = still_clock();
+    let s = capped(Dimension::Requests, 10).on_clock(std::sync::Arc::clone(&skew));
+    let g = reserve(&s, op(1), 0, &[cell(Dimension::Requests, 10)]).expect("draw all");
+    skew.fetch_add(SLICE_TTL_MS + 1, std::sync::atomic::Ordering::Relaxed);
+    // No reserve in between: the release itself applies the expiry.
+    assert_eq!(release(&s, op(2), 0, &[(g[0].slice_id, 10)]), Ok(vec![0]));
+    reserve(&s, op(3), 0, &[cell(Dimension::Requests, 10)]).expect("all 10 back");
+    assert_eq!(
+        reserve(&s, op(4), 0, &[cell(Dimension::Requests, 1)]),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "returned once, not twice"
+    );
+}
+
+/// A write that cannot reach the store answers `Unavailable` (the ABI variant carries no reason),
+/// so the underlying error is logged first.
+#[test]
+fn an_unavailable_reserve_logs_the_dropped_reason() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let s = capped(Dimension::Requests, 10);
+    s.lock_writer()
+        .execute_batch("DROP TABLE money_epoch")
+        .unwrap();
+    let buf = Buf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let r = tracing::subscriber::with_default(sub, || {
+        reserve(&s, op(1), 0, &[cell(Dimension::Requests, 1)])
+    });
+    assert_eq!(r, Err(ReserveRefused::Unavailable));
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("WARN") && log.contains("money_epoch"),
+        "the dropped reason must be logged: {log}"
+    );
 }
 
 /// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
