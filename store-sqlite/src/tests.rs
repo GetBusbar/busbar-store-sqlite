@@ -1154,6 +1154,34 @@ fn migrate_v5_to_v6_backfills_billable_requests_without_wiping_data() {
 }
 
 #[test]
+fn migrate_v5_to_v6_backfills_usage_metering_billable_requests() {
+    // Same hand-built v5 shape as the usage_windows test above, seeding the OTHER table the v6
+    // backfill covers: a `usage_metering` cell stuck at billable_requests=0 with real requests.
+    let dir = tempdir();
+    let file = dir.join("v5_metering.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, requests, billable_requests) \
+             VALUES ('100', 'vk_m', 'p', 'm', 9, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    let rows = s.list_metering(100).unwrap();
+    assert_eq!(rows.len(), 1, "the seeded metering cell must survive");
+    assert_eq!(rows[0].requests, 9);
+    assert_eq!(
+        rows[0].billable_requests, 9,
+        "a v5-era usage_metering cell stuck at billable_requests=0 must be backfilled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn migrate_v5_to_v6_does_not_touch_an_already_nonzero_billable_requests_row() {
     // The backfill's WHERE clause (`billable_requests = 0 AND requests > 0`) must not touch a row
     // that already carries a real, independently-tracked billable_requests value — only the
