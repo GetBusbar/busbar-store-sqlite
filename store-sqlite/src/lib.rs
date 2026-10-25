@@ -104,7 +104,8 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// v12 (busbar 1.6.0, the store kind's epoch and slice life, `abi::store::SLICE_TTL_MS` (a)-(c)):
 /// the ONE persisted fleet epoch (`money_epoch`) and each slice's `valid_until_ms`. Additive: a new
 /// table, and a nullable-free `ADD COLUMN` whose default (`-1`, `u64::MAX` bit-for-bit) is exactly the
-/// never-expiring validity every v11 slice was granted, so no open slice changes meaning.
+/// never-expiring validity every v11 slice was granted, so no open slice changes meaning. The two
+/// `money_slices` indexes (`slot`, `valid_until_ms`) are likewise created by `SCHEMA` on every open.
 const SCHEMA_VERSION: i64 = 12;
 
 /// The task states that are TERMINAL — used ONLY by the v10 migration, to set the `disposition`
@@ -349,6 +350,9 @@ CREATE TABLE IF NOT EXISTS money_slices (
     remaining      INTEGER NOT NULL,
     valid_until_ms INTEGER NOT NULL DEFAULT -1
 ) STRICT;
+-- `slot` serves `expire` (per-cell select/update); `valid_until_ms` serves `sweep_closed`'s delete.
+CREATE INDEX IF NOT EXISTS money_slices_slot_idx ON money_slices (slot);
+CREATE INDEX IF NOT EXISTS money_slices_valid_idx ON money_slices (valid_until_ms);
 -- The ONE fleet epoch (v12, `abi::store::SLICE_TTL_MS` (a)): 0 before any reserve; only a reserve
 -- raises it, nothing lowers it.
 CREATE TABLE IF NOT EXISTS money_epoch (
