@@ -26,7 +26,8 @@ busbar-contract = { workspace = true }
 # The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
 # one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true, features = ["conformance"] }
+busbar-plugin-loader = { workspace = true }
+busbar-test-kit = { workspace = true }
 serde_json = { workspace = true }
 # Dev-only: the conformance test awaits the store v3 calls (`StoreCalls`), which are futures.
 tokio = { workspace = true, features = ["rt"] }
