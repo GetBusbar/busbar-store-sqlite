@@ -1008,135 +1008,6 @@ fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
 }
 
 #[test]
-fn migrate_drops_and_recreates_a_genuinely_older_schema() {
-    // The inverse of the test above: given a database at a version BELOW SCHEMA_VERSION with a
-    // legacy `keys` table shaped incompatibly with the current schema, `migrate()` must actually
-    // drop and recreate it (the `version < SCHEMA_VERSION` guard must admit this case) -- an
-    // inverted comparison (`>` instead of `<`) would leave the incompatible legacy table in place
-    // and the subsequent `put_key` would fail against the wrong column shape.
-    let dir = tempdir();
-    let file = dir.join("legacy.db");
-    {
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE keys (id TEXT PRIMARY KEY); \
-             PRAGMA user_version = 2;",
-        )
-        .unwrap();
-    }
-    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
-        .expect("open() must migrate a genuinely older schema, not fail against the legacy shape");
-    s.put_key(&sample_key("vk_legacy", "g")).expect(
-        "the legacy `keys` table must have been dropped and recreated with the current shape",
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn migrate_v5_to_v6_backfills_billable_requests_without_wiping_data() {
-    // The v5->v6 crossing is the FIRST non-destructive migration this store has ever needed — a
-    // real regression risk `migrate_rerun_at_current_schema_version_does_not_wipe_data`'s own
-    // comment already flags but doesn't itself cover: the legacy-drop block's table-name list
-    // ('keys','store_meta', etc) includes the CURRENT schema's own names, so a naive
-    // `version < SCHEMA_VERSION` bump (5 < 6) would find a real v5 database's OWN 'keys' table and
-    // wipe it, unless the has_legacy check is scoped to pre-v5-ONLY names. Hand-build a real v5
-    // database (current table shapes, PRAGMA user_version=5) with a live key AND a usage_windows
-    // row shaped exactly like the boot-time bug this migration exists to close (billable_requests
-    // stuck at 0 with a real nonzero requests count), then open it through the real store
-    // (triggering migrate()) and assert BOTH that the key survived AND the row was backfilled.
-    let dir = tempdir();
-    let file = dir.join("v5.db");
-    {
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
-             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
-             VALUES ('vk_v5', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) \
-             VALUES (100, 'vk_v5', '', 7, 0)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5i64).unwrap();
-    }
-    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
-        .expect("open() must migrate a real v5 database additively, not fail or wipe it");
-    assert!(
-        s.get_key("vk_v5").unwrap().is_some(),
-        "a real v5 key must survive the v5->v6 migration, not be wiped by the legacy-drop path"
-    );
-    let ledger = s.get_usage("vk_v5", 100).unwrap();
-    assert_eq!(ledger.requests, 7, "requests must be untouched");
-    assert_eq!(
-        ledger.billable_requests, 7,
-        "a v5-era row stuck at billable_requests=0 with real requests must be backfilled exactly \
-         once during the v5->v6 crossing"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn migrate_v5_to_v6_backfills_usage_metering_billable_requests() {
-    // Same hand-built v5 shape as the usage_windows test above, seeding the OTHER table the v6
-    // backfill covers: a `usage_metering` cell stuck at billable_requests=0 with real requests.
-    let dir = tempdir();
-    let file = dir.join("v5_metering.db");
-    {
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO usage_metering (bucket, key_id, provider, model, requests, billable_requests) \
-             VALUES ('100', 'vk_m', 'p', 'm', 9, 0)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5i64).unwrap();
-    }
-    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
-    let rows = s.list_metering(100).unwrap();
-    assert_eq!(rows.len(), 1, "the seeded metering cell must survive");
-    assert_eq!(rows[0].requests, 9);
-    assert_eq!(
-        rows[0].billable_requests, 9,
-        "a v5-era usage_metering cell stuck at billable_requests=0 must be backfilled"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn migrate_v5_to_v6_does_not_touch_an_already_nonzero_billable_requests_row() {
-    // The backfill's WHERE clause (`billable_requests = 0 AND requests > 0`) must not touch a row
-    // that already carries a real, independently-tracked billable_requests value — only the
-    // ambiguous zero-with-nonzero-requests shape is a backfill candidate.
-    let dir = tempdir();
-    let file = dir.join("v5_ok.db");
-    {
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) \
-             VALUES (200, 'vk_v5b', '', 10, 3)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5i64).unwrap();
-    }
-    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
-    let ledger = s.get_usage("vk_v5b", 200).unwrap();
-    assert_eq!(ledger.requests, 10);
-    assert_eq!(
-        ledger.billable_requests, 3,
-        "a row with a real, already-nonzero billable_requests must be left exactly as-is"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn secret_form_from_str_round_trips_every_named_form() {
     assert_eq!(secret_form_from_str("recoverable"), SecretForm::Recoverable);
     assert_eq!(secret_form_from_str("digest"), SecretForm::Digest);
@@ -1728,7 +1599,8 @@ fn task_record(t: &TaskBody) -> PlaneRecord {
         parent: None,
         seq: 0,
         ts: t.updated_at,
-        disposition: if TERMINAL_TASK_STATES.contains(&t.state.as_str()) {
+        disposition: if ["completed", "failed", "canceled", "rejected"].contains(&t.state.as_str())
+        {
             PlaneDisposition::Terminal
         } else {
             PlaneDisposition::Active
@@ -2102,41 +1974,6 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
         0,
         "an ACTIVE task is kept even by a sweep at the end of time"
     );
-}
-
-/// A pre-v10 database crossing to v10 gains the plane tables and keeps every row it already had.
-/// Regression cover for the pre-v5 drop-and-recreate path reaching a live database on a version bump
-/// it has no business touching. (The typed-table crossings v6->v7, v7->v8 and v8->v9 this used to be
-/// three tests for no longer exist; `a_real_v9_database_*` below opens a v9 file the old code wrote.)
-#[test]
-fn migrate_v9_to_v10_adds_the_plane_tables_without_wiping_data() {
-    let dir = tempdir();
-    let file = dir.join("v9.db");
-    {
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute("DROP TABLE plane_records", []).unwrap();
-        conn.execute("DROP TABLE plane_tokens", []).unwrap();
-        conn.execute(
-            "INSERT INTO keys (id, name, key_group, allowed_pools, labels, enabled, \
-             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) \
-             VALUES ('vk_v9', 'n', NULL, NULL, '{}', 1, 'g1', 0, 0, NULL, NULL, 0)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 9i64).unwrap();
-    }
-    let s = SqliteStore::open(file.to_str().unwrap(), 5000)
-        .expect("a v9 database must migrate additively to v10");
-    assert!(
-        s.get_key("vk_v9").unwrap().is_some(),
-        "a real v9 key must survive the v9->v10 crossing"
-    );
-    append_call(&s, &sample_call("vk_v9", 1, 10, "", "h1"))
-        .expect("the newly created plane_records table must be writable after the migration");
-    assert_eq!(list_calls(&s, "vk_v9").len(), 1);
-    assert!(s.redeem_plane_token("ask", "n", 20, 10).unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── The MCP demotion record and the single-use token ledger ─────────────────────────────────
@@ -2743,11 +2580,10 @@ fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
 
 // ── Upgrading a database the OLD code wrote ──────────────────────────────────────────────────
 //
-// `tests/fixtures/` holds two database files byte-for-byte as the old code left them (see the
+// `tests/fixtures/` holds a database file byte-for-byte as the old code left them (see the
 // `gen_*.rs` provenance files beside them): `v6-release-1.0.6.db`, written by the latest RELEASE
-// (store-sqlite v1.0.6 on busbar 1.5.5, schema v6) — the file every existing deployment has — and
-// `v9-origin-dev.db`, written by this repo's pre-port `dev` (schema v9, never released). Each test
-// copies one to a scratch dir, opens it with THIS build, and reads every row back.
+// (store-sqlite v1.0.6 on busbar 1.5.5, schema v6) — the file every existing deployment has. Each test
+// copies it to a scratch dir, opens it with THIS build, and reads every row back.
 
 fn open_fixture(name: &str) -> (std::path::PathBuf, SqliteStore) {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3215,136 +3051,6 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
         "a second migrate must not change a single read"
     );
     drop(s);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_real_v9_database_from_the_pre_port_dev_build_opens_and_upgrades_losslessly() {
-    let (dir, s) = open_fixture("v9-origin-dev.db");
-    assert_the_common_fixture_rows_survived(&s);
-
-    // The typed task rows are now `task` records with the exact body the A2A plane decodes, and the
-    // disposition the plane would have written.
-    let active = get_task(&s, "task_active").expect("the in-flight task survived the upgrade");
-    assert_eq!(active.state, "input-required");
-    assert_eq!(active.artifact_cursor, 3);
-    assert_eq!(active.push_callback, "https://cb.example/x");
-    assert_eq!(
-        (active.created_at, active.updated_at),
-        (1_700_000_000, 1_700_000_100)
-    );
-    assert_eq!(get_task(&s, "task_done").unwrap().state, "completed");
-
-    // Its provenance chain, in order, still linking — and with NO `digest_version`, which the plane
-    // reads as the framing those hashes were sealed under.
-    let events = list_events(&s, "task_active");
-    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-    assert_eq!(events[1].prev_hash, events[0].hash);
-    assert_eq!(events[1].request_id, "req-2");
-    let raw = s
-        .list_plane_records("task_event", &PlaneSelector::Parent("task_active".into()))
-        .unwrap();
-    assert!(!String::from_utf8_lossy(&raw[0]).contains("digest_version"));
-
-    // Retention reads the migrated disposition: the terminal task goes, the interrupted one stays.
-    assert_eq!(
-        s.purge_plane_records_before("task", 1_800_000_000).unwrap(),
-        1
-    );
-    assert!(get_task(&s, "task_done").is_none());
-    assert!(get_task(&s, "task_active").is_some());
-
-    // The demotion is still in force.
-    assert_eq!(
-        list_demotions(&s),
-        vec![demotion("srv_bad", "drift", 1_700_000_060)]
-    );
-    // The spent approval is still spent, under the kind the 1.6.0 kernel redeems with (`ask`, its
-    // `KIND_ASK`). Filed under any other kind, this redemption is told it is the first, and the
-    // approval the 1.5.x node already spent executes a second time after the upgrade.
-    assert!(
-        !s.redeem_plane_token("ask", "nonce_spent", 4_000_000_000, 1_700_000_001)
-            .unwrap(),
-        "DOUBLE SPEND: an approval spent before the upgrade was redeemed again after it"
-    );
-
-    // The call log is LEFT IN PLACE, unread: its rows cannot be re-encoded into the 1.6.0 call body
-    // without forging the chain, and an upgrade must not destroy evidence.
-    let kept: i64 = s
-        .lock_reader()
-        .query_row("SELECT COUNT(*) FROM mcp_calls", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(kept, 1);
-    assert!(s.list_plane_record_parents("call").unwrap().is_empty());
-
-    // The migrated typed tables are gone; everything else is a fresh v10 database's shape.
-    assert_schema_matches_a_fresh_one(&s, &["mcp_calls"]);
-
-    // A SECOND open of the upgraded file is a no-op, not a second migration.
-    let path = dir.join("v9-origin-dev.db");
-    drop(s);
-    let again = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
-    assert_eq!(list_events(&again, "task_active").len(), 2);
-    assert_eq!(list_demotions(&again).len(), 1);
-    drop(again);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// TWO FIRST-OPENS OF ONE UN-MIGRATED FILE. `migrate` gates its destructive pre-v5 drop on the
-/// file's `user_version`, so that version must be the one inside the write transaction. Here a raw
-/// connection plays the process that migrates first: it holds `BEGIN IMMEDIATE`, lays down the
-/// current schema with a marker revision, stamps the current version and commits only after the
-/// second store's `open` is already waiting on the lock. A version read before the lock is still 0
-/// by then, the second open takes the drop path, and the first process's tables are wiped.
-#[test]
-fn a_second_first_open_waiting_on_the_lock_does_not_rerun_the_destructive_migration() {
-    let dir = tempdir();
-    let path = dir.join("two-first-opens.db");
-    let path_str = path.to_str().unwrap().to_string();
-    // An empty file already in WAL mode, so the waiting open's pragmas never need the lock.
-    {
-        let setup = Connection::open(&path).unwrap();
-        setup
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
-            .unwrap();
-    }
-
-    let first = Connection::open(&path).unwrap();
-    first
-        .execute_batch("PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE;")
-        .unwrap();
-    first.execute_batch(SCHEMA).unwrap();
-    first
-        .execute_batch(&format!(
-            "INSERT INTO store_revision (id, revision) VALUES (0, 42); \
-             PRAGMA user_version = {SCHEMA_VERSION};"
-        ))
-        .unwrap();
-
-    let reopened = std::thread::scope(|scope| {
-        let waiter = scope.spawn(|| SqliteStore::open(&path_str, 10_000));
-        // Long enough for the second open to reach its BEGIN IMMEDIATE and wait there.
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        first.execute_batch("COMMIT").unwrap();
-        waiter.join().unwrap()
-    })
-    .expect("the second open waits for the first migration and then opens");
-
-    let revision: i64 = reopened
-        .lock_reader()
-        .query_row(
-            "SELECT revision FROM store_revision WHERE id = 0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        revision, 42,
-        "the second open re-ran the pre-v5 drop against the tables the first open had just \
-         migrated: it gated the drop on a user_version read before it held the write lock"
-    );
-    drop(reopened);
-    drop(first);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

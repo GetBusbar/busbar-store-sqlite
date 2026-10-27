@@ -34,27 +34,19 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
     }
 }
 
-/// Store schema version, kept in `PRAGMA user_version`. The last release (v1.0.6) is v6.
-/// - v5: generic credentials (`keys` + `credentials`), `DELETE` is a tombstone, `store_revision`.
-///   Every bump up to v5 was destructive (1.5.0 was unreleased).
-/// - v6: one-time backfill of `billable_requests` where a v5 write left it 0 beside nonzero `requests`.
-/// - v7-v9: additive typed plane tables, folded into v10's neutral ones.
-/// - v10 (1.6.0): kind-tagged `plane_records` / `plane_tokens`; the v8/v9 typed tables are copied in
-///   and dropped (`mcp_calls` is left unread: its 1.6.0 body is a digest stream no backend can
-///   reconstruct); `keys` gains `scope_grants`, `idp_subject`, `binding_mode`, `minted_by`;
-///   `usage_metering` gains `priced_from_ms` in its key (existing rows copied at 0); open usage
-///   units get their own tables.
-/// - v11/v12: the store v3 state (dedupe log, money slots, epoch). v13 dropped all of it but
-///   `store_ops` (records whose answer is not `"Done"` go) and `schema_records`.
+/// Store schema version, kept in `PRAGMA user_version`. The last release (v1.0.6) is v6, and a file
+/// older than v6 is refused: no release ever wrote one. v6 -> v13 upgrades in place:
+/// - v10 (1.6.0): kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
+///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
+///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
+///   The v6 `mcp_calls` table is left unread: its 1.6.0 body is a digest stream no backend can rebuild.
+/// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
 ///
 /// A file stamped by a later build is refused.
 const SCHEMA_VERSION: i64 = 13;
 
-/// The task states that are TERMINAL, used only by the v10 migration to set `disposition` on a task
-/// row copied out of the legacy `tasks` table. A closed set rather than a negation: a state token
-/// this build has never heard of must read as NOT terminal, so an older build never deletes a task
-/// it does not understand.
-const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+/// The oldest schema any release wrote.
+const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -468,13 +460,13 @@ impl SqliteStore {
         if full {
             with_full_sync(&mut conn, run)
         } else {
-            run(&mut *conn)
+            run(&mut conn)
         }
     }
 
     fn migrate(&self) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
-        // One transaction over the drop, the recreate and the version stamp. The version is read
+        // One transaction over the upgrade and the version stamp. The version is read
         // INSIDE it: every one-time step below is gated on it, and a value read before the lock is
         // stale the moment another process opening the file commits its own migration.
         let tx = conn
@@ -489,38 +481,11 @@ impl SqliteStore {
                  refusing to open"
             )));
         }
-        // Pre-v5 was destructive (unreleased). Gated on `< 5`, never `< SCHEMA_VERSION`: the latter
-        // would wipe a live v5 database's correctly shaped `keys` / `store_meta` on the v5 -> v6 crossing.
-        if version < 5 {
-            let has_legacy: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN \
-                     ('usage_counters','virtual_keys','aws_credentials','usage_ledger','keys','store_meta'))",
-                    [],
-                    |r| r.get(0),
-                )
-                .store()?;
-            if has_legacy {
-                tx.execute_batch(
-                    "DROP TABLE IF EXISTS virtual_keys;
-                     DROP TABLE IF EXISTS aws_credentials;
-                     DROP TABLE IF EXISTS usage_counters;
-                     DROP TABLE IF EXISTS usage_windows;
-                     DROP TABLE IF EXISTS usage_ledger;
-                     DROP TABLE IF EXISTS usage_metering;
-                     DROP TABLE IF EXISTS audit_log;
-                     DROP TABLE IF EXISTS denylist;
-                     DROP TRIGGER IF EXISTS keys_guard_hard_delete;
-                     DROP TRIGGER IF EXISTS keys_cascade_credentials;
-                     DROP TRIGGER IF EXISTS audit_log_no_update;
-                     DROP TRIGGER IF EXISTS audit_log_no_delete;
-                     DROP TABLE IF EXISTS credentials;
-                     DROP TABLE IF EXISTS keys;
-                     DROP TABLE IF EXISTS store_meta;
-                     DROP TABLE IF EXISTS store_revision;",
-                )
-                .store()?;
-            }
+        if version != 0 && version < FIRST_RELEASED_SCHEMA {
+            return Err(RecordStoreError(format!(
+                "sqlite: database schema v{version} predates v{FIRST_RELEASED_SCHEMA}, the oldest \
+                 released schema; refusing to open"
+            )));
         }
         // v10: `usage_metering` gains `priced_from_ms` in its key. Keyed on the column's absence so
         // a re-run is a no-op, and run BEFORE `SCHEMA` so its `IF NOT EXISTS` finds the rebuilt table.
@@ -529,46 +494,13 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
-        // v13: the money state and the dead slots' tables go (idempotent).
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS money_caps;
-             DROP TABLE IF EXISTS money_used;
-             DROP TABLE IF EXISTS money_slices;
-             DROP TABLE IF EXISTS money_epoch;
-             DROP TABLE IF EXISTS journal;
-             DROP TABLE IF EXISTS sessions;",
-        )
-        .store()?;
-        if table_exists(&tx, "store_ops")? {
-            tx.execute("DELETE FROM store_ops WHERE answer <> '\"Done\"'", [])
-                .store()?;
-        }
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
             "INSERT INTO store_revision (id, revision) VALUES (0, 0) ON CONFLICT(id) DO NOTHING",
             [],
         )
         .store()?;
-        // v5 -> v6: a zero `billable_requests` beside nonzero `requests` is either a v5 write that
-        // never split the column out or a fully refunded window, and the stored values cannot tell
-        // them apart. Safe as a blanket backfill only exactly once, at this crossing, because no
-        // genuinely refunded row existed yet; re-running it later would re-bill refunds.
-        if version < 6 {
-            tx.execute(
-                "UPDATE usage_windows SET billable_requests = requests \
-                 WHERE model = '' AND billable_requests = 0 AND requests > 0",
-                [],
-            )
-            .store()?;
-            tx.execute(
-                "UPDATE usage_metering SET billable_requests = requests \
-                 WHERE billable_requests = 0 AND requests > 0",
-                [],
-            )
-            .store()?;
-        }
         add_v10_key_columns(&tx)?;
-        migrate_legacy_plane_tables(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
         tx.commit().store()?;
@@ -673,210 +605,6 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
         }
     }
     Ok(())
-}
-
-/// The legacy (v8/v9) typed plane rows, re-encoded as the opaque bodies the 1.6.0 planes decode.
-/// Field names and order are the plane crates' own, which serialize with `serde_json` as these do.
-mod legacy {
-    #[derive(serde::Serialize)]
-    pub(super) struct TaskBody {
-        pub task_id: String,
-        pub context_id: String,
-        pub principal: String,
-        pub direction: String,
-        pub state: String,
-        pub agent_id: String,
-        pub artifact_cursor: u64,
-        pub push_callback: String,
-        pub created_at: u64,
-        pub updated_at: u64,
-    }
-
-    /// No `digest_version`: a row persisted before that field existed carries none, and the plane
-    /// reads its absence as the framing those rows were sealed under.
-    #[derive(serde::Serialize)]
-    pub(super) struct TaskEventBody {
-        pub task_id: String,
-        pub seq: u64,
-        pub ts: u64,
-        pub kind: String,
-        pub context_id: String,
-        pub principal: String,
-        pub agent_id: String,
-        pub state: String,
-        pub request_id: String,
-        pub prev_hash: String,
-        pub hash: String,
-    }
-
-    #[derive(serde::Serialize)]
-    pub(super) struct DemotionBody {
-        pub server: String,
-        pub reason: String,
-        pub recorded_at: u64,
-    }
-}
-
-/// Every row of the legacy table `table` (none when it does not exist), then the table dropped.
-fn take_table<T>(
-    tx: &Connection,
-    table: &str,
-    sql: &str,
-    f: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
-) -> RecordStoreResult<Vec<T>> {
-    if !table_exists(tx, table)? {
-        return Ok(Vec::new());
-    }
-    let rows = query_all(tx, sql, [], f)?;
-    tx.execute_batch(&format!("DROP TABLE {table}")).store()?;
-    Ok(rows)
-}
-
-/// Copy the v8/v9 typed plane tables into `plane_records` / `plane_tokens`, then drop them, inside
-/// `migrate`'s transaction (a crash leaves the typed tables untouched). A table that is absent is
-/// skipped, which makes this a no-op on a fresh or v6 database and on a second open. A neutral row
-/// already present is newer than any legacy row and is never overwritten.
-///
-/// `mcp_calls` is neither migrated nor dropped: the 1.6.0 `call` body is a digest stream the engine
-/// seals, and re-encoding a typed row into it would forge the chain the engine verifies.
-fn migrate_legacy_plane_tables(tx: &Connection) -> RecordStoreResult<()> {
-    let u = |v: i64| v.max(0) as u64;
-    // The identity is the parent when there is one, else the id itself.
-    let insert = |kind: &str,
-                  id: &str,
-                  seq: u64,
-                  parent: Option<&str>,
-                  ts: u64,
-                  terminal: bool,
-                  body: Vec<u8>|
-     -> RecordStoreResult<()> {
-        tx.execute(
-            "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(kind, identity, seq) DO NOTHING",
-            params![
-                kind,
-                parent.unwrap_or(id),
-                seq as i64,
-                id,
-                parent,
-                ts as i64,
-                if terminal { "terminal" } else { "active" },
-                body
-            ],
-        )
-        .store()
-        .map(drop)
-    };
-
-    let events = take_table(
-        tx,
-        "task_events",
-        "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, request_id, \
-         prev_hash, hash FROM task_events",
-        |r| {
-            Ok(legacy::TaskEventBody {
-                task_id: r.get(0)?,
-                seq: u(r.get(1)?),
-                ts: u(r.get(2)?),
-                kind: r.get(3)?,
-                context_id: r.get(4)?,
-                principal: r.get(5)?,
-                agent_id: r.get(6)?,
-                state: r.get(7)?,
-                request_id: r.get(8)?,
-                prev_hash: r.get(9)?,
-                hash: r.get(10)?,
-            })
-        },
-    )?;
-    for e in events {
-        let (id, body) = (&e.task_id, encode(&e)?);
-        insert(
-            "task_event",
-            id,
-            e.seq,
-            Some(id.as_str()),
-            e.ts,
-            false,
-            body,
-        )?;
-    }
-
-    let tasks = take_table(
-        tx,
-        "tasks",
-        "SELECT task_id, context_id, principal, direction, state, agent_id, \
-         artifact_cursor, push_callback, created_at, updated_at FROM tasks",
-        |r| {
-            Ok(legacy::TaskBody {
-                task_id: r.get(0)?,
-                context_id: r.get(1)?,
-                principal: r.get(2)?,
-                direction: r.get(3)?,
-                state: r.get(4)?,
-                agent_id: r.get(5)?,
-                artifact_cursor: u(r.get(6)?),
-                push_callback: r.get(7)?,
-                created_at: u(r.get(8)?),
-                updated_at: u(r.get(9)?),
-            })
-        },
-    )?;
-    for t in tasks {
-        let terminal = TERMINAL_TASK_STATES.contains(&t.state.as_str());
-        insert(
-            "task",
-            &t.task_id,
-            0,
-            None,
-            t.updated_at,
-            terminal,
-            encode(&t)?,
-        )?;
-    }
-
-    let demotions = take_table(
-        tx,
-        "mcp_demotions",
-        "SELECT server, reason, recorded_at FROM mcp_demotions",
-        |r| {
-            Ok(legacy::DemotionBody {
-                server: r.get(0)?,
-                reason: r.get(1)?,
-                recorded_at: u(r.get(2)?),
-            })
-        },
-    )?;
-    for d in demotions {
-        insert(
-            "demotion",
-            &d.server,
-            0,
-            None,
-            d.recorded_at,
-            false,
-            encode(&d)?,
-        )?;
-    }
-
-    if table_exists(tx, "spent_ask_states")? {
-        // Filed under the token kind `ask` (the kernel's `KIND_ASK`), or a spent nonce is never
-        // consulted and the upgrade hands every unexpired spent approval back for a second use.
-        tx.execute_batch(
-            "INSERT INTO plane_tokens (kind, token, expires_at) \
-               SELECT 'ask', nonce, expires_at FROM spent_ask_states WHERE true \
-               ON CONFLICT(kind, token) DO NOTHING;
-             DROP TABLE spent_ask_states;",
-        )
-        .store()?;
-    }
-    Ok(())
-}
-
-/// `serde_json`-encode one legacy row into the opaque body the plane decodes.
-fn encode<T: serde::Serialize>(row: &T) -> RecordStoreResult<Vec<u8>> {
-    serde_json::to_vec(row)
-        .map_err(|e| RecordStoreError(format!("v10 migration: encode a legacy plane row: {e}")))
 }
 
 // `allowed_scopes` storage. The in-memory grant is `Option<Vec<ScopeRef>>`; on disk it splits by kind
