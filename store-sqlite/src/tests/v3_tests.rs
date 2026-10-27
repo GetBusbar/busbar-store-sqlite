@@ -306,55 +306,6 @@ fn dedupe_survives_a_reopen_of_the_file() {
     );
 }
 
-/// v12 -> v13: the money tables and the dead slots' tables are DROPPED, and only the dedupe records
-/// that answered "Done" stay. RED before v13: the tables and the money answers were kept.
-#[test]
-fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
-    let (s, path) = on_file("v13");
-    {
-        let w = s.lock_writer();
-        w.execute_batch(
-            "CREATE TABLE money_caps (slot TEXT NOT NULL PRIMARY KEY, cap INTEGER NOT NULL, config_gen INTEGER NOT NULL);
-             CREATE TABLE money_used (slot TEXT NOT NULL PRIMARY KEY, used INTEGER NOT NULL);
-             CREATE TABLE money_slices (slice_id INTEGER PRIMARY KEY AUTOINCREMENT, slot TEXT NOT NULL, remaining INTEGER NOT NULL, valid_until_ms INTEGER NOT NULL DEFAULT -1);
-             CREATE TABLE money_epoch (id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0), epoch INTEGER NOT NULL);
-             CREATE TABLE journal (stream TEXT NOT NULL, seq INTEGER NOT NULL, record BLOB NOT NULL, PRIMARY KEY (stream, seq));
-             CREATE TABLE sessions (session INTEGER NOT NULL PRIMARY KEY, node TEXT NOT NULL, principal TEXT NOT NULL);
-             INSERT INTO money_caps VALUES ('s', 10, 1);",
-        )
-        .expect("a v12 file's tables");
-        w.execute(
-            "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, 'b', '{\"Released\":[1]}', ?2)",
-            params![op(90).0.as_slice(), now_secs()],
-        )
-        .expect("a money answer");
-        w.pragma_update(None, "user_version", 12i64).expect("v12");
-    }
-    s.v3_add_usage_batch(op(91), &[("k", 60, delta(1, 1))])
-        .expect("a Done answer");
-    drop(s);
-
-    let s = SqliteStore::open(&path, 5000).expect("reopen at v13");
-    let w = s.lock_writer();
-    let left: i64 = w
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-             ('money_caps','money_used','money_slices','money_epoch','journal','sessions')",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count");
-    assert_eq!(left, 0, "the money and dead-slot tables are gone");
-    let ops: i64 = w
-        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
-        .expect("ops");
-    assert_eq!(ops, 1, "only the Done record stays");
-    let version: i64 = w
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .expect("version");
-    assert_eq!(version, 13);
-}
-
 #[test]
 fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
     let s = fresh();

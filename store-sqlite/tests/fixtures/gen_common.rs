@@ -1,4 +1,4 @@
-// Provenance: shared helpers for the upgrade fixtures (see gen_v6.rs / gen_v9.rs).
+// Provenance: shared helpers for the upgrade fixtures (see gen_v6.rs).
 use busbar_api::*;
 use busbar_store_sqlite::SqliteStore;
 
