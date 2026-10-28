@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
-//! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. Every
-//! one is DURABLE: its state lives in the tables `SCHEMA` creates, on the writer connection. It
-//! holds no money: money is counts x the rate card, derived in busbar's core.
+//! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
+//! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. All
+//! DURABLE: the state lives in the tables `SCHEMA` creates. It holds no money (counts x the rate
+//! card, derived in busbar's core).
 //!
 //! DEDUPE (`abi::store` S1-S4): an `op_id` that APPLIED is recorded in `store_ops` with the op's
-//! value fields and its answer, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect, so
-//! the check, the effect and the record are one atomic step: two racing calls with one `op_id`
-//! apply once, a crash between the effect and the record cannot happen, and a replay after a
-//! restart answers the original. A replay with the same value fields applies nothing; different
-//! value fields are a conflict; a refusal or a failure rolls back and records nothing. Records
-//! older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
+//! value fields and its answer, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect: two
+//! racing calls with one `op_id` apply once, and a replay after a restart answers the original. The
+//! same value fields apply nothing; different ones are a conflict; a refusal rolls back and records
+//! nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -23,12 +21,13 @@ use busbar_contract::records::{
     PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, Retention, UsageDelta,
     UsageLedger, VirtualKey,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 use crate::{
-    add_metering_in, add_usage_in, append_plane_record_in, now_secs, with_full_sync,
-    IntoStoreResult, SqliteStore,
+    add_metering_in, add_usage_in, append_plane_record_in, exec, now_secs, query_all, query_one,
+    SqliteStore,
 };
 
 /// What an applied op answered, stored with it and replayed verbatim.
@@ -49,14 +48,12 @@ enum Seen {
 }
 
 fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreError> {
-    let row: Option<(String, String)> = tx
-        .query_row(
-            "SELECT body, answer FROM store_ops WHERE op_id=?1",
-            params![op.0.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .store()?;
+    let row: Option<(String, String)> = query_one(
+        tx,
+        "SELECT body, answer FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
+        params![op.0.as_slice(), retention_cutoff(now_secs())],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     Ok(match row {
         None => Seen::New,
         Some((b, answer)) if b == body => Seen::Replay(
@@ -67,78 +64,74 @@ fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreE
     })
 }
 
-/// Remember an APPLIED op, and forget every op past its retention.
+/// A row recorded at or before this is past its retention: never honoured, swept in time.
+fn retention_cutoff(now: i64) -> i64 {
+    now.saturating_sub(OP_ID_RETENTION_SECS as i64)
+}
+
+/// Ops recorded between retention sweeps.
+const SWEEP_EVERY: u64 = 256;
+
+/// Remember an APPLIED op; every [`SWEEP_EVERY`]th one also forgets the ops past their retention
+/// (`seen` already ignores them, so the sweep only reclaims space).
 fn record(
     tx: &Transaction<'_>,
     op: OpId,
     body: &str,
     answer: &Answer,
+    sweep: bool,
 ) -> Result<(), RecordStoreError> {
     let now = now_secs();
-    tx.execute(
-        "DELETE FROM store_ops WHERE recorded_at <= ?1",
-        params![now.saturating_sub(OP_ID_RETENTION_SECS as i64)],
-    )
-    .store()?;
+    if sweep {
+        exec(
+            tx,
+            "DELETE FROM store_ops WHERE recorded_at <= ?1",
+            params![retention_cutoff(now)],
+        )?;
+    }
     let answer =
         serde_json::to_string(answer).map_err(|e| RecordStoreError(format!("store_ops: {e}")))?;
-    tx.execute(
-        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+    exec(
+        tx,
+        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, answer=excluded.answer, \
+         recorded_at=excluded.recorded_at",
         params![op.0.as_slice(), body, answer, now],
     )
-    .store()
     .map(drop)
 }
 
 impl SqliteStore {
     /// Run one `op_id`-carrying write in ONE `BEGIN IMMEDIATE` transaction at FULL sync: a replay
-    /// answers the original, a conflict is `conflict`, and a new op runs `apply` and is recorded
-    /// with its answer only if it applied. A refusal from `apply` rolls the transaction back; a
-    /// backend error is `fail`ed.
-    fn deduped<E>(
-        &self,
-        op: OpId,
-        body: &str,
-        conflict: E,
-        fail: fn(RecordStoreError) -> E,
-        apply: impl FnOnce(&Transaction<'_>) -> Result<Answer, E>,
-    ) -> Result<Answer, E> {
-        let mut conn = self.lock_writer();
-        let mut conflict = Some(conflict);
-        let ran = with_full_sync(&mut conn, |conn| {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .store()?;
-            let answer = match seen(&tx, op, body)? {
-                Seen::Replay(a) => Ok(a),
-                Seen::Conflict => Err(conflict.take().expect("taken once")),
-                Seen::New => match apply(&tx) {
-                    Ok(a) => {
-                        record(&tx, op, body, &a)?;
-                        tx.commit().store()?;
-                        Ok(a)
-                    }
-                    Err(e) => Err(e),
-                },
-            };
-            Ok(answer)
-        });
-        ran.unwrap_or_else(|e| Err(fail(e)))
-    }
-
-    /// [`Self::deduped`] for a slot whose refusal is [`OpRefused`].
+    /// answers the original, a conflict applies nothing, and a new op runs `apply` and is recorded
+    /// only if it applied. A refusal from `apply` rolls the transaction back.
     fn op(
         &self,
         op: OpId,
         body: &str,
         apply: impl FnOnce(&Transaction<'_>) -> OpResult<Answer>,
     ) -> OpResult<Answer> {
-        self.deduped(op, body, OpRefused::Conflict, failed, apply)
+        let mut refusal = None;
+        let ran = self.write(true, |tx| {
+            match seen(tx, op, body)? {
+                Seen::Replay(a) => return Ok(a),
+                Seen::Conflict => refusal = Some(OpRefused::Conflict),
+                Seen::New => match apply(tx) {
+                    Ok(a) => {
+                        let n = self.ops_recorded.fetch_add(1, Ordering::Relaxed);
+                        record(tx, op, body, &a, n.is_multiple_of(SWEEP_EVERY))?;
+                        return Ok(a);
+                    }
+                    Err(e) => refusal = Some(e),
+                },
+            }
+            Err(RecordStoreError("op refused".into()))
+        });
+        ran.map_err(|e| refusal.unwrap_or_else(|| failed(e)))
     }
 }
 
-/// The store v3 slots' own bodies: each op's ONE body, which the table's slot answers Ready (the
-/// store is local-disk-bound and never pends).
+/// The slots' own bodies, answered Ready: the store is local-disk-bound and never pends.
 impl SqliteStore {
     pub(crate) fn v3_append_plane_record_op(
         &self,
@@ -153,33 +146,32 @@ impl SqliteStore {
         .map(drop)
     }
 
-    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
-    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
-    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
+    /// An upsert on `(schema, key)`; an EMPTY value removes the row (the host's strike), and
+    /// removing a row that is not there is `Ok`.
     pub(crate) fn v3_record_put(
         &self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
-        if value.is_empty() {
-            return self
-                .lock_writer()
-                .execute(
+        self.write(false, |tx| {
+            (if value.is_empty() {
+                exec(
+                    tx,
                     "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
                     params![schema, key],
                 )
-                .map(drop)
-                .map_err(|e| e.to_string());
-        }
-        self.lock_writer()
-            .execute(
-                "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
-                params![schema, key, value],
-            )
+            } else {
+                exec(
+                    tx,
+                    "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
+                    params![schema, key, value],
+                )
+            })
             .map(drop)
-            .map_err(|e| e.to_string())
+        })
+        .map_err(|e| e.0)
     }
 
     pub(crate) fn v3_record_get(
@@ -187,15 +179,13 @@ impl SqliteStore {
         schema: &str,
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
-        let value: Option<Vec<u8>> = self
-            .lock_reader()
-            .query_row(
-                "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
-                params![schema, key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+        let value: Option<Vec<u8>> = query_one(
+            &self.lock_reader(),
+            "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
+            params![schema, key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.0)?;
         value.map(record_bytes).transpose()
     }
 
@@ -208,41 +198,16 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor).
-        let conn = self.lock_reader();
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = match prefix_successor(prefix) {
-            Some(end) => {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT record_key, value FROM schema_records WHERE schema=?1 \
-                         AND record_key >= ?2 AND record_key < ?3 ORDER BY record_key LIMIT ?4",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![schema, prefix, end, i64::from(limit)], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<_, _>>();
-                rows
-            }
-            None => {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT record_key, value FROM schema_records WHERE schema=?1 \
-                         AND record_key >= ?2 ORDER BY record_key LIMIT ?3",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![schema, prefix, i64::from(limit)], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<_, _>>();
-                rows
-            }
-        }
-        .map_err(|e| e.to_string())?;
+        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); a NULL end
+        // (every byte `0xff`, or empty) is unbounded above.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = query_all(
+            &self.lock_reader(),
+            "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
+             AND (?3 IS NULL OR record_key < ?3) ORDER BY record_key LIMIT ?4",
+            params![schema, prefix, prefix_successor(prefix), i64::from(limit)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.0)?;
         rows.into_iter()
             .map(|(k, v)| Ok((k, record_bytes(v)?)))
             .collect()
@@ -275,11 +240,17 @@ impl SqliteStore {
     }
 }
 
-/// THE STORE v3 TABLE over this store (`abi::sdk::store::StoreSlots`): every slot answers
-/// [`Step::Ready`]. The store is local-disk-bound and never pends, so it makes no connector service
-/// and never touches [`Op`]; the host runs it on its bounded disk lane (THE DESIGN §11.11 R4,
-/// Q-DISK). The 1.5.5 op set (slots 0-32) is ONE body each, the store's [`RecordStore`] impl, which
-/// is exactly the code v1.0.6 shipped.
+/// Each listed slot answers `Step::Ready` over the body named before its argument list.
+macro_rules! ready {
+    ($($name:ident => $via:ident::$body:ident ($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+        fn $name(&self, _: &mut Op<'_>, $($arg: $ty),*) -> Step<$ret> {
+            Step::Ready($via::$body(self, $($arg),*))
+        }
+    )*};
+}
+
+/// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
+/// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const TAIL: Tail = Tail {
         ephemeral: false,
@@ -295,270 +266,39 @@ impl StoreSlots for SqliteStore {
         crate::door::open(settings_str(settings)?)
     }
 
-    fn append_plane_record_op(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        record: PlaneRecordRef<'_>,
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_append_plane_record_op(op, record))
-    }
-
-    fn record_put(
-        &self,
-        _: &mut Op<'_>,
-        schema: &str,
-        key: &[u8],
-        value: &[u8],
-    ) -> Step<Result<(), String>> {
-        Step::Ready(self.v3_record_put(schema, key, value))
-    }
-
-    fn record_get(
-        &self,
-        _: &mut Op<'_>,
-        schema: &str,
-        key: &[u8],
-    ) -> Step<Result<Option<RecordBytes>, String>> {
-        Step::Ready(self.v3_record_get(schema, key))
-    }
-
-    fn record_scan(
-        &self,
-        _: &mut Op<'_>,
-        schema: &str,
-        prefix: &[u8],
-        limit: u32,
-    ) -> Step<Result<Scanned, String>> {
-        Step::Ready(self.v3_record_scan(schema, prefix, limit))
-    }
-
-    fn add_usage_batch(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        cells: &[(&str, u64, UsageDelta)],
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_add_usage_batch(op, cells))
-    }
-
-    fn add_metering_batch(
-        &self,
-        _: &mut Op<'_>,
-        op: OpId,
-        deltas: &[MeteringDelta],
-    ) -> Step<OpResult<()>> {
-        Step::Ready(self.v3_add_metering_batch(op, deltas))
-    }
-
-    // ── the 1.5.5 op set (slots 0-32): the RecordStore impl, one body each ───────────────────────
-
-    fn put_key(&self, _: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::put_key(self, key))
-    }
-
-    fn get_key(&self, _: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<Option<VirtualKey>>> {
-        Step::Ready(RecordStore::get_key(self, id))
-    }
-
-    fn list_keys(&self, _: &mut Op<'_>) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        Step::Ready(RecordStore::list_keys(self))
-    }
-
-    fn delete_key(&self, _: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::delete_key(self, id))
-    }
-
-    fn list_keys_since(
-        &self,
-        _: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        Step::Ready(RecordStore::list_keys_since(self, since))
-    }
-
-    fn get_usage(
-        &self,
-        _: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-    ) -> Step<RecordStoreResult<UsageLedger>> {
-        Step::Ready(RecordStore::get_usage(self, bucket_id, window_start))
-    }
-
-    fn put_usage(
-        &self,
-        _: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-        ledger: &UsageLedger,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::put_usage(
-            self,
-            bucket_id,
-            window_start,
-            ledger,
-        ))
-    }
-
-    fn list_metering(
-        &self,
-        _: &mut Op<'_>,
-        bucket: u64,
-    ) -> Step<RecordStoreResult<Vec<MeteringRow>>> {
-        Step::Ready(RecordStore::list_metering(self, bucket))
-    }
-
-    fn put_credential(
-        &self,
-        _: &mut Op<'_>,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::put_credential(self, secret))
-    }
-
-    fn put_key_with_credential(
-        &self,
-        _: &mut Op<'_>,
-        key: &VirtualKey,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::put_key_with_credential(self, key, secret))
-    }
-
-    fn list_credentials(
-        &self,
-        _: &mut Op<'_>,
-        key_id: &str,
-    ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
-        Step::Ready(RecordStore::list_credentials(self, key_id))
-    }
-
-    fn revoke_credential(
-        &self,
-        _: &mut Op<'_>,
-        id: &str,
-        reason: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::revoke_credential(self, id, reason))
-    }
-
-    fn list_credentials_since(
-        &self,
-        _: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<CredentialSecret>>> {
-        Step::Ready(RecordStore::list_credentials_since(self, since))
-    }
-
-    fn list_audit(&self, _: &mut Op<'_>) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        Step::Ready(RecordStore::list_audit(self))
-    }
-
-    fn add_denylist(&self, _: &mut Op<'_>, sub: &str, reason: &str) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::add_denylist(self, sub, reason))
-    }
-
-    fn list_denylist(&self, _: &mut Op<'_>) -> Step<RecordStoreResult<Vec<String>>> {
-        Step::Ready(RecordStore::list_denylist(self))
-    }
-
-    fn list_audit_tail(
-        &self,
-        _: &mut Op<'_>,
-        limit: u64,
-    ) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        Step::Ready(RecordStore::list_audit_tail(self, limit))
-    }
-
-    fn upsert_plane_record(
-        &self,
-        _: &mut Op<'_>,
-        record: PlaneRecordRef<'_>,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::upsert_plane_record(self, record))
-    }
-
-    fn get_plane_record(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<Option<Vec<u8>>>> {
-        Step::Ready(RecordStore::get_plane_record(self, kind, id))
-    }
-
-    fn list_plane_records(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        selector: &PlaneSelector<'_>,
-    ) -> Step<RecordStoreResult<Vec<Vec<u8>>>> {
-        Step::Ready(RecordStore::list_plane_records(self, kind, selector))
-    }
-
-    fn list_plane_record_parents(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-    ) -> Step<RecordStoreResult<Vec<String>>> {
-        Step::Ready(RecordStore::list_plane_record_parents(self, kind))
-    }
-
-    fn purge_plane_records_before(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        before: u64,
-    ) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(RecordStore::purge_plane_records_before(self, kind, before))
-    }
-
-    fn purge_plane_records(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        before: u64,
-        retention: Retention,
-    ) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(RecordStore::purge_plane_records(
-            self, kind, before, retention,
-        ))
-    }
-
-    fn delete_plane_record(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        Step::Ready(RecordStore::delete_plane_record(self, kind, id))
-    }
-
-    fn redeem_plane_token(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        Step::Ready(RecordStore::redeem_plane_token(
-            self, kind, token, expires_at, now,
-        ))
-    }
-
-    fn plane_token_live(
-        &self,
-        _: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        Step::Ready(RecordStore::plane_token_live(
-            self, kind, token, expires_at, now,
-        ))
+    ready! {
+        append_plane_record_op => Self::v3_append_plane_record_op(op: OpId, record: PlaneRecordRef<'_>) -> OpResult<()>;
+        record_put => Self::v3_record_put(schema: &str, key: &[u8], value: &[u8]) -> Result<(), String>;
+        record_get => Self::v3_record_get(schema: &str, key: &[u8]) -> Result<Option<RecordBytes>, String>;
+        record_scan => Self::v3_record_scan(schema: &str, prefix: &[u8], limit: u32) -> Result<Scanned, String>;
+        add_usage_batch => Self::v3_add_usage_batch(op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()>;
+        add_metering_batch => Self::v3_add_metering_batch(op: OpId, deltas: &[MeteringDelta]) -> OpResult<()>;
+        put_key => RecordStore::put_key(key: &VirtualKey) -> RecordStoreResult<()>;
+        get_key => RecordStore::get_key(id: &str) -> RecordStoreResult<Option<VirtualKey>>;
+        list_keys => RecordStore::list_keys() -> RecordStoreResult<Vec<VirtualKey>>;
+        delete_key => RecordStore::delete_key(id: &str) -> RecordStoreResult<()>;
+        list_keys_since => RecordStore::list_keys_since(since: u64) -> RecordStoreResult<Vec<VirtualKey>>;
+        get_usage => RecordStore::get_usage(bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger>;
+        put_usage => RecordStore::put_usage(bucket_id: &str, window_start: u64, ledger: &UsageLedger) -> RecordStoreResult<()>;
+        list_metering => RecordStore::list_metering(bucket: u64) -> RecordStoreResult<Vec<MeteringRow>>;
+        put_credential => RecordStore::put_credential(secret: &CredentialSecret) -> RecordStoreResult<()>;
+        put_key_with_credential => RecordStore::put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> RecordStoreResult<()>;
+        list_credentials => RecordStore::list_credentials(key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>>;
+        revoke_credential => RecordStore::revoke_credential(id: &str, reason: &str) -> RecordStoreResult<()>;
+        list_credentials_since => RecordStore::list_credentials_since(since: u64) -> RecordStoreResult<Vec<CredentialSecret>>;
+        list_audit => RecordStore::list_audit() -> RecordStoreResult<Vec<AuditRecord>>;
+        add_denylist => RecordStore::add_denylist(sub: &str, reason: &str) -> RecordStoreResult<()>;
+        list_denylist => RecordStore::list_denylist() -> RecordStoreResult<Vec<String>>;
+        list_audit_tail => RecordStore::list_audit_tail(limit: u64) -> RecordStoreResult<Vec<AuditRecord>>;
+        upsert_plane_record => RecordStore::upsert_plane_record(record: PlaneRecordRef<'_>) -> RecordStoreResult<()>;
+        get_plane_record => RecordStore::get_plane_record(kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>>;
+        list_plane_records => RecordStore::list_plane_records(kind: &str, selector: &PlaneSelector<'_>) -> RecordStoreResult<Vec<Vec<u8>>>;
+        list_plane_record_parents => RecordStore::list_plane_record_parents(kind: &str) -> RecordStoreResult<Vec<String>>;
+        purge_plane_records_before => RecordStore::purge_plane_records_before(kind: &str, before: u64) -> RecordStoreResult<u64>;
+        purge_plane_records => RecordStore::purge_plane_records(kind: &str, before: u64, retention: Retention) -> RecordStoreResult<u64>;
+        delete_plane_record => RecordStore::delete_plane_record(kind: &str, id: &str) -> RecordStoreResult<()>;
+        redeem_plane_token => RecordStore::redeem_plane_token(kind: &str, token: &str, expires_at: u64, now: u64) -> RecordStoreResult<bool>;
+        plane_token_live => RecordStore::plane_token_live(kind: &str, token: &str, expires_at: u64, now: u64) -> RecordStoreResult<bool>;
     }
 }
 
@@ -574,8 +314,7 @@ fn record_bytes(v: Vec<u8>) -> Result<RecordBytes, String> {
 }
 
 /// The smallest byte string greater than every string `prefix` starts: the last byte that is not
-/// `0xff` incremented, the rest dropped. `None` when there is none (every byte `0xff`, or empty):
-/// the range is then unbounded above.
+/// `0xff` incremented, the rest dropped. `None` when there is none (every byte `0xff`, or empty).
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let i = prefix.iter().rposition(|&b| b != 0xff)?;
     let mut end = prefix[..=i].to_vec();

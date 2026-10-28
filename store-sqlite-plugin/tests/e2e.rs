@@ -47,7 +47,7 @@
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::slot as lc;
 use busbar_contract::records::{
-    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageLedger,
+    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, Retention, UsageLedger,
     UNIT_INPUT, UNIT_OUTPUT,
 };
 use busbar_plugin_loader::dispatch::kinds::store::Store;
@@ -1138,7 +1138,9 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     // Retention crosses the ABI too, count and all — and both purges are checked for the number
-    // they ACTUALLY removed, because a relay that dropped the return value would read as 0.
+    // they ACTUALLY removed, because a relay that dropped the return value would read as 0. The
+    // task purges carry the terminal-only rule (the host's `purge_plane_records_before` is the age
+    // rule).
     assert_eq!(
         store
             .purge_plane_records_before("call", 2_002)
@@ -1159,14 +1161,16 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
         .is_empty());
     assert_eq!(
         store
-            .purge_plane_records_before("task", 25)
+            .purge_plane_records("task", 25, Retention::TerminalOnly)
             .expect("purge"),
         0,
         "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
          swept no matter how old"
     );
     assert_eq!(
-        store.purge_plane_records_before("task", 31).expect("purge"),
+        store
+            .purge_plane_records("task", 31, Retention::TerminalOnly)
+            .expect("purge"),
         1,
         "the one completed task at updated_at 30 is the only row retention may drop"
     );
