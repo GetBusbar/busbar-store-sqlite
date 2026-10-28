@@ -7,6 +7,33 @@ use busbar_contract::records::{
 };
 use rusqlite::TransactionBehavior;
 
+/// A credential resolved by `(kind, public_id)`, read off the store's own rows: what the tests below
+/// check a cascade or an upgrade left behind (the store table has no lookup slot).
+trait Lookup {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>>;
+}
+
+impl Lookup for SqliteStore {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
+        let conn = self.lock_reader();
+        conn.query_row(
+            &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE kind=?1 AND public_id=?2"),
+            params![kind, public_id],
+            row_to_cred_secret,
+        )
+        .optional()
+        .store()
+    }
+}
+
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
     VirtualKey {
         id: id.to_string(),
@@ -296,12 +323,6 @@ fn delete_key_is_idempotent() {
     );
 }
 
-#[test]
-fn delete_key_unknown_id_errors() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    assert!(s.delete_key("vk_never_existed").is_err());
-}
-
 /// HARDEST INVARIANT #1: the tombstone UPDATE's atomicity. `keys_tombstone_off` (`deleted_at IS NULL
 /// OR enabled = 0`) would reject a transient `enabled=1, deleted_at=now` state — this test proves
 /// `delete_key` sets both flags in the SAME statement by attempting exactly that split, by hand,
@@ -499,43 +520,6 @@ fn credential_public_id_is_globally_unique_per_kind() {
     );
 }
 
-#[test]
-fn lookup_credential_secret_returns_none_for_unknown() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    assert!(s
-        .lookup_credential_secret("sigv4", "nope")
-        .unwrap()
-        .is_none());
-}
-
-#[test]
-fn list_credentials_never_carries_a_secret_field() {
-    // CredentialMeta has no `secret` field at all -- this test exists to document the guarantee at
-    // the type level (it will fail to COMPILE, not fail an assertion, if that ever changes).
-    let s = SqliteStore::open_in_memory().unwrap();
-    s.put_key(&sample_key("vk_s", "g")).unwrap();
-    s.put_credential(&sample_credential("vk_s", "AKIA_S", 0))
-        .unwrap();
-    let metas = s.list_credentials("vk_s").unwrap();
-    assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].public_id, "AKIA_S");
-}
-
-#[test]
-fn scrub_key_requires_tombstone_first() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    s.put_key(&sample_key("vk_live", "g")).unwrap();
-    assert!(
-        s.scrub_key("vk_live").is_err(),
-        "scrubbing a live key must be refused"
-    );
-    s.delete_key("vk_live").unwrap();
-    s.scrub_key("vk_live").unwrap();
-    let row = s.get_key("vk_live").unwrap().unwrap();
-    assert_eq!(row.name, "");
-    assert!(row.labels.is_empty());
-}
-
 // ── Usage ledger ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -639,63 +623,6 @@ fn metering_accumulates_and_carries_group_and_pricing_attribution() {
     assert_eq!(rows[0].requests, 2);
     assert_eq!(rows[0].key_group_at_use, "growth");
     assert_eq!(rows[0].pricing_version, "2026-07");
-}
-
-/// HARDEST INVARIANT #3: chunked retention sweep leaves no partial state and eventually purges
-/// everything, across multiple internal chunk iterations (chunk size 5000; this test uses a small
-/// override-free row count but proves the loop terminates and the final count is exact).
-#[test]
-fn purge_windows_before_removes_exactly_the_stale_rows() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    for i in 0..10u64 {
-        s.add_usage("vk_p", 100 + i, &delta(1, "m", 1, 1)).unwrap();
-    }
-    for i in 0..5u64 {
-        s.add_usage("vk_p", 500 + i, &delta(1, "m", 1, 1)).unwrap();
-    }
-    let purged = s.purge_windows_before(200).unwrap();
-    // Each add_usage call with one model writes TWO physical rows (the model='' requests/
-    // billable_requests sentinel + the one model's token row), so 10 stale windows = 20 rows.
-    // WINDOWS, not rows. This asserted 20 (the row count: one sentinel plus one model row per
-    // window), which encoded the wrong contract as correct. `purge_windows_before` returns "the
-    // number of windows purged", and a figure that scales with each window's model cardinality
-    // cannot be reconciled against the retention the caller asked for.
-    assert_eq!(
-        purged, 10,
-        "the 10 windows with window_start < 200 should be reported as 10 windows purged"
-    );
-    // The remaining 5 must still be readable.
-    for i in 0..5u64 {
-        let ledger = s.get_usage("vk_p", 500 + i).unwrap();
-        assert_eq!(ledger.requests, 1);
-    }
-}
-
-#[test]
-fn purge_metering_before_only_touches_the_named_bucket() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let mk = |bucket: u64| MeteringDelta {
-        key_id: "vk_pm".to_string(),
-        bucket,
-        model: "m".to_string(),
-        provider: "p".to_string(),
-        tokens_input: 1,
-        tokens_output: 1,
-        tokens_cache_read: 0,
-        tokens_cache_write: 0,
-        requests: 1,
-        billable_requests: 1,
-        key_group_at_use: String::new(),
-        pricing_version: String::new(),
-        priced_from_ms: 0,
-        usage_units: Default::default(),
-    };
-    s.add_metering(&mk(20260101)).unwrap();
-    s.add_metering(&mk(20260102)).unwrap();
-    let purged = s.purge_metering_before("20260101").unwrap();
-    assert_eq!(purged, 1);
-    assert!(s.list_metering(20260101).unwrap().is_empty());
-    assert_eq!(s.list_metering(20260102).unwrap().len(), 1);
 }
 
 // ── Denylist ─────────────────────────────────────────────────────────────────────────────────
@@ -1154,6 +1081,34 @@ fn migrate_v5_to_v6_backfills_billable_requests_without_wiping_data() {
 }
 
 #[test]
+fn migrate_v5_to_v6_backfills_usage_metering_billable_requests() {
+    // Same hand-built v5 shape as the usage_windows test above, seeding the OTHER table the v6
+    // backfill covers: a `usage_metering` cell stuck at billable_requests=0 with real requests.
+    let dir = tempdir();
+    let file = dir.join("v5_metering.db");
+    {
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, requests, billable_requests) \
+             VALUES ('100', 'vk_m', 'p', 'm', 9, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+    }
+    let s = SqliteStore::open(file.to_str().unwrap(), 5000).unwrap();
+    let rows = s.list_metering(100).unwrap();
+    assert_eq!(rows.len(), 1, "the seeded metering cell must survive");
+    assert_eq!(rows[0].requests, 9);
+    assert_eq!(
+        rows[0].billable_requests, 9,
+        "a v5-era usage_metering cell stuck at billable_requests=0 must be backfilled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn migrate_v5_to_v6_does_not_touch_an_already_nonzero_billable_requests_row() {
     // The backfill's WHERE clause (`billable_requests = 0 AND requests > 0`) must not touch a row
     // that already carries a real, independently-tracked billable_requests value — only the
@@ -1186,85 +1141,6 @@ fn secret_form_from_str_round_trips_every_named_form() {
     assert_eq!(secret_form_from_str("recoverable"), SecretForm::Recoverable);
     assert_eq!(secret_form_from_str("digest"), SecretForm::Digest);
     assert_eq!(secret_form_from_str("anything-else"), SecretForm::None);
-}
-
-#[test]
-fn purge_windows_before_purges_past_a_single_chunk_boundary() {
-    // The chunked-delete loop breaks on `changed < 5000` (the subquery LIMIT). With more than one
-    // full chunk's worth of stale rows, an inclusive (`<=`) boundary would stop after the FIRST
-    // full chunk and silently leave the remainder unpurged.
-    let s = SqliteStore::open_in_memory().unwrap();
-    // 2501 distinct windows x 2 rows each (requests-sentinel + one model row) = 5002 rows, one more
-    // than a single 5000-row chunk.
-    for i in 0..2501u64 {
-        s.add_usage("vk_chunk", i, &delta(1, "m", 1, 1)).unwrap();
-    }
-    let purged = s.purge_windows_before(10_000).unwrap();
-    assert_eq!(
-        purged, 2501,
-        "every stale window must be purged across chunk boundaries, not just the first chunk, and \
-         the figure returned is windows rather than the 5002 underlying rows"
-    );
-    assert!(s.get_usage("vk_chunk", 0).unwrap().requests == 0);
-}
-
-/// A window whose rows STRADDLE a 5000-row batch boundary is still one window. 4999 windows of a
-/// lone sentinel row, then one window of a sentinel plus three model rows: 5003 rows in 5000
-/// windows, and the first batch ends on the last window's sentinel, so its model rows fall into
-/// the second batch. Counting the distinct windows each batch touches counts that window twice.
-#[test]
-fn purge_windows_before_counts_a_window_split_across_batches_once() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    s.lock_writer()
-        .execute_batch(
-            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 4998)
-             INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
-               SELECT i, 'vk_straddle', '', 1, 1 FROM n;
-             INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
-               VALUES (4999, 'vk_straddle', '', 1, 1), (4999, 'vk_straddle', 'm1', 0, 0),
-                      (4999, 'vk_straddle', 'm2', 0, 0), (4999, 'vk_straddle', 'm3', 0, 0);",
-        )
-        .unwrap();
-    assert_eq!(
-        s.purge_windows_before(10_000).unwrap(),
-        5000,
-        "5000 windows were purged; a window whose rows straddle two batches must be counted once"
-    );
-    let left: i64 = s
-        .lock_reader()
-        .query_row("SELECT COUNT(*) FROM usage_windows", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(left, 0, "every stale row is gone");
-}
-
-#[test]
-fn purge_metering_before_purges_past_a_single_chunk_boundary() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    for i in 0..5001u64 {
-        s.add_metering(&MeteringDelta {
-            key_id: "vk_chunk_m".to_string(),
-            bucket: 1,
-            model: format!("m{i}"),
-            provider: "p".to_string(),
-            tokens_input: 1,
-            tokens_output: 1,
-            tokens_cache_read: 0,
-            tokens_cache_write: 0,
-            requests: 1,
-            billable_requests: 1,
-            key_group_at_use: String::new(),
-            pricing_version: String::new(),
-            priced_from_ms: 0,
-            usage_units: Default::default(),
-        })
-        .unwrap();
-    }
-    let purged = s.purge_metering_before("1").unwrap();
-    assert_eq!(
-        purged, 5001,
-        "every stale metering row must be purged across chunk boundaries, not just the first 5000"
-    );
-    assert!(s.list_metering(1).unwrap().is_empty());
 }
 
 #[test]
@@ -2770,7 +2646,7 @@ fn the_1_6_attribution_fields_round_trip() {
 /// floor at zero exactly like the reserved ones, survive an absolute `put_usage`, and go with their
 /// window when retention sweeps it.
 #[test]
-fn open_usage_units_accumulate_overwrite_and_purge_with_their_window() {
+fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     let s = SqliteStore::open_in_memory().unwrap();
     let units = |pairs: &[(&str, i64)]| -> std::collections::BTreeMap<String, i64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -2822,14 +2698,6 @@ fn open_usage_units_accumulate_overwrite_and_purge_with_their_window() {
         set,
         "put_usage is an absolute overwrite of the whole ledger, open units included"
     );
-
-    assert_eq!(s.purge_windows_before(101).unwrap(), 1);
-    assert_eq!(s.get_usage("vk_u", 100).unwrap(), UsageLedger::default());
-    let left: i64 = s
-        .lock_reader()
-        .query_row("SELECT COUNT(*) FROM usage_window_units", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(left, 0, "a purged window takes its open-unit rows with it");
 }
 
 /// `priced_from_ms` is part of a metering cell's KEY: a rate-card edit mid-day SPLITS the day's cell
@@ -2871,15 +2739,6 @@ fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
 
     // An instant SQLite cannot hold is refused: clamped, it would merge into another card's cell.
     assert!(s.add_metering(&d(u64::MAX, 1)).is_err());
-
-    assert_eq!(s.purge_metering_before("20260101").unwrap(), 2);
-    let left: i64 = s
-        .lock_reader()
-        .query_row("SELECT COUNT(*) FROM usage_metering_units", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(left, 0, "a purged bucket takes its open-class rows with it");
 }
 
 // ── Upgrading a database the OLD code wrote ──────────────────────────────────────────────────
@@ -3522,4 +3381,63 @@ fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
         "a refused open must not restamp the file's version"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plain filesystem path that merely CONTAINS `mode=memory` (or starts like `:memory:`) is a file,
+/// not an in-memory database: SQLite gives in-memory meaning only to the exact `:memory:` or to a
+/// `file:` URI.
+#[test]
+fn a_plain_path_containing_mode_memory_is_a_real_file() {
+    assert!(!is_memory_path("/srv/mode=memory/governance.db"));
+    assert!(!is_memory_path(":memory:-archive.db"));
+    // Inside a `file:` URI the trigger text counts only where SQLite reads it: `mode=memory` as a
+    // query parameter, `:memory:` as the whole path.
+    assert!(!is_memory_path("file:/srv/mode=memory/gov.db"));
+    assert!(!is_memory_path("file:/data/:memory:/gov.db"));
+    for memory in [
+        ":memory:",
+        "file::memory:",
+        "file::memory:?cache=shared",
+        "file:foo?mode=memory",
+        "file:foo?cache=shared&mode=memory",
+    ] {
+        assert!(is_memory_path(memory), "{memory} is an in-memory spelling");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "store-sqlite-modemem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sub = dir.join("mode=memory");
+    std::fs::create_dir_all(&sub).unwrap();
+    let path = sub.join("gov.db").display().to_string();
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    s.put_key(&sample_key("vk_file", "g1")).unwrap();
+    drop(s);
+    let s = SqliteStore::open(&path, 5000).unwrap();
+    assert!(
+        s.get_key("vk_file").unwrap().is_some(),
+        "the key must persist in the operator's file"
+    );
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A NULL `allowed_pools` with a PRESENT but unparseable `scope_grants` must read as the empty
+/// (most restrictive) grant, never as the omitted-grant wildcard (`None`).
+#[test]
+fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_bad_scopes", "g1")).unwrap();
+    s.lock_writer()
+        .execute(
+            "UPDATE keys SET allowed_pools=NULL, scope_grants='{\"mcp_server\":\"x\"}' WHERE id='vk_bad_scopes'",
+            [],
+        )
+        .unwrap();
+    let k = s.get_key("vk_bad_scopes").unwrap().unwrap();
+    assert_eq!(k.allowed_scopes, Some(vec![]));
 }

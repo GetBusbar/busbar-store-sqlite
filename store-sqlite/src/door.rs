@@ -35,6 +35,8 @@ busbar_contract::store_door!(
 /// { "db_path": "busbar-governance.db", "busy_timeout_ms": 5000 }
 /// ```
 ///
+/// Any other top-level key is refused, and an empty or blank `db_path` is refused.
+///
 /// A key that is ABSENT falls back to its default (this plugin's whole design point — an empty
 /// `{}` must work), and so does a key whose value is an explicit JSON `null`: `null` is read as
 /// absent, the semantics this plugin has shipped with since busbar 1.5. A key that is PRESENT with
@@ -56,7 +58,7 @@ pub fn open(cfg: &str) -> Result<SqliteStore, String> {
 pub struct Settings {
     /// The database file (or an in-memory spelling).
     pub db_path: String,
-    /// SQLite's busy timeout, in ms; never negative.
+    /// SQLite's busy timeout, in ms; never negative, at most `i32::MAX`.
     pub busy_timeout_ms: i64,
 }
 
@@ -72,8 +74,26 @@ impl Settings {
         } else {
             serde_json::from_str(cfg).map_err(|e| format!("invalid sqlite plugin config: {e}"))?
         };
+        // A top-level key this plugin does not read is a typo or a setting for another backend; it
+        // must not be swallowed into quietly opening the default path.
+        if let Some(obj) = v.as_object() {
+            if let Some(unknown) = obj
+                .keys()
+                .find(|k| !matches!(k.as_str(), "db_path" | "busy_timeout_ms"))
+            {
+                return Err(format!(
+                    "{BAD}: unknown setting `{unknown}` (accepted: db_path, busy_timeout_ms)"
+                ));
+            }
+        }
         let path = match v.get("db_path") {
             None | Some(serde_json::Value::Null) => "busbar-governance.db".to_owned(),
+            Some(serde_json::Value::String(s)) if s.trim().is_empty() => {
+                return Err(format!(
+                    "{BAD}: `db_path` must not be empty or blank (omit it for the default \
+                     `busbar-governance.db`, or name a file, or `:memory:`)"
+                ))
+            }
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) => {
                 return Err(format!(
@@ -100,6 +120,12 @@ impl Settings {
                 if ms < 0 {
                     return Err(format!(
                         "{BAD}: `busy_timeout_ms` must not be negative, got {ms}"
+                    ));
+                }
+                if ms > i64::from(i32::MAX) {
+                    return Err(format!(
+                        "{BAD}: `busy_timeout_ms` must be at most 2147483647 (SQLite's busy_timeout is a \
+                         32-bit millisecond count; a larger value silently disables it), got {ms}"
                     ));
                 }
                 ms
