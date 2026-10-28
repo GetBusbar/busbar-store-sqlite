@@ -968,7 +968,11 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
 
 /// [`RecordStore::append_plane_record`]'s occupancy check and insert, inside the caller's transaction.
 fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-    let row = PlaneRow::of(record, "append_plane_record")?;
+    let row = PlaneRow::of(
+        record,
+        record.parent.unwrap_or(record.id),
+        "append_plane_record",
+    )?;
     let existing: Option<StoredPlaneRow> = tx
         .query_row(
             "SELECT id, parent, ts, disposition, body FROM plane_records \
@@ -1380,7 +1384,8 @@ impl RecordStore for SqliteStore {
     // handed back by a power cut is worse than a slow commit.
 
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        let row = PlaneRow::of(record, "upsert_plane_record")?;
+        // Keyed on the record's own id, parent or not: the contract upserts by `(kind, id)`.
+        let row = PlaneRow::of(record, record.id, "upsert_plane_record")?;
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
@@ -1564,9 +1569,11 @@ struct PlaneRow {
 impl PlaneRow {
     /// Refused rather than mangled: a `u64` past `i64::MAX` would wrap negative and read back
     /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
-    fn of(record: PlaneRecordRef<'_>, method: &str) -> RecordStoreResult<Self> {
+    /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
+    /// upserted record's own id.
+    fn of(record: PlaneRecordRef<'_>, identity: &str, method: &str) -> RecordStoreResult<Self> {
         Ok(Self {
-            identity: record.parent.unwrap_or(record.id).to_string(),
+            identity: identity.to_string(),
             seq: as_storable_i64(method, "seq", record.seq)?,
             ts: as_storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
