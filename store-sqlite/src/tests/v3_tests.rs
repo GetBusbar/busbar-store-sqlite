@@ -175,7 +175,7 @@ fn an_op_id_is_forgotten_after_its_retention() {
             params![old, op(1).0.as_slice()],
         )
         .expect("age");
-    // Recording another op sweeps the expired one; the old op_id then reads as new.
+    // The expired op_id reads as new, whether or not a sweep has run.
     s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
         .expect("b");
     s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
@@ -184,6 +184,37 @@ fn an_op_id_is_forgotten_after_its_retention() {
         RecordStore::get_usage(&s, "k", 60).expect("read").requests,
         2
     );
+}
+
+/// An expired row is not honoured when no sweep has run: the sweep fires on op 0 and every 256th,
+/// so after op 0 the aged row below is still in the table when its op_id returns.
+#[test]
+fn an_expired_op_id_is_not_honoured_before_any_sweep() {
+    let s = fresh();
+    s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
+        .expect("a");
+    s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
+        .expect("b");
+    let old = now_secs() - OP_ID_RETENTION_SECS as i64;
+    s.lock_writer()
+        .execute(
+            "UPDATE store_ops SET recorded_at=?1 WHERE op_id=?2",
+            params![old, op(2).0.as_slice()],
+        )
+        .expect("age");
+    let rows = |s: &crate::SqliteStore| -> i64 {
+        s.lock_writer()
+            .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+            .expect("count")
+    };
+    assert_eq!(rows(&s), 2, "no sweep has run since the aging");
+    s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
+        .expect("applies again, not replayed");
+    assert_eq!(
+        RecordStore::get_usage(&s, "j", 60).expect("read").requests,
+        2
+    );
+    assert_eq!(rows(&s), 2, "the row was refreshed in place");
 }
 
 #[test]
