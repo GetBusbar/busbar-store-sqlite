@@ -446,7 +446,7 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
 #[test]
 fn the_statement_declares_every_top_level_setting_may_hold_a_secret_reference() {
     let stated = busbar_contract::abi::mechanism::rendering::read(
-        &rendering_of(door).expect("the door renders"),
+        &rendering_of_macro(MACRO_DOOR).expect("the door renders"),
     )
     .expect("the rendering reads back");
     assert_eq!(stated.secret_refs, ["*".to_string()]);
