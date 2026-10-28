@@ -13,7 +13,20 @@ use crate::SqliteStore;
 /// The store's name, as its Statement states it and its signed manifest names it.
 pub const NAME: &str = "busbar-store-sqlite";
 
-busbar_contract::store_door!(SqliteStore, NAME, env!("CARGO_PKG_VERSION"), 64);
+/// The settings paths this store declares may hold a secret reference: `*`, every top-level key.
+/// busbar 1.5.5 resolved a reference at any top-level store setting (a `license_key`, a `db_path`
+/// read from the environment), and busbar now resolves one only where the Statement declares it,
+/// refusing it anywhere else; declaring every key keeps each 1.5.5 config booting as it did.
+const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
+    &[busbar_contract::abi::sdk::door::abi_str("*")];
+
+busbar_contract::store_door!(
+    SqliteStore,
+    NAME,
+    env!("CARGO_PKG_VERSION"),
+    64,
+    secret_refs: SECRET_REFS
+);
 
 /// Construct a SQLite store from the settings the host passes through `open`. Shape (both keys
 /// optional, sensible defaults so an empty `{}` works):
