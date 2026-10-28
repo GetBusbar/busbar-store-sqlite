@@ -7,7 +7,7 @@
 //! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
 //!
 //! [`door::door`] answers the store v3 table over [`SqliteStore`] through the contract's store SDK:
-//! the 1.5.5 op set is the [`RecordStore`] implementation below, the v3 additions are in `v3`. A
+//! the base op set is the [`RecordStore`] implementation below, the v3 additions are in `v3`. A
 //! build that links this crate registers `door`; the `busbar-store-sqlite-plugin` cdylib exports it.
 
 #![forbid(unsafe_code)]
@@ -34,12 +34,12 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
     }
 }
 
-/// Store schema version, kept in `PRAGMA user_version`. The last release (v1.0.6) is v6, and a file
-/// older than v6 is refused: no release ever wrote one. v6 -> v13 upgrades in place:
-/// - v10 (1.6.0): kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
+/// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
+/// release ever wrote one. v6 -> v13 upgrades in place:
+/// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
 ///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
 ///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
-///   The v6 `mcp_calls` table is left unread: its 1.6.0 body is a digest stream no backend can rebuild.
+///   The v6 `mcp_calls` table is left unread: its body is a digest stream no backend can rebuild.
 /// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
 ///
 /// A file stamped by a later build is refused.
@@ -600,7 +600,7 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 }
 
 /// The v10 `keys` columns: nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as before
-/// (no non-pool scope grant, `None` for the 1.6.0 attribution fields).
+/// (no non-pool scope grant, `None` for the attribution fields).
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     const COLUMNS: [(&str, &str); 5] = [
         (
