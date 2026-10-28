@@ -242,10 +242,12 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
   BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
--- An appended chain record (one with a parent) is never rewritten. No no-delete counterpart: these
--- rows have a retention sweep, and bounded retention is not an integrity claim.
+-- An appended chain record (one filed at its parent: identity = parent) is never rewritten; an
+-- upserted record that names a parent lives at its own id and is rewritten by its next upsert.
+-- No no-delete counterpart: these rows have a retention sweep, and bounded retention is not an
+-- integrity claim.
 CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plane_records
-  WHEN OLD.parent IS NOT NULL
+  WHEN OLD.parent IS NOT NULL AND OLD.identity = OLD.parent
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ";
 
@@ -509,6 +511,10 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
+        // The chain trigger's condition narrowed to appended records (upsert-by-id): a file opened
+        // by an older build holds the old one, and `SCHEMA` creates it only if it is absent.
+        tx.execute_batch("DROP TRIGGER IF EXISTS plane_records_chain_no_update;")
+            .store()?;
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
             "INSERT INTO store_revision (id, revision) VALUES (0, 0) ON CONFLICT(id) DO NOTHING",
@@ -968,7 +974,11 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
 
 /// [`RecordStore::append_plane_record`]'s occupancy check and insert, inside the caller's transaction.
 fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-    let row = PlaneRow::of(record, "append_plane_record")?;
+    let row = PlaneRow::of(
+        record,
+        record.parent.unwrap_or(record.id),
+        "append_plane_record",
+    )?;
     let existing: Option<StoredPlaneRow> = tx
         .query_row(
             "SELECT id, parent, ts, disposition, body FROM plane_records \
@@ -1380,7 +1390,8 @@ impl RecordStore for SqliteStore {
     // handed back by a power cut is worse than a slow commit.
 
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        let row = PlaneRow::of(record, "upsert_plane_record")?;
+        // Keyed on the record's own id, parent or not: the contract upserts by `(kind, id)`.
+        let row = PlaneRow::of(record, record.id, "upsert_plane_record")?;
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
@@ -1564,9 +1575,11 @@ struct PlaneRow {
 impl PlaneRow {
     /// Refused rather than mangled: a `u64` past `i64::MAX` would wrap negative and read back
     /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
-    fn of(record: PlaneRecordRef<'_>, method: &str) -> RecordStoreResult<Self> {
+    /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
+    /// upserted record's own id.
+    fn of(record: PlaneRecordRef<'_>, identity: &str, method: &str) -> RecordStoreResult<Self> {
         Ok(Self {
-            identity: record.parent.unwrap_or(record.id).to_string(),
+            identity: identity.to_string(),
             seq: as_storable_i64(method, "seq", record.seq)?,
             ts: as_storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
