@@ -20,7 +20,7 @@ use busbar_contract::records::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// rusqlite error -> `RecordStoreError` (the contract crate stays storage-free, so the `From` impl
@@ -371,6 +371,8 @@ pub struct SqliteStore {
     /// The writer's current `synchronous` mode (FULL = true), so the PRAGMA is issued only on a
     /// change. Read and written only under the `writer` lock.
     writer_full: AtomicBool,
+    /// Ops recorded since open, pacing the `store_ops` retention sweep.
+    ops_recorded: AtomicU64,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     path: String,
@@ -409,6 +411,7 @@ impl SqliteStore {
         let store = Self {
             writer: Mutex::new(writer_conn),
             writer_full: AtomicBool::new(false),
+            ops_recorded: AtomicU64::new(0),
             readers,
             next_reader: AtomicUsize::new(0),
             path: path.to_string(),
@@ -425,6 +428,7 @@ impl SqliteStore {
         let store = Self {
             writer: Mutex::new(conn),
             writer_full: AtomicBool::new(false),
+            ops_recorded: AtomicU64::new(0),
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
             path: ":memory:".to_string(),

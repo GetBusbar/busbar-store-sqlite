@@ -23,6 +23,7 @@ use busbar_contract::records::{
 };
 use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 use crate::{
     add_metering_in, add_usage_in, append_plane_record_in, exec, now_secs, query_all, query_one,
@@ -49,8 +50,8 @@ enum Seen {
 fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreError> {
     let row: Option<(String, String)> = query_one(
         tx,
-        "SELECT body, answer FROM store_ops WHERE op_id=?1",
-        params![op.0.as_slice()],
+        "SELECT body, answer FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
+        params![op.0.as_slice(), retention_cutoff(now_secs())],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok(match row {
@@ -63,24 +64,38 @@ fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreE
     })
 }
 
-/// Remember an APPLIED op, and forget every op past its retention.
+/// A row recorded at or before this is past its retention: never honoured, swept in time.
+fn retention_cutoff(now: i64) -> i64 {
+    now.saturating_sub(OP_ID_RETENTION_SECS as i64)
+}
+
+/// Ops recorded between retention sweeps.
+const SWEEP_EVERY: u64 = 256;
+
+/// Remember an APPLIED op; every [`SWEEP_EVERY`]th one also forgets the ops past their retention
+/// (`seen` already ignores them, so the sweep only reclaims space).
 fn record(
     tx: &Transaction<'_>,
     op: OpId,
     body: &str,
     answer: &Answer,
+    sweep: bool,
 ) -> Result<(), RecordStoreError> {
     let now = now_secs();
-    exec(
-        tx,
-        "DELETE FROM store_ops WHERE recorded_at <= ?1",
-        params![now.saturating_sub(OP_ID_RETENTION_SECS as i64)],
-    )?;
+    if sweep {
+        exec(
+            tx,
+            "DELETE FROM store_ops WHERE recorded_at <= ?1",
+            params![retention_cutoff(now)],
+        )?;
+    }
     let answer =
         serde_json::to_string(answer).map_err(|e| RecordStoreError(format!("store_ops: {e}")))?;
     exec(
         tx,
-        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, answer=excluded.answer, \
+         recorded_at=excluded.recorded_at",
         params![op.0.as_slice(), body, answer, now],
     )
     .map(drop)
@@ -103,7 +118,8 @@ impl SqliteStore {
                 Seen::Conflict => refusal = Some(OpRefused::Conflict),
                 Seen::New => match apply(tx) {
                     Ok(a) => {
-                        record(tx, op, body, &a)?;
+                        let n = self.ops_recorded.fetch_add(1, Ordering::Relaxed);
+                        record(tx, op, body, &a, n.is_multiple_of(SWEEP_EVERY))?;
                         return Ok(a);
                     }
                     Err(e) => refusal = Some(e),
