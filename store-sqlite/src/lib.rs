@@ -20,7 +20,7 @@ use busbar_contract::records::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// rusqlite error -> `RecordStoreError` (the contract crate stays storage-free, so the `From` impl
@@ -328,19 +328,6 @@ fn apply_pragmas(
     Ok(())
 }
 
-/// Run `f` with the writer escalated to `synchronous=FULL` for security- and billing-relevant
-/// transactions. SQLite refuses to change `synchronous` inside a transaction, so the escalation
-/// happens BEFORE `f` opens its transaction and the restore AFTER it returns, on success or error.
-fn with_full_sync<T>(
-    conn: &mut Connection,
-    f: impl FnOnce(&mut Connection) -> RecordStoreResult<T>,
-) -> RecordStoreResult<T> {
-    conn.pragma_update(None, "synchronous", "FULL").store()?;
-    let result = f(conn);
-    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
-    result
-}
-
 /// Every row of `sql`, mapped by `f`.
 fn query_all<T>(
     conn: &Connection,
@@ -348,12 +335,31 @@ fn query_all<T>(
     params: impl rusqlite::Params,
     f: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
 ) -> RecordStoreResult<Vec<T>> {
-    conn.prepare(sql)
+    conn.prepare_cached(sql)
         .store()?
         .query_map(params, f)
         .store()?
         .collect::<Result<Vec<_>, _>>()
         .store()
+}
+
+/// The one row of `sql` mapped by `f`, if any (statement cached per connection).
+fn query_one<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    f: impl FnOnce(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> RecordStoreResult<Option<T>> {
+    conn.prepare_cached(sql)
+        .store()?
+        .query_row(params, f)
+        .optional()
+        .store()
+}
+
+/// Execute `sql` through the connection's statement cache; the rows changed.
+fn exec(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> RecordStoreResult<usize> {
+    conn.prepare_cached(sql).store()?.execute(params).store()
 }
 
 /// Embedded SQLite `Store` backend. One mutex-guarded writer connection (all mutations, `BEGIN
@@ -362,6 +368,9 @@ fn query_all<T>(
 /// `query_only` reader connections.
 pub struct SqliteStore {
     writer: Mutex<Connection>,
+    /// The writer's current `synchronous` mode (FULL = true), so the PRAGMA is issued only on a
+    /// change. Read and written only under the `writer` lock.
+    writer_full: AtomicBool,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     path: String,
@@ -399,6 +408,7 @@ impl SqliteStore {
         }
         let store = Self {
             writer: Mutex::new(writer_conn),
+            writer_full: AtomicBool::new(false),
             readers,
             next_reader: AtomicUsize::new(0),
             path: path.to_string(),
@@ -414,6 +424,7 @@ impl SqliteStore {
         apply_pragmas(&conn, ":memory:", 5000, true)?;
         let store = Self {
             writer: Mutex::new(conn),
+            writer_full: AtomicBool::new(false),
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
             path: ":memory:".to_string(),
@@ -448,20 +459,20 @@ impl SqliteStore {
         full: bool,
         f: impl FnOnce(&Transaction<'_>) -> RecordStoreResult<T>,
     ) -> RecordStoreResult<T> {
-        let run = |conn: &mut Connection| -> RecordStoreResult<T> {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .store()?;
-            let out = f(&tx)?;
-            tx.commit().store()?;
-            Ok(out)
-        };
         let mut conn = self.lock_writer();
-        if full {
-            with_full_sync(&mut conn, run)
-        } else {
-            run(&mut conn)
+        // SQLite refuses to change `synchronous` inside a transaction, so the mode is set BEFORE
+        // the transaction opens, and only when it differs from the connection's current one.
+        if self.writer_full.load(Ordering::Relaxed) != full {
+            conn.pragma_update(None, "synchronous", if full { "FULL" } else { "NORMAL" })
+                .store()?;
+            self.writer_full.store(full, Ordering::Relaxed);
         }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .store()?;
+        let out = f(&tx)?;
+        tx.commit().store()?;
+        Ok(out)
     }
 
     fn migrate(&self) -> RecordStoreResult<()> {
@@ -679,8 +690,12 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
     })
 }
 
-const KEY_COLS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
-     expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by,idp_provider";
+macro_rules! key_cols {
+    () => {
+        "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,\
+         expires_at,deleted_at,revision,scope_grants,idp_subject,binding_mode,minted_by,idp_provider"
+    };
+}
 
 fn secret_form_to_str(f: SecretForm) -> &'static str {
     match f {
@@ -848,7 +863,8 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
     // would merge this accrual into a different card's cell.
     let priced_from = as_storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
              tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
@@ -874,10 +890,10 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
             clamp(d.requests),
             clamp(d.billable_requests),
         ],
-    )
-    .store()?;
+    )?;
     for (unit, count) in &d.usage_units {
-        tx.execute(
+        exec(
+            tx,
             "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
              VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
@@ -891,8 +907,7 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
                 unit,
                 clamp(*count),
             ],
-        )
-        .store()?;
+        )?;
     }
     Ok(())
 }
@@ -991,24 +1006,26 @@ impl RecordStore for SqliteStore {
     }
 
     fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
-        self.lock_reader()
-            .query_row(
-                &format!("SELECT {KEY_COLS} FROM keys WHERE id=?1"),
-                params![id],
-                row_to_key,
-            )
-            .optional()
-            .store()
+        query_one(
+            &self.lock_reader(),
+            concat!("SELECT ", key_cols!(), " FROM keys WHERE id=?1"),
+            params![id],
+            row_to_key,
+        )
     }
 
     fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = format!("SELECT {KEY_COLS} FROM keys ORDER BY created_at");
-        query_all(&self.lock_reader(), &sql, [], row_to_key)
+        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at");
+        query_all(&self.lock_reader(), sql, [], row_to_key)
     }
 
     fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = format!("SELECT {KEY_COLS} FROM keys WHERE revision > ?1 ORDER BY revision");
-        query_all(&self.lock_reader(), &sql, params![since as i64], row_to_key)
+        let sql = concat!(
+            "SELECT ",
+            key_cols!(),
+            " FROM keys WHERE revision > ?1 ORDER BY revision"
+        );
+        query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
     }
 
     fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
@@ -1116,15 +1133,13 @@ impl RecordStore for SqliteStore {
         let conn = self.lock_reader();
         // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
         // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
-        let (requests, billable_requests): (i64, i64) = conn
-            .query_row(
-                "SELECT requests, billable_requests FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model=''",
-                params![window_start as i64, bucket_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .store()?
-            .unwrap_or((0, 0));
+        let (requests, billable_requests): (i64, i64) = query_one(
+            &conn,
+            "SELECT requests, billable_requests FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model=''",
+            params![window_start as i64, bucket_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .unwrap_or((0, 0));
         let ws = window_start as i64;
         let at = params![ws, bucket_id];
         let mut models = query_all(
