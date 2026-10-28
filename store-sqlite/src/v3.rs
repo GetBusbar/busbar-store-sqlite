@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
+//! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
 //! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. All
 //! DURABLE: the state lives in the tables `SCHEMA` creates. It holds no money (counts x the rate
 //! card, derived in busbar's core).
@@ -250,7 +250,7 @@ macro_rules! ready {
 }
 
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
-/// bounded disk lane. The 1.5.5 op set is the [`RecordStore`] impl, one body each.
+/// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const TAIL: Tail = Tail {
         ephemeral: false,
