@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
+//! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
 //! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. All
 //! DURABLE: the state lives in the tables `SCHEMA` creates. It holds no money (counts x the rate
 //! card, derived in busbar's core).
@@ -21,11 +21,12 @@ use busbar_contract::records::{
     PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger,
     VirtualKey,
 };
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 use crate::{
-    add_metering_in, add_usage_in, append_plane_record_in, now_secs, query_all, IntoStoreResult,
+    add_metering_in, add_usage_in, append_plane_record_in, exec, now_secs, query_all, query_one,
     SqliteStore,
 };
 
@@ -47,14 +48,12 @@ enum Seen {
 }
 
 fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreError> {
-    let row: Option<(String, String)> = tx
-        .query_row(
-            "SELECT body, answer FROM store_ops WHERE op_id=?1",
-            params![op.0.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .store()?;
+    let row: Option<(String, String)> = query_one(
+        tx,
+        "SELECT body, answer FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
+        params![op.0.as_slice(), retention_cutoff(now_secs())],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     Ok(match row {
         None => Seen::New,
         Some((b, answer)) if b == body => Seen::Replay(
@@ -65,26 +64,40 @@ fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreE
     })
 }
 
-/// Remember an APPLIED op, and forget every op past its retention.
+/// A row recorded at or before this is past its retention: never honoured, swept in time.
+fn retention_cutoff(now: i64) -> i64 {
+    now.saturating_sub(OP_ID_RETENTION_SECS as i64)
+}
+
+/// Ops recorded between retention sweeps.
+const SWEEP_EVERY: u64 = 256;
+
+/// Remember an APPLIED op; every [`SWEEP_EVERY`]th one also forgets the ops past their retention
+/// (`seen` already ignores them, so the sweep only reclaims space).
 fn record(
     tx: &Transaction<'_>,
     op: OpId,
     body: &str,
     answer: &Answer,
+    sweep: bool,
 ) -> Result<(), RecordStoreError> {
     let now = now_secs();
-    tx.execute(
-        "DELETE FROM store_ops WHERE recorded_at <= ?1",
-        params![now.saturating_sub(OP_ID_RETENTION_SECS as i64)],
-    )
-    .store()?;
+    if sweep {
+        exec(
+            tx,
+            "DELETE FROM store_ops WHERE recorded_at <= ?1",
+            params![retention_cutoff(now)],
+        )?;
+    }
     let answer =
         serde_json::to_string(answer).map_err(|e| RecordStoreError(format!("store_ops: {e}")))?;
-    tx.execute(
-        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+    exec(
+        tx,
+        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, answer=excluded.answer, \
+         recorded_at=excluded.recorded_at",
         params![op.0.as_slice(), body, answer, now],
     )
-    .store()
     .map(drop)
 }
 
@@ -105,7 +118,8 @@ impl SqliteStore {
                 Seen::Conflict => refusal = Some(OpRefused::Conflict),
                 Seen::New => match apply(tx) {
                     Ok(a) => {
-                        record(tx, op, body, &a)?;
+                        let n = self.ops_recorded.fetch_add(1, Ordering::Relaxed);
+                        record(tx, op, body, &a, n.is_multiple_of(SWEEP_EVERY))?;
                         return Ok(a);
                     }
                     Err(e) => refusal = Some(e),
@@ -142,18 +156,19 @@ impl SqliteStore {
     ) -> Result<(), String> {
         self.write(false, |tx| {
             (if value.is_empty() {
-                tx.execute(
+                exec(
+                    tx,
                     "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
                     params![schema, key],
                 )
             } else {
-                tx.execute(
+                exec(
+                    tx,
                     "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
                      ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
                     params![schema, key, value],
                 )
             })
-            .store()
             .map(drop)
         })
         .map_err(|e| e.0)
@@ -164,15 +179,13 @@ impl SqliteStore {
         schema: &str,
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
-        let value: Option<Vec<u8>> = self
-            .lock_reader()
-            .query_row(
-                "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
-                params![schema, key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+        let value: Option<Vec<u8>> = query_one(
+            &self.lock_reader(),
+            "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
+            params![schema, key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.0)?;
         value.map(record_bytes).transpose()
     }
 
@@ -237,7 +250,7 @@ macro_rules! ready {
 }
 
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
-/// bounded disk lane. The 1.5.5 op set is the [`RecordStore`] impl, one body each.
+/// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const TAIL: Tail = Tail {
         ephemeral: false,
