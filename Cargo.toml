@@ -37,6 +37,7 @@ needless_update = "allow"
 [workspace.dependencies]
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "6acd5afc46969040ebd548bc3ae21feb5d979f34" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "6acd5afc46969040ebd548bc3ae21feb5d979f34" }
+busbar-test-kit = { git = "https://github.com/GetBusbar/busbar", rev = "6acd5afc46969040ebd548bc3ae21feb5d979f34" }
 # busbar's root [workspace.dependencies], third-party rows, at 6acd5afc46969040ebd548bc3ae21feb5d979f34
 arc-swap = "1"
 async-trait = "0.1"

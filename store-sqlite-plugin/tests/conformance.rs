@@ -48,7 +48,7 @@ use busbar_store_sqlite::door::MACRO_DOOR;
 // the built cdylib, each through the one loader, driven by the store kind's script over
 // `conformance.json`; exact crossing counts, the two folds equal, its RED arms. Each fold opens its
 // own database file: `db_path` names `{fold}`, a namespace no other fold uses.
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_store_sqlite::door::MACRO_DOOR,
     cdylib: "busbar_store_sqlite_plugin",
     inputs: include_str!("conformance.json"),
