@@ -304,10 +304,11 @@ pub fn assert_put_credential_requires_a_live_key(store: &dyn RecordStore, ns: &s
     );
     assert!(
         store
-            .lookup_credential_secret("sigv4", &format!("AKIA{cred_id}"))
-            .expect("lookup is never an error")
-            .is_none(),
-        "the refused credential still resolves on the verify path"
+            .list_credentials(&key_id)
+            .expect("listing is never an error")
+            .iter()
+            .all(|c| c.id != cred_id),
+        "the refused credential is still listed under its key"
     );
 }
 
