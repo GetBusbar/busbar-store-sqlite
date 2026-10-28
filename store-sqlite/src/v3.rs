@@ -21,11 +21,11 @@ use busbar_contract::records::{
     PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger,
     VirtualKey,
 };
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    add_metering_in, add_usage_in, append_plane_record_in, now_secs, query_all, IntoStoreResult,
+    add_metering_in, add_usage_in, append_plane_record_in, exec, now_secs, query_all, query_one,
     SqliteStore,
 };
 
@@ -47,14 +47,12 @@ enum Seen {
 }
 
 fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreError> {
-    let row: Option<(String, String)> = tx
-        .query_row(
-            "SELECT body, answer FROM store_ops WHERE op_id=?1",
-            params![op.0.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .store()?;
+    let row: Option<(String, String)> = query_one(
+        tx,
+        "SELECT body, answer FROM store_ops WHERE op_id=?1",
+        params![op.0.as_slice()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     Ok(match row {
         None => Seen::New,
         Some((b, answer)) if b == body => Seen::Replay(
@@ -73,18 +71,18 @@ fn record(
     answer: &Answer,
 ) -> Result<(), RecordStoreError> {
     let now = now_secs();
-    tx.execute(
+    exec(
+        tx,
         "DELETE FROM store_ops WHERE recorded_at <= ?1",
         params![now.saturating_sub(OP_ID_RETENTION_SECS as i64)],
-    )
-    .store()?;
+    )?;
     let answer =
         serde_json::to_string(answer).map_err(|e| RecordStoreError(format!("store_ops: {e}")))?;
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4)",
         params![op.0.as_slice(), body, answer, now],
     )
-    .store()
     .map(drop)
 }
 
@@ -142,18 +140,19 @@ impl SqliteStore {
     ) -> Result<(), String> {
         self.write(false, |tx| {
             (if value.is_empty() {
-                tx.execute(
+                exec(
+                    tx,
                     "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
                     params![schema, key],
                 )
             } else {
-                tx.execute(
+                exec(
+                    tx,
                     "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
                      ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
                     params![schema, key, value],
                 )
             })
-            .store()
             .map(drop)
         })
         .map_err(|e| e.0)
@@ -164,15 +163,13 @@ impl SqliteStore {
         schema: &str,
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
-        let value: Option<Vec<u8>> = self
-            .lock_reader()
-            .query_row(
-                "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
-                params![schema, key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+        let value: Option<Vec<u8>> = query_one(
+            &self.lock_reader(),
+            "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
+            params![schema, key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.0)?;
         value.map(record_bytes).transpose()
     }
 
