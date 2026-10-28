@@ -18,8 +18,8 @@
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2086,11 +2086,28 @@ impl RecordStore for SqliteStore {
     }
 
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
-        // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the kind's
-        // own contract, read off the typed `disposition` column, never out of the body:
-        // - `task` drops only TERMINAL rows. An interrupted task waiting on a human is exactly the row
-        //   that legitimately sits still longest; compacting it is losing the work.
-        // - every other kind drops every row older than `before`.
+        // The age-only entry: `task` has always dropped only its TERMINAL rows here, every other kind
+        // every row older than `before`. A caller that carries the rule calls `purge_plane_records`.
+        let retention = if kind == "task" {
+            Retention::TerminalOnly
+        } else {
+            Retention::Age
+        };
+        self.purge_plane_records(kind, before, retention)
+    }
+
+    fn purge_plane_records(
+        &self,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
+        // STRICTLY older than the cutoff, and a count actually performed. WHICH rows go is the rule
+        // the call carries (never one inferred from the kind's name), read off the typed
+        // `disposition` column, never out of the body:
+        // - `TerminalOnly` drops only TERMINAL rows. An interrupted task waiting on a human is exactly
+        //   the row that legitimately sits still longest; compacting it is losing the work.
+        // - `Age` drops every row older than `before`.
         //
         // A purged task takes its `task_event` chain with it, and only its own. Nothing else ever
         // removes a task's events, so leaving them would grow the table forever with chains whose
@@ -2099,7 +2116,7 @@ impl RecordStore for SqliteStore {
         // `before` is clamped rather than refused, unlike the write paths: a cutoff past what SQLite
         // can hold means "everything older than the end of time", and clamping it says exactly that.
         let before = i64::try_from(before).unwrap_or(i64::MAX);
-        let terminal_only = kind == "task";
+        let terminal_only = retention == Retention::TerminalOnly;
         let mut conn = self.lock_writer();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2109,7 +2126,7 @@ impl RecordStore for SqliteStore {
         } else {
             "kind=?1 AND ts < ?2"
         };
-        if terminal_only {
+        if terminal_only && kind == "task" {
             tx.execute(
                 &format!(
                     "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \

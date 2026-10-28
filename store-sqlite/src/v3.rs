@@ -20,8 +20,8 @@ use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger,
-    VirtualKey,
+    PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, Retention, UsageDelta,
+    UsageLedger, VirtualKey,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -512,6 +512,18 @@ impl StoreSlots for SqliteStore {
         before: u64,
     ) -> Step<RecordStoreResult<u64>> {
         Step::Ready(RecordStore::purge_plane_records_before(self, kind, before))
+    }
+
+    fn purge_plane_records(
+        &self,
+        _: &mut Op<'_>,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> Step<RecordStoreResult<u64>> {
+        Step::Ready(RecordStore::purge_plane_records(
+            self, kind, before, retention,
+        ))
     }
 
     fn delete_plane_record(
