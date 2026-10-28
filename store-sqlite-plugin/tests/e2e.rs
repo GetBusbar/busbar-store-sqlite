@@ -322,7 +322,16 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` (roster def 14:
     // author-side packaging lives with the loader that verifies what it packs).
     for args in [
-        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
+            "build",
+            "--release",
+            "--manifest-path",
+            "dist/default/Cargo.toml",
+            "--target-dir",
+            "target",
+            "--bin",
+            "busbar",
+        ][..],
         &[
             "build",
             "--release",
@@ -417,7 +426,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let config_text = format!(
@@ -663,7 +672,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     let providers = work.join("providers.yaml");
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
 
