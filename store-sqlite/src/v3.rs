@@ -119,7 +119,7 @@ impl SqliteStore {
                 Seen::New => match apply(tx) {
                     Ok(a) => {
                         let n = self.ops_recorded.fetch_add(1, Ordering::Relaxed);
-                        record(tx, op, body, &a, n % SWEEP_EVERY == 0)?;
+                        record(tx, op, body, &a, n.is_multiple_of(SWEEP_EVERY))?;
                         return Ok(a);
                     }
                     Err(e) => refusal = Some(e),
