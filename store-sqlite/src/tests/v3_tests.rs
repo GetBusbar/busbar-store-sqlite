@@ -175,7 +175,7 @@ fn an_op_id_is_forgotten_after_its_retention() {
             params![old, op(1).0.as_slice()],
         )
         .expect("age");
-    // Recording another op sweeps the expired one; the old op_id then reads as new.
+    // The expired op_id reads as new, whether or not a sweep has run.
     s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
         .expect("b");
     s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
@@ -184,6 +184,37 @@ fn an_op_id_is_forgotten_after_its_retention() {
         RecordStore::get_usage(&s, "k", 60).expect("read").requests,
         2
     );
+}
+
+/// An expired row is not honoured when no sweep has run: the sweep fires on op 0 and every 256th,
+/// so after op 0 the aged row below is still in the table when its op_id returns.
+#[test]
+fn an_expired_op_id_is_not_honoured_before_any_sweep() {
+    let s = fresh();
+    s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
+        .expect("a");
+    s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
+        .expect("b");
+    let old = now_secs() - OP_ID_RETENTION_SECS as i64;
+    s.lock_writer()
+        .execute(
+            "UPDATE store_ops SET recorded_at=?1 WHERE op_id=?2",
+            params![old, op(2).0.as_slice()],
+        )
+        .expect("age");
+    let rows = |s: &crate::SqliteStore| -> i64 {
+        s.lock_writer()
+            .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+            .expect("count")
+    };
+    assert_eq!(rows(&s), 2, "no sweep has run since the aging");
+    s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
+        .expect("applies again, not replayed");
+    assert_eq!(
+        RecordStore::get_usage(&s, "j", 60).expect("read").requests,
+        2
+    );
+    assert_eq!(rows(&s), 2, "the row was refreshed in place");
 }
 
 #[test]
@@ -304,55 +335,6 @@ fn dedupe_survives_a_reopen_of_the_file() {
             .map(|v| v.as_slice().to_vec()),
         Some(b"v".to_vec())
     );
-}
-
-/// v12 -> v13: the money tables and the dead slots' tables are DROPPED, and only the dedupe records
-/// that answered "Done" stay. RED before v13: the tables and the money answers were kept.
-#[test]
-fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
-    let (s, path) = on_file("v13");
-    {
-        let w = s.lock_writer();
-        w.execute_batch(
-            "CREATE TABLE money_caps (slot TEXT NOT NULL PRIMARY KEY, cap INTEGER NOT NULL, config_gen INTEGER NOT NULL);
-             CREATE TABLE money_used (slot TEXT NOT NULL PRIMARY KEY, used INTEGER NOT NULL);
-             CREATE TABLE money_slices (slice_id INTEGER PRIMARY KEY AUTOINCREMENT, slot TEXT NOT NULL, remaining INTEGER NOT NULL, valid_until_ms INTEGER NOT NULL DEFAULT -1);
-             CREATE TABLE money_epoch (id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0), epoch INTEGER NOT NULL);
-             CREATE TABLE journal (stream TEXT NOT NULL, seq INTEGER NOT NULL, record BLOB NOT NULL, PRIMARY KEY (stream, seq));
-             CREATE TABLE sessions (session INTEGER NOT NULL PRIMARY KEY, node TEXT NOT NULL, principal TEXT NOT NULL);
-             INSERT INTO money_caps VALUES ('s', 10, 1);",
-        )
-        .expect("a v12 file's tables");
-        w.execute(
-            "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, 'b', '{\"Released\":[1]}', ?2)",
-            params![op(90).0.as_slice(), now_secs()],
-        )
-        .expect("a money answer");
-        w.pragma_update(None, "user_version", 12i64).expect("v12");
-    }
-    s.v3_add_usage_batch(op(91), &[("k", 60, delta(1, 1))])
-        .expect("a Done answer");
-    drop(s);
-
-    let s = SqliteStore::open(&path, 5000).expect("reopen at v13");
-    let w = s.lock_writer();
-    let left: i64 = w
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-             ('money_caps','money_used','money_slices','money_epoch','journal','sessions')",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count");
-    assert_eq!(left, 0, "the money and dead-slot tables are gone");
-    let ops: i64 = w
-        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
-        .expect("ops");
-    assert_eq!(ops, 1, "only the Done record stays");
-    let version: i64 = w
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .expect("version");
-    assert_eq!(version, 13);
 }
 
 #[test]

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE DOOR: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`, the contract's store
-//! SDK), and [`open`], the settings parser its `open` slot runs. A busbar build that links this crate
-//! registers `door` as its compiled-in row; the `busbar-store-sqlite-plugin` cdylib exports the same
-//! `door` as `busbar_plugin_door`. Compiled in or dropped in, the host reaches one table. The store
-//! answers every call Ready: it is local-disk-bound, and the host runs it on its bounded disk lane
-//! (THE DESIGN §11.11 R4, Q-DISK).
+//! The door: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`), and [`open`], the
+//! settings parser its `open` slot runs. A build that links this crate registers `door`; the
+//! `busbar-store-sqlite-plugin` cdylib exports the same one as `busbar_plugin_door`. The store
+//! answers every call Ready: it is local-disk-bound and runs on the host's bounded disk lane.
 
 use crate::SqliteStore;
 
@@ -28,22 +26,16 @@ busbar_contract::store_door!(
     secret_refs: SECRET_REFS
 );
 
-/// Construct a SQLite store from the settings the host passes through `open`. Shape (both keys
-/// optional, sensible defaults so an empty `{}` works):
+/// Construct a SQLite store from the settings the host passes through `open`:
 ///
 /// ```json
 /// { "db_path": "busbar-governance.db", "busy_timeout_ms": 5000 }
 /// ```
 ///
-/// Any other top-level key is refused, and an empty or blank `db_path` is refused.
-///
-/// A key that is ABSENT falls back to its default (this plugin's whole design point — an empty
-/// `{}` must work), and so does a key whose value is an explicit JSON `null`: `null` is read as
-/// absent, the semantics this plugin has shipped with since busbar 1.5. A key that is PRESENT with
-/// any other wrong JSON type (e.g. `db_path: 5` or `busy_timeout_ms: "5000"`) is a config error,
-/// not silently defaulted: a template variable that resolves to a number for `db_path` must never
-/// be swallowed into quietly opening the default relative path — that reads as a healthy boot
-/// against an empty governance database (data loss), not a config error.
+/// Both keys are optional, so `{}` works; any other top-level key, and an empty or blank `db_path`,
+/// is refused. An absent key or an explicit `null` takes the default. A key of any other wrong JSON
+/// type is a config error, never defaulted: a template variable resolving to a number for `db_path`
+/// must not quietly open the default path, which reads as a healthy boot on an empty database.
 pub fn open(cfg: &str) -> Result<SqliteStore, String> {
     let Settings {
         db_path,
@@ -52,8 +44,8 @@ pub fn open(cfg: &str) -> Result<SqliteStore, String> {
     SqliteStore::open(&db_path, busy_timeout_ms).map_err(|e| e.0)
 }
 
-/// The operator's settings, PARSED and nothing more: the store's `validate` slot runs this alone
-/// (`--validate` opens, connects to and migrates no store), and [`open`] opens what it read.
+/// The operator's settings, parsed and nothing more: `validate` runs this alone (`--validate` opens
+/// and migrates no store), and [`open`] opens what it read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// The database file (or an in-memory spelling).
@@ -74,8 +66,6 @@ impl Settings {
         } else {
             serde_json::from_str(cfg).map_err(|e| format!("invalid sqlite plugin config: {e}"))?
         };
-        // A top-level key this plugin does not read is a typo or a setting for another backend; it
-        // must not be swallowed into quietly opening the default path.
         if let Some(obj) = v.as_object() {
             if let Some(unknown) = obj
                 .keys()
@@ -107,16 +97,8 @@ impl Settings {
                 let ms = n.as_i64().ok_or_else(|| {
                     format!("invalid sqlite plugin config: `busy_timeout_ms` out of range, got {n}")
                 })?;
-                // A negative duration has no meaning and can only be a config mistake (a unit-
-                // conversion bug, a stray sign, a bad template substitution) -- unlike `0`, which is a
-                // real, deliberate SQLite setting (see `apply_pragmas`'s own doc: SQLite's own
-                // zero-second default), a negative number names nothing SQLite or an operator could
-                // sensibly mean. SQLite doesn't reject it either -- like `0`, any `busy_timeout <= 0`
-                // silently disables the busy handler entirely (every write fails instantly on the
-                // slightest lock contention instead of retrying), which reads as a healthy boot with a
-                // quietly degraded reliability posture. `0` is left as a legal, if unusual, explicit
-                // "never retry" choice; only the never-sensible negative case is rejected here, the
-                // same silent-footgun class the wrong-JSON-type check above already guards against.
+                // Negative is a config mistake and SQLite would silently disable the busy handler;
+                // `0` is a legal, deliberate "never retry".
                 if ms < 0 {
                     return Err(format!(
                         "{BAD}: `busy_timeout_ms` must not be negative, got {ms}"
@@ -143,10 +125,6 @@ impl Settings {
     }
 }
 
-// ── unit tests for the door's own responsibility: adapting the engine's JSON config into a real
-// `SqliteStore`. Hermetic — every case uses `:memory:` or a scratch temp file, never the relative
-// default path (which would write into the test's cwd). The real over-the-ABI paths live in
-// `busbar-store-sqlite-plugin`'s `tests/e2e.rs` and `tests/conformance.rs`.
 #[cfg(test)]
 #[path = "door/tests.rs"]
 mod tests;
