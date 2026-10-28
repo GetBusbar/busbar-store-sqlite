@@ -15,8 +15,8 @@
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
@@ -1457,20 +1457,37 @@ impl RecordStore for SqliteStore {
         )
     }
 
-    /// STRICTLY older than the cutoff. `task` drops only TERMINAL rows (an interrupted task waiting
-    /// on a human sits still longest), every other kind drops every older row; a purged task takes
-    /// its `task_event` chain with it. `before` is clamped, not refused: a cutoff past what SQLite
-    /// holds means "everything older than the end of time".
+    /// The age-only entry: `task` drops only its TERMINAL rows, every other kind every older row. A
+    /// caller that carries the rule calls `purge_plane_records`.
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
+        let retention = if kind == "task" {
+            Retention::TerminalOnly
+        } else {
+            Retention::Age
+        };
+        self.purge_plane_records(kind, before, retention)
+    }
+
+    /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
+    /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
+    /// sits still longest), `Age` every older row; a purged task takes its `task_event` chain with
+    /// it. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
+    /// than the end of time".
+    fn purge_plane_records(
+        &self,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
         let before = clamp(before);
-        let terminal_only = kind == "task";
+        let terminal_only = retention == Retention::TerminalOnly;
         self.write(false, |tx| {
             let predicate = if terminal_only {
                 "kind=?1 AND ts < ?2 AND disposition='terminal'"
             } else {
                 "kind=?1 AND ts < ?2"
             };
-            if terminal_only {
+            if terminal_only && kind == "task" {
                 tx.execute(
                     &format!(
                         "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
