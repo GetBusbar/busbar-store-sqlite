@@ -437,17 +437,17 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
     );
 }
 
-/// busbar 1.5.5 resolved a secret reference (`{env:}`, `{file:}`, `{module:}`) at ANY top-level
-/// store setting before the settings crossed to the plugin, so a 1.5.5 config such as
-/// `license_key: {env: …}` or `db_path: {env: …}` must keep booting on 1.6.0. busbar now resolves a
-/// reference only at a position the plugin's Statement declares secret (`secret_refs`) and refuses
-/// one anywhere else (busbar #1699, ORACLE-SIGNOFF G14), so the store declares every top-level
-/// setting: `*`, any key. The dropped-in library states the same Statement (the test above).
+/// The store's Statement declares exactly its secret fields (`secret_refs`), never `*`: busbar
+/// resolves a secret reference only at a position the Statement declares secret and refuses one
+/// anywhere else (busbar #1699, ORACLE-SIGNOFF G14: each plugin declares its secret fields). The one
+/// secret-valued key a 1.5.5 sqlite config carried is `license_key` (busbar oracle BOOT-170: its
+/// unresolved reference refuses the boot with the 1.5.5 text); `db_path` and `busy_timeout_ms` are
+/// not secrets. The dropped-in library states the same Statement (the test above).
 #[test]
-fn the_statement_declares_every_top_level_setting_may_hold_a_secret_reference() {
+fn the_statement_declares_exactly_its_secret_fields() {
     let stated = busbar_contract::abi::mechanism::rendering::read(
         &rendering_of_macro(MACRO_DOOR).expect("the door renders"),
     )
     .expect("the rendering reads back");
-    assert_eq!(stated.secret_refs, ["*".to_string()]);
+    assert_eq!(stated.secret_refs, ["license_key".to_string()]);
 }
