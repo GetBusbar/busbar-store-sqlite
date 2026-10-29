@@ -3,7 +3,7 @@
 
 use super::*;
 use busbar_contract::records::{
-    AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, VirtualKey,
+    AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, ScopeRef, VirtualKey,
 };
 use rusqlite::TransactionBehavior;
 
