@@ -47,7 +47,7 @@
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::slot as lc;
 use busbar_contract::records::{
-    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageLedger,
+    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, Retention, UsageLedger,
     UNIT_INPUT, UNIT_OUTPUT,
 };
 use busbar_plugin_loader::dispatch::kinds::store::Store;
@@ -322,7 +322,16 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` (roster def 14:
     // author-side packaging lives with the loader that verifies what it packs).
     for args in [
-        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
+            "build",
+            "--release",
+            "--manifest-path",
+            "dist/default/Cargo.toml",
+            "--target-dir",
+            "target",
+            "--bin",
+            "busbar",
+        ][..],
         &[
             "build",
             "--release",
@@ -417,7 +426,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let config_text = format!(
@@ -663,7 +672,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     let providers = work.join("providers.yaml");
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
 
@@ -681,6 +690,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
                  plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
                  identity-providers:\n  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
                  auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
+             credentials:\n  at_rest:\n    key: {{ env: BUSBAR_SIGNING_KEY }}\n\
                  providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
                  models:\n  test-model:\n    provider: mock\n",
                 plugins_dir.display()
@@ -1128,7 +1138,9 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     // Retention crosses the ABI too, count and all — and both purges are checked for the number
-    // they ACTUALLY removed, because a relay that dropped the return value would read as 0.
+    // they ACTUALLY removed, because a relay that dropped the return value would read as 0. The
+    // task purges carry the terminal-only rule (the host's `purge_plane_records_before` is the age
+    // rule).
     assert_eq!(
         store
             .purge_plane_records_before("call", 2_002)
@@ -1149,14 +1161,16 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
         .is_empty());
     assert_eq!(
         store
-            .purge_plane_records_before("task", 25)
+            .purge_plane_records("task", 25, Retention::TerminalOnly)
             .expect("purge"),
         0,
         "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
          swept no matter how old"
     );
     assert_eq!(
-        store.purge_plane_records_before("task", 31).expect("purge"),
+        store
+            .purge_plane_records("task", 31, Retention::TerminalOnly)
+            .expect("purge"),
         1,
         "the one completed task at updated_at 30 is the only row retention may drop"
     );
