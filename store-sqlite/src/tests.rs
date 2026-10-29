@@ -3,7 +3,7 @@
 
 use super::*;
 use busbar_contract::records::{
-    AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, VirtualKey,
+    AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, ScopeRef, VirtualKey,
 };
 use rusqlite::TransactionBehavior;
 
@@ -1452,11 +1452,11 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     );
 
     // Same (principal, seq), different digest — the fork case.
-    let forked = sample_call("vk_a", 1, 100, "", "DIFFERENT");
+    let forked = sample_call("vk_a", 1, 100, "", "h2-second-writer");
     let err = append_call(&s, &forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
     assert!(
-        !format!("{err}").contains("DIFFERENT"),
+        !format!("{err}").contains("h2-second-writer"),
         "the error must not echo stored content back"
     );
     assert_eq!(

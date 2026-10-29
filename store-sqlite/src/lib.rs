@@ -12,11 +12,12 @@
 
 #![forbid(unsafe_code)]
 
+use busbar_contract::abi::sdk::store::{column, fork};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
-    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
-    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
@@ -628,64 +629,12 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     Ok(())
 }
 
-// `allowed_scopes` storage. The in-memory grant is `Option<Vec<ScopeRef>>`; on disk it splits by kind
-// like the contract's wire shape: `allowed_pools` holds the `pool` values as a JSON array of strings
-// (NULL = grant omitted = every scope; an array, even '[]', = an exhaustive grant, so `None` and
-// `Some([])` never collapse), and `scope_grants` holds every other kind as `{kind: [value, ...]}`
-// (NULL when none). An explicit grant always writes `allowed_pools`, so a non-pool-only grant never
-// reads back as the wildcard.
-type ScopeColumns = (Option<String>, Option<String>);
-
-fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
-    let Some(list) = scopes else {
-        return (None, None);
-    };
-    let mut pools: Vec<&str> = Vec::new();
-    let mut other: BTreeMap<&str, Vec<&str>> = Default::default();
-    for s in list {
-        if s.kind == "pool" {
-            pools.push(&s.value);
-        } else {
-            other.entry(&s.kind).or_default().push(&s.value);
-        }
-    }
-    let pools = serde_json::to_string(&pools).unwrap_or_else(|_| "[]".to_string());
-    let other = (!other.is_empty()).then(|| serde_json::to_string(&other).unwrap_or_default());
-    (Some(pools), other)
-}
-
-// A malformed value (reachable only by an out-of-band edit) reads as the most restrictive grant, never
-// a silent widen: an unparseable `allowed_pools` is the empty set, an unparseable `scope_grants` adds nothing.
-fn scopes_from_storage(pools: Option<String>, other: Option<String>) -> Option<Vec<ScopeRef>> {
-    // The wildcard is decided on the RAW columns: a present-but-unparseable column is restrictive.
-    if pools.is_none() && other.is_none() {
-        return None;
-    }
-    let other: BTreeMap<String, Vec<String>> = other
-        .as_deref()
-        .map(|o| serde_json::from_str(o.trim()).unwrap_or_default())
-        .unwrap_or_default();
-    let mut list: Vec<ScopeRef> = pools
-        .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
-        .unwrap_or_default()
-        .into_iter()
-        .map(ScopeRef::pool)
-        .collect();
-    for (kind, values) in other {
-        list.extend(values.into_iter().map(|value| ScopeRef {
-            kind: kind.clone(),
-            value,
-        }));
-    }
-    Some(list)
-}
-
 fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
     Ok(VirtualKey {
         id: r.get(0)?,
         generation_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_scopes: scopes_from_storage(r.get(3)?, r.get(11)?),
+        allowed_scopes: column::scopes_from_columns(r.get(3)?, r.get(11)?),
         enabled: r.get::<_, i64>(4)? != 0,
         created_at: r.get::<_, i64>(5)? as u64,
         group: r.get(6)?,
@@ -760,7 +709,7 @@ fn put_key_inner(
     // reissue an id the contract says is never reissued. It is in the statement, not a prior SELECT,
     // so the test and the write are atomic against a concurrent `delete_key`. A write that CARRIES
     // a tombstone is unaffected. When the guard bites, `execute` reports 0 rows.
-    let (allowed_pools, scope_grants) = scopes_to_storage(&key.allowed_scopes);
+    let (allowed_pools, scope_grants) = column::scope_columns(key.allowed_scopes.as_deref());
     let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
                            scope_grants,idp_subject,binding_mode,minted_by,idp_provider)
@@ -864,15 +813,11 @@ fn add_usage_in(
     Ok(())
 }
 
-fn clamp(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
-}
-
 /// [`RecordStore::add_metering`]'s writes, inside the caller's transaction.
 fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> {
     // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
     // would merge this accrual into a different card's cell.
-    let priced_from = as_storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
+    let priced_from = column::storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
     exec(
         tx,
         "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
@@ -893,12 +838,12 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
             priced_from,
             d.key_group_at_use,
             d.pricing_version,
-            clamp(d.tokens_input),
-            clamp(d.tokens_output),
-            clamp(d.tokens_cache_read),
-            clamp(d.tokens_cache_write),
-            clamp(d.requests),
-            clamp(d.billable_requests),
+            column::clamp(d.tokens_input),
+            column::clamp(d.tokens_output),
+            column::clamp(d.tokens_cache_read),
+            column::clamp(d.tokens_cache_write),
+            column::clamp(d.requests),
+            column::clamp(d.billable_requests),
         ],
     )?;
     for (unit, count) in &d.usage_units {
@@ -915,7 +860,7 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
                 d.model,
                 priced_from,
                 unit,
-                clamp(*count),
+                column::clamp(*count),
             ],
         )?;
     }
@@ -962,11 +907,7 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
             )
             .store()?;
         if &stored != entry {
-            return Err(RecordStoreError(format!(
-                "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
-                 has forked (stored action '{}', incoming '{}')",
-                entry.seq, stored.action, entry.action
-            )));
+            return Err(fork::audit_fork(entry.seq));
         }
     }
     Ok(())
@@ -999,11 +940,7 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
         {
             return Ok(());
         }
-        return Err(RecordStoreError(format!(
-            "append_plane_record: kind '{}' already holds a different record at sequence {} \
-             of this chain; the chain has forked",
-            record.kind, record.seq
-        )));
+        return Err(fork::chain_fork(record.kind, &row.identity, record.seq));
     }
     tx.execute(
         "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
@@ -1231,8 +1168,8 @@ impl RecordStore for SqliteStore {
                 params![
                     window_start as i64,
                     bucket_id,
-                    clamp(ledger.requests),
-                    clamp(ledger.billable_requests)
+                    column::clamp(ledger.requests),
+                    column::clamp(ledger.billable_requests)
                 ],
             )
             .store()?;
@@ -1243,17 +1180,17 @@ impl RecordStore for SqliteStore {
                      VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
                     params![
                         window_start as i64, bucket_id, m.model,
-                        clamp(m.tier(UNIT_INPUT)),
-                        clamp(m.tier(UNIT_OUTPUT)),
-                        clamp(m.tier(UNIT_CACHE_READ)),
-                        clamp(m.tier(UNIT_CACHE_WRITE)),
+                        column::clamp(m.tier(UNIT_INPUT)),
+                        column::clamp(m.tier(UNIT_OUTPUT)),
+                        column::clamp(m.tier(UNIT_CACHE_READ)),
+                        column::clamp(m.tier(UNIT_CACHE_WRITE)),
                     ],
                 ).store()?;
                 for (unit, count) in open_units(&m.usage_units) {
                     tx.execute(
                         "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
                          VALUES (?1,?2,?3,?4,?5)",
-                        params![window_start as i64, bucket_id, m.model, unit, clamp(*count)],
+                        params![window_start as i64, bucket_id, m.model, unit, column::clamp(*count)],
                     )
                     .store()?;
                 }
@@ -1357,7 +1294,7 @@ impl RecordStore for SqliteStore {
         let mut rows = query_all(
             &self.lock_reader(),
             "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT ?1",
-            [clamp(limit)],
+            [column::clamp(limit)],
             row_to_audit,
         )?;
         rows.reverse();
@@ -1479,7 +1416,7 @@ impl RecordStore for SqliteStore {
         before: u64,
         retention: Retention,
     ) -> RecordStoreResult<u64> {
-        let before = clamp(before);
+        let before = column::clamp(before);
         let terminal_only = retention == Retention::TerminalOnly;
         self.write(false, |tx| {
             let predicate = if terminal_only {
@@ -1530,8 +1467,8 @@ impl RecordStore for SqliteStore {
         // report the insert as a first redemption, reopening every spent grant. `expires_at` alone
         // saturates: minting claims pass `u64::MAX` for "never expires", and the column is only
         // compared against `now` by the sweep, so `i64::MAX` is the same answer.
-        let expires = clamp(expires_at);
-        let now_i = as_storable_i64("redeem_plane_token", "now", now)?;
+        let expires = column::clamp(expires_at);
+        let now_i = column::storable_i64("redeem_plane_token", "now", now)?;
         // One transaction over the sweep and the test-and-set: two redemptions of one grant, from two
         // threads or two nodes on one file, serialise instead of both being told they were first.
         self.write(true, |tx| {
@@ -1597,8 +1534,8 @@ impl PlaneRow {
     fn of(record: PlaneRecordRef<'_>, identity: &str, method: &str) -> RecordStoreResult<Self> {
         Ok(Self {
             identity: identity.to_string(),
-            seq: as_storable_i64(method, "seq", record.seq)?,
-            ts: as_storable_i64(method, "ts", record.ts)?,
+            seq: column::storable_i64(method, "seq", record.seq)?,
+            ts: column::storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
                 PlaneDisposition::Active => DISPOSITION_ACTIVE,
                 PlaneDisposition::Terminal => DISPOSITION_TERMINAL,
@@ -1618,17 +1555,6 @@ impl PlaneRow {
             &record.body,
         ]
     }
-}
-
-/// Reject a `u64` that SQLite's signed 64-bit integer cannot hold, naming the method and the field:
-/// `as i64` would wrap it negative and the row read back would not be the row written.
-fn as_storable_i64(method: &str, field: &str, v: u64) -> RecordStoreResult<i64> {
-    i64::try_from(v).map_err(|_| {
-        RecordStoreError(format!(
-            "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
-             that would not read back as itself"
-        ))
-    })
 }
 
 fn put_credential_inner(
