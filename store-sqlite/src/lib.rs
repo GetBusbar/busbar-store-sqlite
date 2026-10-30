@@ -727,11 +727,23 @@ fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
     })
 }
 
+/// The `keys_labels_json` CHECK's ceiling on the serialized labels.
+const MAX_LABELS_BYTES: usize = 4096;
+
 fn put_key_inner(
     conn: &rusqlite::Connection,
     key: &VirtualKey,
     revision: i64,
+    method: &str,
 ) -> RecordStoreResult<()> {
+    let labels = serde_json::to_string(&key.labels).unwrap_or_else(|_| "{}".to_string());
+    if labels.len() > MAX_LABELS_BYTES {
+        return Err(RecordStoreError(format!(
+            "{method}: labels of key {} are {} bytes, over the {MAX_LABELS_BYTES}-byte limit",
+            key.id,
+            labels.len()
+        )));
+    }
     // `?6` (created_at) seeds `updated_at` on INSERT, but the ON CONFLICT branch stamps `?12`, the
     // mutation time, like every other mutation path here. The `WHERE` on that branch is the
     // TOMBSTONE PRECONDITION: a live-shaped write must not overwrite a tombstoned row, which would
@@ -758,7 +770,7 @@ fn put_key_inner(
             key.enabled as i64,
             key.created_at as i64,
             key.group,
-            serde_json::to_string(&key.labels).unwrap_or_else(|_| "{}".to_string()),
+            labels,
             key.expires_at.map(|v| v as i64),
             key.deleted_at.map(|v| v as i64),
             revision,
@@ -989,7 +1001,9 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
 
 impl RecordStore for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
-        self.write(true, |tx| put_key_inner(tx, key, Self::bump_revision(tx)?))
+        self.write(true, |tx| {
+            put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
+        })
     }
 
     fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
@@ -1062,7 +1076,7 @@ impl RecordStore for SqliteStore {
     ) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             let rev = Self::bump_revision(tx)?;
-            put_key_inner(tx, key, rev)?;
+            put_key_inner(tx, key, rev, "put_key_with_credential")?;
             put_credential_inner(tx, secret, rev)
         })
     }
