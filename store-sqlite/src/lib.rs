@@ -1628,6 +1628,20 @@ fn put_credential_inner(
         }
         Some(true) => {}
     }
+    let taken: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM credentials WHERE kind=?1 AND public_id=?2 \
+             AND NOT (key_id=?3 AND slot=?4))",
+            params![m.kind, m.public_id, m.key_id, m.slot as i64],
+            |r| r.get(0),
+        )
+        .store()?;
+    if taken {
+        return Err(RecordStoreError(format!(
+            "put_credential: public_id {} is already taken for kind {}",
+            m.public_id, m.kind
+        )));
+    }
     // UPSERT on (key_id, kind, slot): a LIVE slot must fail rather than silently destroy a working
     // credential mid-overlap-window, so only a revoked row is overwritten (the DO UPDATE's WHERE).
     // `updated_at` is its own parameter (?11), not a second use of `created_at`'s.
@@ -1647,24 +1661,11 @@ fn put_credential_inner(
             ],
         )
         .store()?;
+    // Zero changed rows: the DO UPDATE's WHERE failed, so a LIVE credential holds the slot.
     if changed == 0 {
-        // Zero changed rows: a LIVE credential holds the slot, or UNIQUE(kind, public_id) fired.
-        let occupied: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=?1 AND kind=?2 AND slot=?3 AND revoked_at IS NULL)",
-                params![m.key_id, m.kind, m.slot as i64],
-                |r| r.get(0),
-            )
-            .store()?;
-        if occupied {
-            return Err(RecordStoreError(format!(
-                "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
-                m.slot, m.key_id, m.kind
-            )));
-        }
         return Err(RecordStoreError(format!(
-            "put_credential: public_id {} is already taken for kind {}",
-            m.public_id, m.kind
+            "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
+            m.slot, m.key_id, m.kind
         )));
     }
     Ok(())
