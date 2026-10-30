@@ -907,11 +907,28 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
         )
         .unwrap();
 
+    // The writer's busy handler flags that the store's write really met the held lock.
+    static MET_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    store
+        .lock_writer()
+        .busy_handler(Some(|_| {
+            MET_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }))
+        .unwrap();
     let call = sample_call("vk_contend", 1, 100, "", "h1");
     let result = std::thread::scope(|scope| {
         let writer = scope.spawn(|| append_call(&store, &call));
-        // Let the store's write start and meet the held lock, then commit a change underneath it.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Commit a change underneath the store's write only once it is waiting on the lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !MET_LOCK.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store's write never met the held lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         holder.execute_batch("COMMIT").unwrap();
         writer.join().unwrap()
     });
