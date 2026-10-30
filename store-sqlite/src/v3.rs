@@ -6,13 +6,14 @@
 //! DURABLE: the state lives in the tables `SCHEMA` creates. It holds no money (counts x the rate
 //! card, derived in busbar's core).
 //!
-//! DEDUPE (`abi::store` S1-S4): an `op_id` that APPLIED is recorded in `store_ops` with the op's
-//! value fields and its answer, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect: two
-//! racing calls with one `op_id` apply once, and a replay after a restart answers the original. The
-//! same value fields apply nothing; different ones are a conflict; a refusal rolls back and records
-//! nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
+//! DEDUPE (`abi::store` S1-S4, [`Dedupe`]): an `op_id` that APPLIED is recorded in `store_ops` with
+//! the op's body, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect: two racing calls
+//! with one `op_id` apply once, and a replay after a restart answers done. A refusal rolls back and
+//! records nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
+use busbar_contract::abi::sdk::store::column::prefix_end;
+use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::RecordBytes;
@@ -22,7 +23,6 @@ use busbar_contract::records::{
     UsageLedger, VirtualKey,
 };
 use rusqlite::{params, Transaction};
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 
 use crate::{
@@ -30,38 +30,19 @@ use crate::{
     SqliteStore,
 };
 
-/// What an applied op answered, stored with it and replayed verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Answer {
-    Done,
-}
-
 fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
 }
 
-/// Whether `op` is new, a replay (its original answer), or a conflict, read inside `tx`.
-enum Seen {
-    New,
-    Replay(Answer),
-    Conflict,
-}
-
-fn seen(tx: &Transaction<'_>, op: OpId, body: &str) -> Result<Seen, RecordStoreError> {
-    let row: Option<(String, String)> = query_one(
+/// The body recorded under `op` inside its retention, read inside `tx`.
+fn recorded(tx: &Transaction<'_>, op: OpId) -> OpResult<Option<String>> {
+    query_one(
         tx,
-        "SELECT body, answer FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
+        "SELECT body FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
         params![op.0.as_slice(), retention_cutoff(now_secs())],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    Ok(match row {
-        None => Seen::New,
-        Some((b, answer)) if b == body => Seen::Replay(
-            serde_json::from_str(&answer)
-                .map_err(|e| RecordStoreError(format!("store_ops: unreadable answer: {e}")))?,
-        ),
-        Some(_) => Seen::Conflict,
-    })
+        |r| r.get(0),
+    )
+    .map_err(failed)
 }
 
 /// A row recorded at or before this is past its retention: never honoured, swept in time.
@@ -72,15 +53,10 @@ fn retention_cutoff(now: i64) -> i64 {
 /// Ops recorded between retention sweeps.
 const SWEEP_EVERY: u64 = 256;
 
-/// Remember an APPLIED op; every [`SWEEP_EVERY`]th one also forgets the ops past their retention
-/// (`seen` already ignores them, so the sweep only reclaims space).
-fn record(
-    tx: &Transaction<'_>,
-    op: OpId,
-    body: &str,
-    answer: &Answer,
-    sweep: bool,
-) -> Result<(), RecordStoreError> {
+/// Remember an APPLIED op's body ([`Dedupe::body_hex`]: the column is TEXT); every [`SWEEP_EVERY`]th one also
+/// forgets the ops past their retention (`recorded` already ignores them, so the sweep only
+/// reclaims space). `answer` is written as the one answer older builds read back (`"Done"`).
+fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStoreResult<()> {
     let now = now_secs();
     if sweep {
         exec(
@@ -89,43 +65,42 @@ fn record(
             params![retention_cutoff(now)],
         )?;
     }
-    let answer =
-        serde_json::to_string(answer).map_err(|e| RecordStoreError(format!("store_ops: {e}")))?;
     exec(
         tx,
-        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, answer=excluded.answer, \
-         recorded_at=excluded.recorded_at",
-        params![op.0.as_slice(), body, answer, now],
+        "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, '\"Done\"', ?3) \
+         ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, recorded_at=excluded.recorded_at",
+        params![op.0.as_slice(), body, now],
     )
     .map(drop)
 }
 
 impl SqliteStore {
-    /// Run one `op_id`-carrying write in ONE `BEGIN IMMEDIATE` transaction at FULL sync: a replay
-    /// answers the original, a conflict applies nothing, and a new op runs `apply` and is recorded
-    /// only if it applied. A refusal from `apply` rolls the transaction back.
+    /// Run one `op_id`-carrying write deduped ([`Dedupe::run`]) in ONE `BEGIN IMMEDIATE`
+    /// transaction at FULL sync. A refusal rolls the transaction back.
     fn op(
         &self,
         op: OpId,
-        body: &str,
-        apply: impl FnOnce(&Transaction<'_>) -> OpResult<Answer>,
-    ) -> OpResult<Answer> {
+        dedupe: Dedupe<'_>,
+        apply: impl FnOnce(&Transaction<'_>) -> RecordStoreResult<()>,
+    ) -> OpResult<()> {
         let mut refusal = None;
         let ran = self.write(true, |tx| {
-            match seen(tx, op, body)? {
-                Seen::Replay(a) => return Ok(a),
-                Seen::Conflict => refusal = Some(OpRefused::Conflict),
-                Seen::New => match apply(tx) {
-                    Ok(a) => {
+            let mut tx = tx;
+            dedupe
+                .run(
+                    &mut tx,
+                    |tx| recorded(tx, op),
+                    |tx, _| {
+                        apply(tx).map_err(failed)?;
                         let n = self.ops_recorded.fetch_add(1, Ordering::Relaxed);
-                        record(tx, op, body, &a, n.is_multiple_of(SWEEP_EVERY))?;
-                        return Ok(a);
-                    }
-                    Err(e) => refusal = Some(e),
-                },
-            }
-            Err(RecordStoreError("op refused".into()))
+                        record(tx, op, &dedupe.body_hex(), n.is_multiple_of(SWEEP_EVERY))
+                            .map_err(failed)
+                    },
+                )
+                .map_err(|e| {
+                    refusal = Some(e);
+                    RecordStoreError("op refused".into())
+                })
         });
         ran.map_err(|e| refusal.unwrap_or_else(|| failed(e)))
     }
@@ -138,12 +113,9 @@ impl SqliteStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> OpResult<()> {
-        let body = format!("append_plane_record:{record:?}");
-        self.op(op, &body, |tx| {
-            append_plane_record_in(tx, record).map_err(failed)?;
-            Ok(Answer::Done)
+        self.op(op, Dedupe::append(record), |tx| {
+            append_plane_record_in(tx, record)
         })
-        .map(drop)
     }
 
     /// An upsert on `(schema, key)`; an EMPTY value removes the row (the host's strike), and
@@ -204,7 +176,7 @@ impl SqliteStore {
             &self.lock_reader(),
             "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
              AND (?3 IS NULL OR record_key < ?3) ORDER BY record_key LIMIT ?4",
-            params![schema, prefix, prefix_successor(prefix), i64::from(limit)],
+            params![schema, prefix, prefix_end(prefix), i64::from(limit)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| e.0)?;
@@ -218,25 +190,17 @@ impl SqliteStore {
         op: OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> OpResult<()> {
-        let body = format!("add_usage_batch:{cells:?}");
-        self.op(op, &body, |tx| {
-            for (bucket, window, delta) in cells {
-                add_usage_in(tx, bucket, *window, delta).map_err(failed)?;
-            }
-            Ok(Answer::Done)
+        self.op(op, Dedupe::usage(cells), |tx| {
+            cells
+                .iter()
+                .try_for_each(|(bucket, window, delta)| add_usage_in(tx, bucket, *window, delta))
         })
-        .map(drop)
     }
 
     pub(crate) fn v3_add_metering_batch(&self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
-        let body = format!("add_metering_batch:{deltas:?}");
-        self.op(op, &body, |tx| {
-            for d in deltas {
-                add_metering_in(tx, d).map_err(failed)?;
-            }
-            Ok(Answer::Done)
+        self.op(op, Dedupe::metering(deltas), |tx| {
+            deltas.iter().try_for_each(|d| add_metering_in(tx, d))
         })
-        .map(drop)
     }
 }
 
@@ -311,15 +275,6 @@ fn settings_str(settings: &[u8]) -> Result<&str, String> {
 /// A stored record's bytes as the contract's bounded record.
 fn record_bytes(v: Vec<u8>) -> Result<RecordBytes, String> {
     RecordBytes::new(v).map_err(|n| format!("a stored record of {n} bytes is over the ceiling"))
-}
-
-/// The smallest byte string greater than every string `prefix` starts: the last byte that is not
-/// `0xff` incremented, the rest dropped. `None` when there is none (every byte `0xff`, or empty).
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let i = prefix.iter().rposition(|&b| b != 0xff)?;
-    let mut end = prefix[..=i].to_vec();
-    end[i] += 1;
-    Some(end)
 }
 
 #[cfg(test)]
