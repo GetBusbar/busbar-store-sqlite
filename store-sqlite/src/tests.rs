@@ -219,6 +219,23 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
 
 /// The credential-side half of the same revision-based hydration mechanism as
 /// `list_keys_since_only_returns_keys_past_the_watermark` — had zero coverage before this test.
+/// A row never stamped with a revision (0) always reads as changed.
+#[test]
+fn list_keys_since_lists_an_unstamped_revision_zero_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_zero", "g")).unwrap();
+    s.lock_writer()
+        .execute("UPDATE keys SET revision = 0 WHERE id = 'vk_zero'", [])
+        .unwrap();
+    let ids: Vec<_> = s
+        .list_keys_since(5)
+        .unwrap()
+        .into_iter()
+        .map(|k| k.id)
+        .collect();
+    assert_eq!(ids, vec!["vk_zero".to_string()]);
+}
+
 #[test]
 fn list_credentials_since_only_returns_credentials_past_the_watermark() {
     let s = SqliteStore::open_in_memory().unwrap();
