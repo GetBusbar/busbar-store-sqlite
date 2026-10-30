@@ -572,3 +572,108 @@ fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
         "rows past the prefix were stepped over: {few} vs {many}"
     );
 }
+
+fn ops_recorded(s: &SqliteStore) -> i64 {
+    s.lock_writer()
+        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A failed op (a fork) records nothing, so the same `op_id` retried with a record that does not
+/// fork applies instead of conflicting.
+#[test]
+fn a_failed_op_records_nothing_and_its_op_id_can_be_retried() {
+    let s = fresh();
+    let rec = |seq: u64, body: &'static [u8]| PlaneRecordRef {
+        kind: "task_event",
+        id: "e1",
+        parent: Some("t1"),
+        seq,
+        ts: 5,
+        disposition: busbar_contract::records::PlaneDisposition::Active,
+        body,
+    };
+    s.v3_append_plane_record_op(op(1), rec(1, b"{}")).unwrap();
+    assert!(matches!(
+        s.v3_append_plane_record_op(op(2), rec(1, b"{\"x\":1}")),
+        Err(OpRefused::Failed(_))
+    ));
+    assert_eq!(ops_recorded(&s), 1, "the fork recorded its op_id");
+    s.v3_append_plane_record_op(op(2), rec(2, b"{}"))
+        .expect("the retry of the failed op_id applies");
+    assert_eq!(ops_recorded(&s), 2);
+}
+
+/// A usage batch whose second cell fails rolls back the first and records nothing.
+#[test]
+fn a_usage_batch_whose_second_cell_fails_rolls_back_the_first() {
+    let s = fresh();
+    s.lock_writer()
+        .execute_batch("ALTER TABLE usage_window_units RENAME TO units_away")
+        .unwrap();
+    let open_unit = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokensDelta {
+            model: "m".to_string(),
+            usage_units: [("custom".to_string(), 1)].into_iter().collect(),
+        }],
+    };
+    let cells = [("k", 60, delta(1, 1)), ("k", 61, open_unit)];
+    assert!(matches!(
+        s.v3_add_usage_batch(op(1), &cells),
+        Err(OpRefused::Failed(_))
+    ));
+    let rows: i64 = s
+        .lock_writer()
+        .query_row("SELECT COUNT(*) FROM usage_windows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the first cell was not rolled back");
+    assert_eq!(ops_recorded(&s), 0);
+    s.lock_writer()
+        .execute_batch("ALTER TABLE units_away RENAME TO usage_window_units")
+        .unwrap();
+    s.v3_add_usage_batch(op(1), &cells)
+        .expect("the retry applies");
+    assert_eq!(RecordStore::get_usage(&s, "k", 60).unwrap().requests, 1);
+}
+
+/// The retention sweep runs every `SWEEP_EVERY`th recorded op and drops only rows past retention.
+#[test]
+fn the_retention_sweep_deletes_aged_rows_every_sweep_every_ops() {
+    let s = fresh();
+    s.v3_add_usage_batch(op(0), &[("k", 60, delta(1, 1))])
+        .unwrap(); // the first op sweeps
+    let aged = |s: &SqliteStore| -> i64 {
+        s.lock_writer()
+            .query_row(
+                "SELECT COUNT(*) FROM store_ops WHERE recorded_at < 1000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    {
+        let c = s.lock_writer();
+        for i in 0..5u64 {
+            c.execute(
+                "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, 'x', '', 1)",
+                [OpId::from_parts(9, i).0.as_slice()],
+            )
+            .unwrap();
+        }
+    }
+    for n in 1..SWEEP_EVERY {
+        s.v3_add_usage_batch(op(n), &[("k", 60, delta(1, 1))])
+            .unwrap();
+    }
+    assert_eq!(aged(&s), 5, "swept before SWEEP_EVERY ops");
+    s.v3_add_usage_batch(op(SWEEP_EVERY), &[("k", 60, delta(1, 1))])
+        .unwrap();
+    assert_eq!(aged(&s), 0, "aged rows survived the sweep");
+    assert_eq!(
+        ops_recorded(&s),
+        SWEEP_EVERY as i64 + 1,
+        "fresh rows were swept"
+    );
+}
