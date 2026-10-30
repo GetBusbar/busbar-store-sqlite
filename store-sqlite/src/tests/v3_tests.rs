@@ -555,11 +555,16 @@ fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
         assert_eq!(rows.len(), 1);
         STEPS.load(Ordering::Relaxed)
     };
+    steps(&s); // prepares and caches the statement
     let few = steps(&s);
     for i in 0..2000u32 {
         s.v3_record_put("p", format!("z{i:05}").as_bytes(), b"v")
             .expect("put");
     }
     let many = steps(&s);
-    assert_eq!(few, many, "rows past the prefix were stepped over");
+    // A deeper b-tree costs a step or two; stepping over 2000 rows costs thousands.
+    assert!(
+        many <= few + 10,
+        "rows past the prefix were stepped over: {few} vs {many}"
+    );
 }
