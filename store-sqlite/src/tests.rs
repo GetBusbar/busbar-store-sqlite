@@ -124,17 +124,17 @@ fn oversized_labels_are_refused_with_a_clear_text() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut k = sample_key("vk_big", "g");
     k.labels.insert("k".into(), "x".repeat(5000));
-    let n = serde_json::to_string(&k.labels).unwrap().len();
+    let n = serde_json::to_string(&k.labels).unwrap().chars().count();
     assert_eq!(
         s.put_key(&k).unwrap_err().0,
-        format!("put_key: labels of key vk_big are {n} bytes, over the 4096-byte limit")
+        format!("put_key: labels of key vk_big are {n} characters, over the 4096-character limit")
     );
     assert_eq!(
         s.put_key_with_credential(&k, &sample_credential("vk_big", "AKIA_BIG", 0))
             .unwrap_err()
             .0,
         format!(
-            "put_key_with_credential: labels of key vk_big are {n} bytes, over the 4096-byte limit"
+            "put_key_with_credential: labels of key vk_big are {n} characters, over the 4096-character limit"
         )
     );
 }
@@ -146,7 +146,8 @@ fn multibyte_labels_under_the_character_limit_are_accepted() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut k = sample_key("vk_cjk", "g");
     k.labels.insert("k".into(), "\u{4e2d}".repeat(2000));
-    s.put_key(&k).expect("2000 characters fit the 4096-character CHECK");
+    s.put_key(&k)
+        .expect("2000 characters fit the 4096-character CHECK");
 }
 
 #[test]
@@ -247,8 +248,6 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     assert_eq!(delta[0].id, "vk_b");
 }
 
-/// The credential-side half of the same revision-based hydration mechanism as
-/// `list_keys_since_only_returns_keys_past_the_watermark` — had zero coverage before this test.
 /// A row never stamped with a revision (0) always reads as changed.
 #[test]
 fn list_keys_since_lists_an_unstamped_revision_zero_row() {
@@ -266,6 +265,8 @@ fn list_keys_since_lists_an_unstamped_revision_zero_row() {
     assert_eq!(ids, vec!["vk_zero".to_string()]);
 }
 
+/// The credential-side half of the same revision-based hydration mechanism as
+/// `list_keys_since_only_returns_keys_past_the_watermark` — had zero coverage before this test.
 #[test]
 fn list_credentials_since_only_returns_credentials_past_the_watermark() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -1368,6 +1369,11 @@ fn a_file_backed_writer_runs_wal_with_the_size_limit_and_autocheckpoint() {
         pragma("wal_autocheckpoint"),
         rusqlite::types::Value::Integer(2000)
     );
+    assert_eq!(
+        pragma("busy_timeout"),
+        rusqlite::types::Value::Integer(5000),
+        "the configured busy_timeout_ms reaches the writer"
+    );
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2316,10 +2322,6 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     );
 }
 
-/// A `seq`/`ts` past `i64::MAX` cannot be stored faithfully — `as i64` wraps it negative and the
-/// read clamps back — so the row read back would not be the row written: a wrapped `seq` reorders a
-/// chain, a wrapped `ts` changes what retention does to it. Refused outright, exactly as
-/// `append_audit` refuses it, rather than silently mangled.
 /// The contract upserts by `(kind, id)`: a record's own `seq` never makes a second row.
 #[test]
 fn upsert_plane_record_ignores_seq_and_keeps_one_row() {
@@ -2346,6 +2348,10 @@ fn upsert_plane_record_ignores_seq_and_keeps_one_row() {
     assert_eq!(n, 1);
 }
 
+/// A `seq`/`ts` past `i64::MAX` cannot be stored faithfully — `as i64` wraps it negative and the
+/// read clamps back — so the row read back would not be the row written: a wrapped `seq` reorders a
+/// chain, a wrapped `ts` changes what retention does to it. Refused outright, exactly as
+/// `append_audit` refuses it, rather than silently mangled.
 #[test]
 fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();

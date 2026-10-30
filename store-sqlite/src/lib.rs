@@ -747,8 +747,8 @@ fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
     })
 }
 
-/// The `keys_labels_json` CHECK's ceiling on the serialized labels.
-const MAX_LABELS_BYTES: usize = 4096;
+/// The `keys_labels_json` CHECK's ceiling on the serialized labels, in characters (`length()`).
+const MAX_LABELS_CHARS: usize = 4096;
 
 fn put_key_inner(
     conn: &rusqlite::Connection,
@@ -757,11 +757,11 @@ fn put_key_inner(
     method: &str,
 ) -> RecordStoreResult<()> {
     let labels = serde_json::to_string(&key.labels).unwrap_or_else(|_| "{}".to_string());
-    if labels.len() > MAX_LABELS_BYTES {
+    let chars = labels.chars().count();
+    if chars > MAX_LABELS_CHARS {
         return Err(RecordStoreError(format!(
-            "{method}: labels of key {} are {} bytes, over the {MAX_LABELS_BYTES}-byte limit",
-            key.id,
-            labels.len()
+            "{method}: labels of key {} are {chars} characters, over the {MAX_LABELS_CHARS}-character limit",
+            key.id
         )));
     }
     // `?6` (created_at) seeds `updated_at` on INSERT, but the ON CONFLICT branch stamps `?12`, the
