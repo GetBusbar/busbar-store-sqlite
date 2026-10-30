@@ -979,7 +979,7 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
 
 impl RecordStore for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
-        self.write(false, |tx| put_key_inner(tx, key, Self::bump_revision(tx)?))
+        self.write(true, |tx| put_key_inner(tx, key, Self::bump_revision(tx)?))
     }
 
     fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
