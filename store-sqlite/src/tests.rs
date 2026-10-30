@@ -1090,6 +1090,38 @@ fn now_secs_reflects_the_actual_current_time_not_a_constant() {
     );
 }
 
+/// `PRAGMA synchronous` on the writer: 1 = NORMAL, 2 = FULL.
+fn writer_synchronous(s: &SqliteStore) -> i64 {
+    s.lock_writer()
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Rotate/disable/tombstone and mint writes commit at FULL; the ledger path stays NORMAL.
+#[test]
+fn durable_writes_commit_at_synchronous_full_and_ledger_writes_at_normal() {
+    const NORMAL: i64 = 1;
+    const FULL: i64 = 2;
+    let dir = tempdir();
+    let s = SqliteStore::open(dir.join("sync.db").to_str().unwrap(), 5000).unwrap();
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    assert_eq!(writer_synchronous(&s), NORMAL, "add_usage");
+    s.put_key(&sample_key("vk_sync", "g")).unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "put_key");
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    assert_eq!(writer_synchronous(&s), NORMAL, "add_usage after put_key");
+    s.delete_key("vk_sync").unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "delete_key");
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    s.put_key_with_credential(
+        &sample_key("vk_sync2", "g"),
+        &sample_credential("vk_sync2", "AKIA_SYNC", 0),
+    )
+    .unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "put_key_with_credential");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
 fn tempdir() -> std::path::PathBuf {
