@@ -72,17 +72,31 @@ impl Settings {
         let v: serde_json::Value = if cfg.trim().is_empty() {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_str(cfg).map_err(|e| format!("invalid sqlite plugin config: {e}"))?
+            serde_json::from_str(cfg).map_err(|e| format!("{BAD}: {e}"))?
         };
-        if let Some(obj) = v.as_object() {
-            if let Some(unknown) = obj
-                .keys()
-                .find(|k| !matches!(k.as_str(), "db_path" | "busy_timeout_ms"))
-            {
-                return Err(format!(
-                    "{BAD}: unknown setting `{unknown}` (accepted: db_path, busy_timeout_ms)"
-                ));
+        let v = match v {
+            serde_json::Value::Null => serde_json::Value::Object(Default::default()),
+            serde_json::Value::Object(_) => v,
+            other => {
+                let ty = match other {
+                    serde_json::Value::String(_) => "a string",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Number(_) => "a number",
+                    _ => "a boolean",
+                };
+                return Err(format!("{BAD}: expected a JSON object, got {ty}"));
             }
+        };
+        // `license_key` is a declared secret ref a 1.5.5 config carried; accepted and ignored.
+        if let Some(unknown) = v
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.keys())
+            .find(|k| !matches!(k.as_str(), "db_path" | "busy_timeout_ms" | "license_key"))
+        {
+            return Err(format!(
+                "{BAD}: unknown setting `{unknown}` (accepted: db_path, busy_timeout_ms, license_key)"
+            ));
         }
         let path = match v.get("db_path") {
             None | Some(serde_json::Value::Null) => "busbar-governance.db".to_owned(),
@@ -93,18 +107,14 @@ impl Settings {
                 ))
             }
             Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => {
-                return Err(format!(
-                    "invalid sqlite plugin config: `db_path` must be a string, got {other}"
-                ))
-            }
+            Some(other) => return Err(format!("{BAD}: `db_path` must be a string, got {other}")),
         };
         let busy_timeout_ms = match v.get("busy_timeout_ms") {
             None | Some(serde_json::Value::Null) => 5000,
             Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
-                let ms = n.as_i64().ok_or_else(|| {
-                    format!("invalid sqlite plugin config: `busy_timeout_ms` out of range, got {n}")
-                })?;
+                let ms = n
+                    .as_i64()
+                    .ok_or_else(|| format!("{BAD}: `busy_timeout_ms` out of range, got {n}"))?;
                 // Negative is a config mistake and SQLite would silently disable the busy handler;
                 // `0` is a legal, deliberate "never retry".
                 if ms < 0 {
