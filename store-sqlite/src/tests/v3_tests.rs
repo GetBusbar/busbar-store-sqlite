@@ -300,11 +300,38 @@ fn an_empty_put_removes_the_row() {
 }
 
 #[test]
-fn prefix_successor_bounds_every_key_the_prefix_starts() {
-    assert_eq!(prefix_successor(b"ab"), Some(b"ac".to_vec()));
-    assert_eq!(prefix_successor(b"a\xff"), Some(b"b".to_vec()));
-    assert_eq!(prefix_successor(b"\xff\xff"), None);
-    assert_eq!(prefix_successor(b""), None);
+fn a_prefix_scan_returns_exactly_the_keys_the_prefix_starts() {
+    let s = fresh();
+    for k in [
+        &b"aa"[..],
+        b"ab",
+        b"ab\x00",
+        b"ac",
+        b"a\xff",
+        b"a\xff\x01",
+        b"b",
+        b"\xff\xff",
+        b"\xff\xff\x00",
+    ] {
+        s.v3_record_put("p", k, b"v").expect("put");
+    }
+    let keys = |prefix: &[u8]| -> Vec<Vec<u8>> {
+        s.v3_record_scan("p", prefix, 100)
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(keys(b"ab"), vec![b"ab".to_vec(), b"ab\x00".to_vec()]);
+    assert_eq!(
+        keys(b"a\xff"),
+        vec![b"a\xff".to_vec(), b"a\xff\x01".to_vec()]
+    );
+    assert_eq!(
+        keys(b"\xff\xff"),
+        vec![b"\xff\xff".to_vec(), b"\xff\xff\x00".to_vec()],
+        "an all-0xff prefix is unbounded above"
+    );
 }
 
 /// S4: dedupe is DURABLE. Every write below is replayed on a REOPENED file: the replays apply

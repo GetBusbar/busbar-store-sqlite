@@ -215,8 +215,8 @@ CREATE TABLE IF NOT EXISTS plane_tokens (
     PRIMARY KEY (kind, token)
 ) STRICT, WITHOUT ROWID;
 
--- The durable `op_id` dedupe log: an applied op is remembered with its value fields and answer in
--- the same transaction as its effect, so a replay after a restart answers the original.
+-- The durable `op_id` dedupe log: an applied op's body (`Dedupe::body_hex`; an older build's
+-- `{:?}` form still replays) in the same transaction as its effect. `answer` is a constant.
 CREATE TABLE IF NOT EXISTS store_ops (
     op_id       BLOB NOT NULL PRIMARY KEY,
     body        TEXT NOT NULL,
