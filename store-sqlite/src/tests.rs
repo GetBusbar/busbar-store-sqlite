@@ -722,9 +722,23 @@ fn metering_accumulates_and_carries_group_and_pricing_attribution() {
 fn denylist_add_and_list_and_idempotent() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.add_denylist("vk_d", "compromised").unwrap();
-    s.add_denylist("vk_d", "compromised again").unwrap(); // idempotent, updates reason
+    s.add_denylist("vk_d", "compromised again").unwrap(); // idempotent, a no-op
     let list = s.list_denylist().unwrap();
     assert_eq!(list, vec!["vk_d".to_string()]);
+}
+
+#[test]
+fn add_denylist_twice_is_a_no_op_that_keeps_the_first_reason() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.add_denylist("vk_d", "a").unwrap();
+    s.add_denylist("vk_d", "b").unwrap();
+    let reason: String = s
+        .lock_writer()
+        .query_row("SELECT reason FROM denylist WHERE sub='vk_d'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(reason, "a");
 }
 
 // ── Audit log ────────────────────────────────────────────────────────────────────────────────
