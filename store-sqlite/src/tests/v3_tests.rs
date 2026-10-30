@@ -532,3 +532,34 @@ fn values_the_columns_cannot_hold_are_refused_not_failed() {
         .unwrap();
     assert_eq!(n, 0, "a refused op records nothing");
 }
+
+/// A bounded prefix scan stops at the prefix: the VM work does not grow with the rows past it.
+#[test]
+fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STEPS: AtomicU64 = AtomicU64::new(0);
+    let s = fresh();
+    s.v3_record_put("p", b"aa", b"v").expect("put");
+    let steps = |s: &SqliteStore| {
+        // `:memory:` has one connection, so the scan runs on the writer holding the handler.
+        s.lock_writer().progress_handler(
+            1,
+            Some(|| {
+                STEPS.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        STEPS.store(0, Ordering::Relaxed);
+        let rows = s.v3_record_scan("p", b"a", 100).expect("scan");
+        s.lock_writer().progress_handler(1, None::<fn() -> bool>);
+        assert_eq!(rows.len(), 1);
+        STEPS.load(Ordering::Relaxed)
+    };
+    let few = steps(&s);
+    for i in 0..2000u32 {
+        s.v3_record_put("p", format!("z{i:05}").as_bytes(), b"v")
+            .expect("put");
+    }
+    let many = steps(&s);
+    assert_eq!(few, many, "rows past the prefix were stepped over");
+}
