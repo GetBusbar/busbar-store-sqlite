@@ -107,8 +107,10 @@ fn empty_and_bare_object_configs_use_defaults_and_succeed() {
 
 #[test]
 fn explicit_in_memory_db_path_is_honored() {
-    // Proves `db_path` is actually read (not ignored in favor of the default) via the one value
-    // that's observable without touching disk: `:memory:` opens instantly with no file created.
+    // `db_path` is read, not ignored for the default: nothing is created in the cwd, and two opens
+    // of `:memory:` do not share data, which a file would.
+    let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cwd = ScratchCwd::enter("explicit-memory");
     let store = open(r#"{"db_path": ":memory:"}"#).expect("in-memory db_path must open");
     let key = busbar_contract::records::VirtualKey {
         id: "vk_adapter_test".into(),
@@ -130,6 +132,12 @@ fn explicit_in_memory_db_path_is_honored() {
     assert_eq!(
         store.get_key("vk_adapter_test").unwrap().unwrap().id,
         "vk_adapter_test"
+    );
+    let other = open(r#"{"db_path": ":memory:"}"#).unwrap();
+    assert!(other.get_key("vk_adapter_test").unwrap().is_none());
+    assert!(
+        !cwd.scratch.join("busbar-governance.db").exists(),
+        "a `:memory:` db_path must not create the default file"
     );
 }
 
