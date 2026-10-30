@@ -1047,6 +1047,31 @@ fn lock_reader_round_robins_without_ever_indexing_out_of_bounds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A busy reader must not make `lock_reader` wait while another reader sits idle.
+#[test]
+fn lock_reader_skips_a_busy_reader_when_another_is_idle() {
+    let dir = tempdir();
+    let file = dir.join("readers_busy.db");
+    let s = std::sync::Arc::new(
+        SqliteStore::open_with_readers(file.to_str().unwrap(), 5000, 3).unwrap(),
+    );
+    let held = s.readers[0].lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let s2 = s.clone();
+    std::thread::spawn(move || {
+        for _ in 0..6 {
+            drop(s2.lock_reader());
+            let _ = tx.send(());
+        }
+    });
+    for i in 0..6 {
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("lock_reader call {i} blocked on the held reader"));
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
     // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
