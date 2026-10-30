@@ -12,7 +12,7 @@
 //! records nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::column::prefix_end;
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -32,6 +32,11 @@ use crate::{
 
 fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
+}
+
+/// A value the columns cannot hold: nothing applied, the host may split or re-send.
+fn refused(e: RecordStoreError) -> OpRefused {
+    OpRefused::Refused(e.0)
 }
 
 /// The body recorded under `op` inside its retention, read inside `tx`.
@@ -113,6 +118,8 @@ impl SqliteStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> OpResult<()> {
+        storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
+        storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
         self.op(op, Dedupe::append(record), |tx| {
             append_plane_record_in(tx, record)
         })
@@ -198,6 +205,9 @@ impl SqliteStore {
     }
 
     pub(crate) fn v3_add_metering_batch(&self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
+        for d in deltas {
+            storable_i64("add_metering", "priced_from_ms", d.priced_from_ms).map_err(refused)?;
+        }
         self.op(op, Dedupe::metering(deltas), |tx| {
             deltas.iter().try_for_each(|d| add_metering_in(tx, d))
         })
