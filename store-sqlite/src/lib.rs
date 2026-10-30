@@ -1346,7 +1346,7 @@ impl RecordStore for SqliteStore {
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(sub) DO UPDATE SET reason = excluded.reason",
+                 ON CONFLICT(sub) DO NOTHING",
                 params![sub, reason, now_secs()],
             )
             .store()
