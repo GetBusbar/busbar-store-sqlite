@@ -561,12 +561,13 @@ impl SqliteStore {
     /// Bump the store-global revision counter, inside the same `BEGIN IMMEDIATE` transaction as the
     /// mutation it stamps (`RETURNING` hands the value back in one round trip).
     fn bump_revision(tx: &rusqlite::Transaction) -> RecordStoreResult<i64> {
-        tx.query_row(
+        query_one(
+            tx,
             "UPDATE store_revision SET revision = revision + 1 WHERE id = 0 RETURNING revision",
             [],
             |r| r.get(0),
-        )
-        .store()
+        )?
+        .ok_or_else(|| RecordStoreError("store_revision row missing".into()))
     }
 }
 
@@ -945,35 +946,33 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
     // retry would compare unequal and be reported as a forked chain. Rejected outright.
     let seq = column::storable_i64("append_audit", "seq", entry.seq)?;
     let ts = column::storable_i64("append_audit", "ts", entry.ts)?;
-    let affected = tx
-        .execute(
-            "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+    let affected = exec(
+        tx,
+        "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(seq) DO NOTHING",
-            params![
-                seq,
-                ts,
-                entry.action,
-                entry.resource,
-                entry.outcome,
-                entry.principal,
-                entry.prev_hash,
-                entry.hash,
-            ],
-        )
-        .store()?;
+        params![
+            seq,
+            ts,
+            entry.action,
+            entry.resource,
+            entry.outcome,
+            entry.principal,
+            entry.prev_hash,
+            entry.hash,
+        ],
+    )?;
     // A collision is EITHER the write-through retrying (identical: Ok) or two records claiming one
     // chain position (a forked or tampered log, the thing an audit store must report).
     if affected == 0 {
-        let stored = tx
-            .query_row(
-                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                 FROM audit_log WHERE seq=?1",
-                params![seq],
-                row_to_audit,
-            )
-            .store()?;
-        if &stored != entry {
+        let stored = query_one(
+            tx,
+            "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+             FROM audit_log WHERE seq=?1",
+            params![seq],
+            row_to_audit,
+        )?;
+        if stored.as_ref() != Some(entry) {
             return Err(fork::audit_fork(entry.seq));
         }
     }
@@ -989,15 +988,13 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
         seq,
         "append_plane_record",
     )?;
-    let existing: Option<StoredPlaneRow> = tx
-        .query_row(
-            "SELECT id, parent, ts, disposition, body FROM plane_records \
-             WHERE kind=?1 AND identity=?2 AND seq=?3",
-            params![record.kind, row.identity, row.seq],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()
-        .store()?;
+    let existing: Option<StoredPlaneRow> = query_one(
+        tx,
+        "SELECT id, parent, ts, disposition, body FROM plane_records \
+         WHERE kind=?1 AND identity=?2 AND seq=?3",
+        params![record.kind, row.identity, row.seq],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
     if let Some((id, parent, ts, disposition, body)) = existing {
         // Identical is the write-through retrying (success); different is a forked chain (an error,
         // as in `append_audit`). The message names the position and echoes no stored content.
@@ -1011,12 +1008,12 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
         }
         return Err(fork::chain_fork(record.kind, &row.identity, record.seq));
     }
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         row.params(&record),
-    )
-    .store()?;
+    )?;
     Ok(())
 }
 
@@ -1420,14 +1417,12 @@ impl RecordStore for SqliteStore {
     /// An upserted record lives at `(kind, id, 0)`. No caller-scoping filter: authorization stays
     /// engine-side, or an unauthorized reader bypasses it by configuring a different backend.
     fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
-        self.lock_reader()
-            .query_row(
-                "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
-                params![kind, id, UPSERT_SEQ],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .store()
+        query_one(
+            &self.lock_reader(),
+            "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+            params![kind, id, UPSERT_SEQ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
     }
 
     fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
@@ -1573,15 +1568,12 @@ impl RecordStore for SqliteStore {
         if now > expires_at {
             return Ok(false);
         }
-        let disposition: Option<String> = self
-            .lock_reader()
-            .query_row(
-                "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
-                params![kind, token, UPSERT_SEQ],
-                |r| r.get(0),
-            )
-            .optional()
-            .store()?;
+        let disposition: Option<String> = query_one(
+            &self.lock_reader(),
+            "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+            params![kind, token, UPSERT_SEQ],
+            |r| r.get(0),
+        )?;
         Ok(disposition.as_deref() == Some(DISPOSITION_ACTIVE))
     }
 }
