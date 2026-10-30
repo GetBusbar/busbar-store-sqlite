@@ -1293,6 +1293,32 @@ fn durable_writes_commit_at_synchronous_full_and_ledger_writes_at_normal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A new database file holds recoverable secrets: created 0600, its WAL files alike; an operator's
+/// existing file keeps its mode.
+#[cfg(unix)]
+#[test]
+fn a_new_database_file_is_private_and_an_existing_one_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempdir();
+    let fresh = dir.join("fresh.db");
+    let s = SqliteStore::open(fresh.to_str().unwrap(), 5000).unwrap();
+    s.put_key(&sample_key("vk_mode", "g")).unwrap();
+    assert_eq!(mode(&fresh), 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let side = dir.join(format!("fresh.db{suffix}"));
+        assert!(side.exists(), "{suffix} should exist while open");
+        assert_eq!(mode(&side), 0o600, "{suffix}");
+    }
+    drop(s);
+    let existing = dir.join("existing.db");
+    drop(SqliteStore::open(existing.to_str().unwrap(), 5000).unwrap());
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(SqliteStore::open(existing.to_str().unwrap(), 5000).unwrap());
+    assert_eq!(mode(&existing), 0o644);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
 fn tempdir() -> std::path::PathBuf {
