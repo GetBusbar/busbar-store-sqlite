@@ -449,13 +449,23 @@ impl SqliteStore {
         &self.path
     }
 
-    /// A reader connection; the writer when no reader pool exists (`:memory:`).
+    /// An idle reader connection (round-robin start), else wait on one; the writer when no pool exists (`:memory:`).
     fn lock_reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         if self.readers.is_empty() {
             return self.lock_writer();
         }
-        let i = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[i].lock().unwrap_or_else(|p| p.into_inner())
+        let n = self.readers.len();
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % n;
+        for k in 0..n {
+            match self.readers[(start + k) % n].try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        self.readers[start]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Run `f` in one `BEGIN IMMEDIATE` transaction on the writer, committing when it returns `Ok`.
