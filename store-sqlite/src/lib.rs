@@ -982,9 +982,11 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
 
 /// [`RecordStore::append_plane_record`]'s occupancy check and insert, inside the caller's transaction.
 fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    let seq = column::storable_i64("append_plane_record", "seq", record.seq)?;
     let row = PlaneRow::of(
         record,
         record.parent.unwrap_or(record.id),
+        seq,
         "append_plane_record",
     )?;
     let existing: Option<StoredPlaneRow> = tx
@@ -1400,7 +1402,7 @@ impl RecordStore for SqliteStore {
 
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         // Keyed on the record's own id, parent or not: the contract upserts by `(kind, id)`.
-        let row = PlaneRow::of(record, record.id, "upsert_plane_record")?;
+        let row = PlaneRow::of(record, record.id, UPSERT_SEQ, "upsert_plane_record")?;
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
@@ -1420,8 +1422,8 @@ impl RecordStore for SqliteStore {
     fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
         self.lock_reader()
             .query_row(
-                "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
-                params![kind, id],
+                "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+                params![kind, id, UPSERT_SEQ],
                 |r| r.get::<_, Vec<u8>>(0),
             )
             .optional()
@@ -1574,8 +1576,8 @@ impl RecordStore for SqliteStore {
         let disposition: Option<String> = self
             .lock_reader()
             .query_row(
-                "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
-                params![kind, token],
+                "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+                params![kind, token, UPSERT_SEQ],
                 |r| r.get(0),
             )
             .optional()
@@ -1583,6 +1585,9 @@ impl RecordStore for SqliteStore {
         Ok(disposition.as_deref() == Some(DISPOSITION_ACTIVE))
     }
 }
+
+/// The `seq` an upserted record lives at: the contract upserts by `(kind, id)`.
+const UPSERT_SEQ: i64 = 0;
 
 /// A stored plane row's `(id, parent, ts, disposition, body)`, as the append verb's fork check reads it.
 type StoredPlaneRow = (String, Option<String>, i64, String, Vec<u8>);
@@ -1603,10 +1608,15 @@ impl PlaneRow {
     /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
     /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
     /// upserted record's own id.
-    fn of(record: PlaneRecordRef<'_>, identity: &str, method: &str) -> RecordStoreResult<Self> {
+    fn of(
+        record: PlaneRecordRef<'_>,
+        identity: &str,
+        seq: i64,
+        method: &str,
+    ) -> RecordStoreResult<Self> {
         Ok(Self {
             identity: identity.to_string(),
-            seq: column::storable_i64(method, "seq", record.seq)?,
+            seq,
             ts: column::storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
                 PlaneDisposition::Active => DISPOSITION_ACTIVE,
