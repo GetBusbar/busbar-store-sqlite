@@ -1336,6 +1336,52 @@ fn a_new_database_file_is_private_and_an_existing_one_keeps_its_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The file-backed writer's WAL journal, its size limit and auto-checkpoint, read back.
+#[test]
+fn a_file_backed_writer_runs_wal_with_the_size_limit_and_autocheckpoint() {
+    let dir = tempdir();
+    let s = SqliteStore::open(dir.join("wal.db").to_str().unwrap(), 5000).unwrap();
+    let w = s.lock_writer();
+    let pragma = |name: &str| -> rusqlite::types::Value {
+        w.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        pragma("journal_mode"),
+        rusqlite::types::Value::Text("wal".into())
+    );
+    assert_eq!(
+        pragma("journal_size_limit"),
+        rusqlite::types::Value::Integer(67_108_864)
+    );
+    assert_eq!(
+        pragma("wal_autocheckpoint"),
+        rusqlite::types::Value::Integer(2000)
+    );
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only credential slots 0 and 1 exist.
+#[test]
+fn a_credential_slot_other_than_0_or_1_is_refused() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_slot", "g")).unwrap();
+    for slot in [2u8, 255] {
+        assert!(
+            s.put_credential(&sample_credential(
+                "vk_slot",
+                &format!("AKIA_S{slot}"),
+                slot
+            ))
+            .is_err(),
+            "slot {slot}"
+        );
+    }
+    s.put_credential(&sample_credential("vk_slot", "AKIA_S1", 1))
+        .unwrap();
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
 fn tempdir() -> std::path::PathBuf {
