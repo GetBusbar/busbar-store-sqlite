@@ -120,6 +120,26 @@ fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
 // ── Basic key CRUD ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn oversized_labels_are_refused_with_a_clear_text() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_big", "g");
+    k.labels.insert("k".into(), "x".repeat(5000));
+    let n = serde_json::to_string(&k.labels).unwrap().len();
+    assert_eq!(
+        s.put_key(&k).unwrap_err().0,
+        format!("put_key: labels of key vk_big are {n} bytes, over the 4096-byte limit")
+    );
+    assert_eq!(
+        s.put_key_with_credential(&k, &sample_credential("vk_big", "AKIA_BIG", 0))
+            .unwrap_err()
+            .0,
+        format!(
+            "put_key_with_credential: labels of key vk_big are {n} bytes, over the 4096-byte limit"
+        )
+    );
+}
+
+#[test]
 fn put_get_roundtrips_a_key() {
     let s = SqliteStore::open_in_memory().unwrap();
     let k = sample_key("vk_1", "binding:vk_1:g1");
