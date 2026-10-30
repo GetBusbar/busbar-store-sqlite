@@ -371,3 +371,82 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
         vec![b"{}".to_vec()]
     );
 }
+
+/// A body an older build recorded (`slot:{:?}`) still dedupes after the upgrade, inside the
+/// retention window: the same op replays and applies nothing, a different op conflicts.
+#[test]
+fn an_older_builds_recorded_body_replays_across_the_upgrade() {
+    let s = fresh();
+    let recorded = |n: u64, body: String| {
+        s.lock_writer()
+            .execute(
+                "INSERT INTO store_ops (op_id, body, answer, recorded_at) \
+                 VALUES (?1, ?2, '\"Done\"', ?3)",
+                params![op(n).0.as_slice(), body, now_secs()],
+            )
+            .expect("record");
+    };
+    let cells = [("k", 60, delta(1, 1))];
+    recorded(1, format!("add_usage_batch:{cells:?}"));
+    s.v3_add_usage_batch(op(1), &cells).expect("replay");
+    assert_eq!(
+        RecordStore::get_usage(&s, "k", 60).expect("read").requests,
+        0,
+        "the replay applied nothing"
+    );
+    assert_eq!(
+        s.v3_add_usage_batch(op(1), &[("k", 60, delta(2, 2))]),
+        Err(OpRefused::Conflict)
+    );
+
+    let d = MeteringDelta {
+        key_id: "k".into(),
+        bucket: 86_400,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 3,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 2,
+        billable_requests: 2,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let deltas = std::slice::from_ref(&d);
+    recorded(2, format!("add_metering_batch:{deltas:?}"));
+    s.v3_add_metering_batch(op(2), deltas).expect("replay");
+    assert!(RecordStore::list_metering(&s, 86_400)
+        .expect("list")
+        .is_empty());
+    assert_eq!(
+        s.v3_add_metering_batch(op(2), &[]),
+        Err(OpRefused::Conflict)
+    );
+
+    let rec = |body: &'static [u8]| PlaneRecordRef {
+        kind: "task_event",
+        id: "e1",
+        parent: Some("t1"),
+        seq: 1,
+        ts: 5,
+        disposition: busbar_contract::records::PlaneDisposition::Active,
+        body,
+    };
+    recorded(3, format!("append_plane_record:{:?}", rec(b"{}")));
+    s.v3_append_plane_record_op(op(3), rec(b"{}"))
+        .expect("replay");
+    assert_eq!(
+        s.v3_append_plane_record_op(op(3), rec(b"{\"x\":1}")),
+        Err(OpRefused::Conflict)
+    );
+    assert!(RecordStore::list_plane_records(
+        &s,
+        "task_event",
+        &busbar_contract::records::PlaneSelector::All
+    )
+    .expect("list")
+    .is_empty());
+}
