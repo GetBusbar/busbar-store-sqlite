@@ -381,6 +381,24 @@ pub struct SqliteStore {
     path: String,
 }
 
+/// Create a missing database file 0600 (it holds recoverable secrets) so SQLite, which gives the
+/// `-wal`/`-shm` files the main file's mode, never creates it with the umask. An existing file is
+/// left alone, and so is any failure to create (SQLite reports it on open).
+#[cfg(unix)]
+fn create_private(path: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !path.starts_with("file:") {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path);
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private(_: &str) {}
+
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> RecordStoreResult<Self> {
         // A `:memory:` spelling opens a NEW private database per connection, so a writer plus N
@@ -403,6 +421,7 @@ impl SqliteStore {
         busy_timeout_ms: i64,
         n_readers: usize,
     ) -> RecordStoreResult<Self> {
+        create_private(path);
         let writer_conn = Connection::open(path).store()?;
         apply_pragmas(&writer_conn, path, busy_timeout_ms, true)?;
         let mut readers = Vec::with_capacity(n_readers);
