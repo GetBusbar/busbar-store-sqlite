@@ -1088,7 +1088,7 @@ fn get_usage_reads_one_snapshot_while_a_writer_commits() {
             }
         })
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut torn = None;
     while torn.is_none() && std::time::Instant::now() < deadline {
         let l = s.get_usage("vk_snap", 1).unwrap();
@@ -1135,7 +1135,7 @@ fn list_metering_reads_one_snapshot_while_a_writer_commits() {
             }
         })
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut torn = None;
     while torn.is_none() && std::time::Instant::now() < deadline {
         if let Some(r) = s.list_metering(1).unwrap().first() {

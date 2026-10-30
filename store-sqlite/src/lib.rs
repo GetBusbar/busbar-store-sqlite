@@ -1118,6 +1118,8 @@ impl RecordStore for SqliteStore {
 
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let conn = self.lock_reader();
+        // One deferred read transaction: every SELECT sees the same WAL snapshot (rolled back on drop).
+        let _snapshot = conn.unchecked_transaction().store()?;
         // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
         // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
         let (requests, billable_requests): (i64, i64) = query_one(
@@ -1250,6 +1252,7 @@ impl RecordStore for SqliteStore {
 
     fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let conn = self.lock_reader();
+        let _snapshot = conn.unchecked_transaction().store()?;
         let u = column::read_u64;
         let mut rows = query_all(
             &conn,
