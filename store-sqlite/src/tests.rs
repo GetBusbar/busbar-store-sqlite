@@ -520,6 +520,22 @@ fn credential_public_id_is_globally_unique_per_kind() {
     );
 }
 
+#[test]
+fn a_taken_public_id_is_refused_with_the_intended_text() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_a", "g")).unwrap();
+    s.put_key(&sample_key("vk_b", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
+        .unwrap();
+    let err = s
+        .put_credential(&sample_credential("vk_b", "AKIA_DUP", 0))
+        .unwrap_err();
+    assert_eq!(
+        err.0,
+        "put_credential: public_id AKIA_DUP is already taken for kind sigv4"
+    );
+}
+
 // ── Usage ledger ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
