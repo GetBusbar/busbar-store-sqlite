@@ -641,7 +641,7 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         labels: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
         expires_at: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         deleted_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-        revision: r.get::<_, i64>(10)?.max(0) as u64,
+        revision: column::read_u64(r.get(10)?),
         idp_subject: r.get(12)?,
         binding_mode: r.get(13)?,
         minted_by: r.get(14)?,
@@ -684,7 +684,7 @@ fn row_to_cred_meta(r: &rusqlite::Row) -> rusqlite::Result<CredentialMeta> {
         expires_at: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         revoked_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         revoke_reason: r.get(10)?,
-        revision: r.get::<_, i64>(11)?.max(0) as u64,
+        revision: column::read_u64(r.get(11)?),
     })
 }
 const CRED_META_COLS: &str =
@@ -871,21 +871,16 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
 fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()> {
     // A `seq` / `ts` past `i64::MAX` would wrap negative and read back clamped to 0, so an identical
     // retry would compare unequal and be reported as a forked chain. Rejected outright.
-    if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-        return Err(RecordStoreError(format!(
-            "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
-             store a record that would not read back as itself",
-            entry.seq, entry.ts
-        )));
-    }
+    let seq = column::storable_i64("append_audit", "seq", entry.seq)?;
+    let ts = column::storable_i64("append_audit", "ts", entry.ts)?;
     let affected = tx
         .execute(
             "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(seq) DO NOTHING",
             params![
-                entry.seq as i64,
-                entry.ts as i64,
+                seq,
+                ts,
                 entry.action,
                 entry.resource,
                 entry.outcome,
@@ -902,7 +897,7 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
             .query_row(
                 "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
                  FROM audit_log WHERE seq=?1",
-                params![entry.seq as i64],
+                params![seq],
                 row_to_audit,
             )
             .store()?;
@@ -1101,7 +1096,7 @@ impl RecordStore for SqliteStore {
             |r| {
                 let mut units = BTreeMap::new();
                 for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                    let v = r.get::<_, i64>(i + 1)?.max(0) as u64;
+                    let v = column::read_u64(r.get(i + 1)?);
                     // A zero reads as absent, as `ModelTokens` itself reads an absent key.
                     if v != 0 {
                         units.insert(unit.to_string(), v);
@@ -1122,7 +1117,7 @@ impl RecordStore for SqliteStore {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?.max(0) as u64,
+                    column::read_u64(r.get(2)?),
                 ))
             },
         )?;
@@ -1142,8 +1137,8 @@ impl RecordStore for SqliteStore {
             models[at].usage_units.insert(unit, count);
         }
         Ok(UsageLedger {
-            requests: requests.max(0) as u64,
-            billable_requests: billable_requests.max(0) as u64,
+            requests: column::read_u64(requests),
+            billable_requests: column::read_u64(billable_requests),
             models,
         })
     }
@@ -1214,7 +1209,7 @@ impl RecordStore for SqliteStore {
 
     fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let conn = self.lock_reader();
-        let u = |v: i64| v.max(0) as u64;
+        let u = column::read_u64;
         let mut rows = query_all(
             &conn,
             "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read,
@@ -1633,8 +1628,8 @@ fn put_credential_inner(
 
 fn row_to_audit(r: &rusqlite::Row) -> rusqlite::Result<AuditRecord> {
     Ok(AuditRecord {
-        seq: r.get::<_, i64>(0)?.max(0) as u64,
-        ts: r.get::<_, i64>(1)?.max(0) as u64,
+        seq: column::read_u64(r.get(0)?),
+        ts: column::read_u64(r.get(1)?),
         action: r.get(2)?,
         resource: r.get(3)?,
         outcome: r.get(4)?,
