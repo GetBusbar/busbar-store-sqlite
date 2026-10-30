@@ -177,15 +177,27 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); a NULL end
-        // (every byte `0xff`, or empty) is unbounded above.
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = query_all(
-            &self.lock_reader(),
-            "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
-             AND (?3 IS NULL OR record_key < ?3) ORDER BY record_key LIMIT ?4",
-            params![schema, prefix, prefix_end(prefix), i64::from(limit)],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); no successor
+        // (every byte `0xff`, or empty) is unbounded above. Two statements, so the bounded one stops
+        // at the end of the range instead of filtering every row past it.
+        let conn = self.lock_reader();
+        let row = |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?));
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = match prefix_end(prefix) {
+            Some(end) => query_all(
+                &conn,
+                "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
+                 AND record_key < ?3 ORDER BY record_key LIMIT ?4",
+                params![schema, prefix, end, i64::from(limit)],
+                row,
+            ),
+            None => query_all(
+                &conn,
+                "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
+                 ORDER BY record_key LIMIT ?3",
+                params![schema, prefix, i64::from(limit)],
+                row,
+            ),
+        }
         .map_err(|e| e.0)?;
         rows.into_iter()
             .map(|(k, v)| Ok((k, record_bytes(v)?)))
