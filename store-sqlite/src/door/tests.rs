@@ -307,7 +307,7 @@ fn an_unknown_setting_is_refused() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
     assert_eq!(
         err,
-        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms)"
+        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms, license_key)"
     );
 }
 
@@ -323,4 +323,38 @@ fn an_empty_or_blank_db_path_is_refused() {
             "{p:?}: {err}"
         );
     }
+}
+
+/// A non-object top level must not skip the settings check and open the default database.
+#[test]
+fn a_non_object_top_level_is_refused_naming_only_its_type() {
+    use super::Settings;
+    for (cfg, ty) in [
+        (r#""/var/lib/x.db""#, "a string"),
+        ("[]", "an array"),
+        ("5", "a number"),
+        ("true", "a boolean"),
+    ] {
+        let err = Settings::parse(cfg).unwrap_err();
+        assert_eq!(
+            err,
+            format!("invalid sqlite plugin config: expected a JSON object, got {ty}")
+        );
+        assert!(!err.contains("/var/lib"), "{err}");
+    }
+    assert!(Settings::parse("null").is_ok());
+    assert!(Settings::parse("  ").is_ok());
+}
+
+/// The Statement declares `license_key` a secret ref, so the parser accepts and ignores it.
+#[test]
+fn license_key_is_accepted_and_ignored() {
+    use super::Settings;
+    let s = Settings::parse(r#"{"db_path":":memory:","license_key":"x"}"#).unwrap();
+    assert_eq!(s.db_path, ":memory:");
+    let err = Settings::parse(r#"{"x":1}"#).unwrap_err();
+    assert!(
+        err.contains("(accepted: db_path, busy_timeout_ms, license_key)"),
+        "{err}"
+    );
 }
