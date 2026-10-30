@@ -37,6 +37,8 @@ tracing = { workspace = true }
 # whose `store_v3` cases are the store kind's epoch and slice-life spec every durable store runs
 # (`abi::store::SLICE_TTL_MS`). Same pinned rev, so one contract links.
 [dev-dependencies]
+# `hooks`: the scan test counts SQLite VM steps through `progress_handler`.
+rusqlite = { workspace = true, features = ["hooks"] }
 busbar-contract = { workspace = true, features = ["test-seal"] }
 # `derive` for the tests' legacy row encoders and the conformance suite's stand-in bodies.
 serde = { workspace = true }
