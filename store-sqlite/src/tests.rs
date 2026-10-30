@@ -139,6 +139,16 @@ fn oversized_labels_are_refused_with_a_clear_text() {
     );
 }
 
+/// The CHECK counts characters (`length()` on TEXT), not bytes: multi-byte labels under 4096
+/// characters were always storable and still are.
+#[test]
+fn multibyte_labels_under_the_character_limit_are_accepted() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_cjk", "g");
+    k.labels.insert("k".into(), "\u{4e2d}".repeat(2000));
+    s.put_key(&k).expect("2000 characters fit the 4096-character CHECK");
+}
+
 #[test]
 fn put_get_roundtrips_a_key() {
     let s = SqliteStore::open_in_memory().unwrap();
