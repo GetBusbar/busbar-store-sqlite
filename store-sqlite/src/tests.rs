@@ -1384,7 +1384,29 @@ fn a_credential_slot_other_than_0_or_1_is_refused() {
 
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
-fn tempdir() -> std::path::PathBuf {
+/// A scratch directory removed on drop, so a failing test leaves nothing behind.
+pub(crate) struct TempDir(std::path::PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) fn tempdir() -> TempDir {
     let mut p = std::env::temp_dir();
     p.push(format!(
         "store-sqlite-test-{}-{}",
@@ -1392,7 +1414,7 @@ fn tempdir() -> std::path::PathBuf {
         unique_suffix()
     ));
     std::fs::create_dir_all(&p).unwrap();
-    p
+    TempDir(p)
 }
 
 fn unique_suffix() -> u64 {
@@ -2970,7 +2992,7 @@ fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
 // (store-sqlite v1.0.6 on busbar 1.5.5, schema v6) — the file every existing deployment has. Each test
 // copies it to a scratch dir, opens it with THIS build, and reads every row back.
 
-fn open_fixture(name: &str) -> (std::path::PathBuf, SqliteStore) {
+fn open_fixture(name: &str) -> (TempDir, SqliteStore) {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
@@ -3175,7 +3197,7 @@ fn a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly() {
 // migration conformance gate (a missing fixture fails CI).
 
 /// Copy the recorded database to a scratch dir; returns the dir and the copied file's path.
-fn copy_the_1_5_5_fixture() -> (std::path::PathBuf, String) {
+fn copy_the_1_5_5_fixture() -> (TempDir, String) {
     let src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1.5.5/governance.db");
     let dir = tempdir();

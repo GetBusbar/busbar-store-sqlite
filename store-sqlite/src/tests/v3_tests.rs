@@ -16,18 +16,10 @@ fn fresh() -> SqliteStore {
 }
 
 /// A store on a real file in a fresh scratch directory, and the file's path.
-fn on_file(tag: &str) -> (SqliteStore, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "store-sqlite-v3-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("v3.db").display().to_string();
-    (SqliteStore::open(&path, 5000).expect("open"), path)
+fn on_file(tag: &str) -> (SqliteStore, String, crate::tests::TempDir) {
+    let dir = crate::tests::tempdir();
+    let path = dir.join(format!("{tag}.db")).display().to_string();
+    (SqliteStore::open(&path, 5000).expect("open"), path, dir)
 }
 
 fn op(n: u64) -> OpId {
@@ -338,7 +330,7 @@ fn a_prefix_scan_returns_exactly_the_keys_the_prefix_starts() {
 /// nothing and answer the originals, and a reused id with another body is still a conflict.
 #[test]
 fn dedupe_survives_a_reopen_of_the_file() {
-    let (s, path) = on_file("durable");
+    let (s, path, _dir) = on_file("durable");
     s.v3_add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
         .expect("usage");
     s.v3_record_put("plane", b"k", b"v").expect("record");
