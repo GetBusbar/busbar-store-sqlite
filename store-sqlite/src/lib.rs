@@ -621,7 +621,7 @@ fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> Record
 
 /// Rebuild a pre-v10 `usage_metering` with `priced_from_ms` in its primary key, the one change SQLite
 /// cannot make in place. Every row is copied at `priced_from_ms = 0`, the opening card's instant.
-/// The column list must stay identical to [`SCHEMA`]'s (`migrated_tables_match_a_fresh_schema`).
+/// The column list must stay identical to [`SCHEMA`]'s (`a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly`).
 /// The trigger naming `usage_metering` is dropped first because `ALTER TABLE ... RENAME` re-parses
 /// every trigger; `SCHEMA` recreates it right after.
 fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResult<()> {

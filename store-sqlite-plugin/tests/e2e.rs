@@ -120,37 +120,6 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
-///
-/// This looks in `target/<profile>/deps/`, NOT `target/<profile>/`, and that distinction is the
-/// whole point of this function.
-///
-/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
-/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
-/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml — so `deps/libbusbar_store_sqlite_plugin.dylib`
-/// is by construction up to date with the source tree being tested). It only *uplifts* a copy to
-/// `target/<profile>/` for `cargo build`, NEVER for `cargo test`. So the old lookup in
-/// `target/<profile>/` read an artifact that nothing in the test's dependency graph ever refreshes:
-/// whatever some earlier `cargo build` happened to leave there, from any commit, or nothing at all.
-///
-/// Both failure modes of that are lies about durability, and the second is the dangerous one:
-///   * NOTHING there  -> the test used to `return` with a "skip:" line and report GREEN, which is
-///     how `cargo test --workspace` on a fresh clone reported success with ZERO over-the-ABI
-///     coverage of the ten task/call-log methods.
-///   * STALE artifact -> a cdylib older than the ABI relay answers every write `Ok(())` and every
-///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl RecordStore` overrode 24 methods, none
-///     of them task methods, so `put_task` took the accept-and-keep-nothing trait default). RED on
-///     a stale artifact is indistinguishable from RED on the real bug; and an artifact that happens
-///     to be NEWER than a regression reports GREEN while the shipped ABI is broken.
-///
-/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
-/// `busbar-store-example-plugin`: put the cdylib in the graph so the test cannot judge a stale one.
-/// Here the plugin's lib IS this package, so the graph edge already exists — what was missing was
-/// looking at the artifact that edge produces.
-///
-/// Panics rather than skipping. A missing cdylib under `cargo test` means the build graph changed
-/// shape, and the only honest report is a failure, not a silent pass.
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
 /// one this source tree describes".
 ///
@@ -197,6 +166,37 @@ fn newest_source_mtime() -> std::time::SystemTime {
     newest
 }
 
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks in `target/<profile>/deps/`, NOT `target/<profile>/`, and that distinction is the
+/// whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml — so `deps/libbusbar_store_sqlite_plugin.dylib`
+/// is by construction up to date with the source tree being tested). It only *uplifts* a copy to
+/// `target/<profile>/` for `cargo build`, NEVER for `cargo test`. So the old lookup in
+/// `target/<profile>/` read an artifact that nothing in the test's dependency graph ever refreshes:
+/// whatever some earlier `cargo build` happened to leave there, from any commit, or nothing at all.
+///
+/// Both failure modes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the test used to `return` with a "skip:" line and report GREEN, which is
+///     how `cargo test --workspace` on a fresh clone reported success with ZERO over-the-ABI
+///     coverage of the ten task/call-log methods.
+///   * STALE artifact -> a cdylib older than the ABI relay answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl RecordStore` overrode 24 methods, none
+///     of them task methods, so `put_task` took the accept-and-keep-nothing trait default). RED on
+///     a stale artifact is indistinguishable from RED on the real bug; and an artifact that happens
+///     to be NEWER than a regression reports GREEN while the shipped ABI is broken.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: put the cdylib in the graph so the test cannot judge a stale one.
+/// Here the plugin's lib IS this package, so the graph edge already exists — what was missing was
+/// looking at the artifact that edge produces.
+///
+/// Panics rather than skipping. A missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report is a failure, not a silent pass.
 fn plugin_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/e2e-<hash>
     let deps_dir = exe.parent().expect("the test binary always lives in deps/");
