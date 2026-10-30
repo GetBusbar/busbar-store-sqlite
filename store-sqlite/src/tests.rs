@@ -1072,6 +1072,85 @@ fn lock_reader_skips_a_busy_reader_when_another_is_idle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `get_usage` is one snapshot: a writer adding requests and tokens together is never seen half-way.
+#[test]
+fn get_usage_reads_one_snapshot_while_a_writer_commits() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempdir();
+    let file = dir.join("snapshot.db");
+    let s = std::sync::Arc::new(SqliteStore::open(file.to_str().unwrap(), 5000).unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                s.add_usage("vk_snap", 1, &delta(1, "m", 1, 0)).unwrap();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut torn = None;
+    while torn.is_none() && std::time::Instant::now() < deadline {
+        let l = s.get_usage("vk_snap", 1).unwrap();
+        let tokens = l.models.first().map_or(0, |m| m.tier(UNIT_INPUT));
+        if l.requests != tokens {
+            torn = Some((l.requests, tokens));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(torn, None, "get_usage returned a torn (requests, tokens)");
+}
+
+/// `list_metering` is one snapshot too: the row and its open units move together.
+#[test]
+fn list_metering_reads_one_snapshot_while_a_writer_commits() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempdir();
+    let file = dir.join("snapshot_metering.db");
+    let s = std::sync::Arc::new(SqliteStore::open(file.to_str().unwrap(), 5000).unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let d = MeteringDelta {
+                key_id: "k".into(),
+                bucket: 1,
+                model: "m".into(),
+                provider: "p".into(),
+                tokens_input: 0,
+                tokens_output: 0,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+                requests: 1,
+                billable_requests: 1,
+                key_group_at_use: String::new(),
+                pricing_version: String::new(),
+                priced_from_ms: 0,
+                usage_units: [("u".to_string(), 1)].into_iter().collect(),
+            };
+            while !stop.load(Ordering::Relaxed) {
+                s.add_metering(&d).unwrap();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut torn = None;
+    while torn.is_none() && std::time::Instant::now() < deadline {
+        if let Some(r) = s.list_metering(1).unwrap().first() {
+            let u = r.usage_units.get("u").copied().unwrap_or(0);
+            if r.requests != u {
+                torn = Some((r.requests, u));
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(torn, None, "list_metering returned a torn row");
+}
+
 #[test]
 fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
     // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
