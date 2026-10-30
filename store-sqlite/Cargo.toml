@@ -28,8 +28,6 @@ busbar-contract = { workspace = true }
 # `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all.
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
-# `warn!` for a reason the ABI refusal cannot carry (an `Unavailable` reserve); the host captures it.
-tracing = { workspace = true }
 
 # The `RecordStore` contract conformance suite lives in this crate's own
 # `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins). The one
@@ -37,8 +35,8 @@ tracing = { workspace = true }
 # whose `store_v3` cases are the store kind's epoch and slice-life spec every durable store runs
 # (`abi::store::SLICE_TTL_MS`). Same pinned rev, so one contract links.
 [dev-dependencies]
+# `hooks`: the scan test counts SQLite VM steps through `progress_handler`.
+rusqlite = { workspace = true, features = ["hooks"] }
 busbar-contract = { workspace = true, features = ["test-seal"] }
 # `derive` for the tests' legacy row encoders and the conformance suite's stand-in bodies.
 serde = { workspace = true }
-# Dev-only: a test subscriber asserts the dropped-reason warning is emitted.
-tracing-subscriber = { workspace = true }

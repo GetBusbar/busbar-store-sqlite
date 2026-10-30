@@ -381,6 +381,24 @@ pub struct SqliteStore {
     path: String,
 }
 
+/// Create a missing database file 0600 (it holds recoverable secrets) so SQLite, which gives the
+/// `-wal`/`-shm` files the main file's mode, never creates it with the umask. An existing file is
+/// left alone, and so is any failure to create (SQLite reports it on open).
+#[cfg(unix)]
+fn create_private(path: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !path.starts_with("file:") {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path);
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private(_: &str) {}
+
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> RecordStoreResult<Self> {
         // A `:memory:` spelling opens a NEW private database per connection, so a writer plus N
@@ -403,6 +421,7 @@ impl SqliteStore {
         busy_timeout_ms: i64,
         n_readers: usize,
     ) -> RecordStoreResult<Self> {
+        create_private(path);
         let writer_conn = Connection::open(path).store()?;
         apply_pragmas(&writer_conn, path, busy_timeout_ms, true)?;
         let mut readers = Vec::with_capacity(n_readers);
@@ -449,13 +468,23 @@ impl SqliteStore {
         &self.path
     }
 
-    /// A reader connection; the writer when no reader pool exists (`:memory:`).
+    /// An idle reader connection (round-robin start), else wait on one; the writer when no pool exists (`:memory:`).
     fn lock_reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         if self.readers.is_empty() {
             return self.lock_writer();
         }
-        let i = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[i].lock().unwrap_or_else(|p| p.into_inner())
+        let n = self.readers.len();
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % n;
+        for k in 0..n {
+            match self.readers[(start + k) % n].try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        self.readers[start]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Run `f` in one `BEGIN IMMEDIATE` transaction on the writer, committing when it returns `Ok`.
@@ -532,13 +561,33 @@ impl SqliteStore {
     /// Bump the store-global revision counter, inside the same `BEGIN IMMEDIATE` transaction as the
     /// mutation it stamps (`RETURNING` hands the value back in one round trip).
     fn bump_revision(tx: &rusqlite::Transaction) -> RecordStoreResult<i64> {
-        tx.query_row(
+        query_one(
+            tx,
             "UPDATE store_revision SET revision = revision + 1 WHERE id = 0 RETURNING revision",
             [],
             |r| r.get(0),
-        )
-        .store()
+        )?
+        .ok_or_else(|| RecordStoreError("store_revision row missing".into()))
     }
+}
+
+/// `col + delta` in SQL, saturating at `i64::MAX` (a REAL result would be refused by STRICT INTEGER).
+macro_rules! sat_add {
+    ($col:literal, $delta:literal) => {
+        concat!(
+            "CASE WHEN ",
+            $delta,
+            " > 0 AND ",
+            $col,
+            " > 9223372036854775807 - ",
+            $delta,
+            " THEN 9223372036854775807 ELSE ",
+            $col,
+            " + ",
+            $delta,
+            " END"
+        )
+    };
 }
 
 /// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
@@ -572,7 +621,7 @@ fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> Record
 
 /// Rebuild a pre-v10 `usage_metering` with `priced_from_ms` in its primary key, the one change SQLite
 /// cannot make in place. Every row is copied at `priced_from_ms = 0`, the opening card's instant.
-/// The column list must stay identical to [`SCHEMA`]'s (`migrated_tables_match_a_fresh_schema`).
+/// The column list must stay identical to [`SCHEMA`]'s (`a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly`).
 /// The trigger naming `usage_metering` is dropped first because `ALTER TABLE ... RENAME` re-parses
 /// every trigger; `SCHEMA` recreates it right after.
 fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
@@ -698,11 +747,23 @@ fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
     })
 }
 
+/// The `keys_labels_json` CHECK's ceiling on the serialized labels, in characters (`length()`).
+const MAX_LABELS_CHARS: usize = 4096;
+
 fn put_key_inner(
     conn: &rusqlite::Connection,
     key: &VirtualKey,
     revision: i64,
+    method: &str,
 ) -> RecordStoreResult<()> {
+    let labels = serde_json::to_string(&key.labels).unwrap_or_else(|_| "{}".to_string());
+    let chars = labels.chars().count();
+    if chars > MAX_LABELS_CHARS {
+        return Err(RecordStoreError(format!(
+            "{method}: labels of key {} are {chars} characters, over the {MAX_LABELS_CHARS}-character limit",
+            key.id
+        )));
+    }
     // `?6` (created_at) seeds `updated_at` on INSERT, but the ON CONFLICT branch stamps `?12`, the
     // mutation time, like every other mutation path here. The `WHERE` on that branch is the
     // TOMBSTONE PRECONDITION: a live-shaped write must not overwrite a tombstoned row, which would
@@ -729,7 +790,7 @@ fn put_key_inner(
             key.enabled as i64,
             key.created_at as i64,
             key.group,
-            serde_json::to_string(&key.labels).unwrap_or_else(|_| "{}".to_string()),
+            labels,
             key.expires_at.map(|v| v as i64),
             key.deleted_at.map(|v| v as i64),
             revision,
@@ -765,12 +826,17 @@ fn add_usage_in(
     // `requests` / `billable_requests` accumulate unconditionally on the `model=''` sentinel row,
     // whether or not the delta reached any model (a rejected request adds to `requests` alone).
     // `prepare_cached`: this fires once per admitted request, the hottest write path in the crate.
-    tx.prepare_cached(
+    tx.prepare_cached(concat!(
         "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
          VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
          ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-            requests = MAX(0, requests + ?3), billable_requests = MAX(0, billable_requests + ?4)",
-    )
+            requests = MAX(0, ",
+        sat_add!("requests", "?3"),
+        "),
+            billable_requests = MAX(0, ",
+        sat_add!("billable_requests", "?4"),
+        ")"
+    ))
     .store()?
     .execute(params![
         window_start as i64,
@@ -781,30 +847,37 @@ fn add_usage_in(
     .store()?;
     for m in &delta.models {
         let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
-        tx.prepare_cached(
+        tx.prepare_cached(concat!(
             "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
                  tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
              VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
              ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-                tokens_input       = MAX(0, tokens_input + ?4),
-                tokens_output      = MAX(0, tokens_output + ?5),
-                tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
-                tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
-        )
+                tokens_input       = MAX(0, ", sat_add!("tokens_input", "?4"), "),
+                tokens_output      = MAX(0, ", sat_add!("tokens_output", "?5"), "),
+                tokens_cache_read  = MAX(0, ", sat_add!("tokens_cache_read", "?6"), "),
+                tokens_cache_write = MAX(0, ", sat_add!("tokens_cache_write", "?7"), ")"
+        ))
         .store()?
         .execute(params![
-            window_start as i64, bucket_id, m.model,
-            d(UNIT_INPUT), d(UNIT_OUTPUT), d(UNIT_CACHE_READ), d(UNIT_CACHE_WRITE),
+            window_start as i64,
+            bucket_id,
+            m.model,
+            d(UNIT_INPUT),
+            d(UNIT_OUTPUT),
+            d(UNIT_CACHE_READ),
+            d(UNIT_CACHE_WRITE),
         ])
         .store()?;
         // Every open unit accumulates the same way, floored at 0 (a refund never drives a counter negative).
         for (unit, d) in open_units(&m.usage_units) {
-            tx.prepare_cached(
+            tx.prepare_cached(concat!(
                 "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
                  VALUES (?1,?2,?3,?4,MAX(0,?5))
                  ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
-                    count = MAX(0, count + ?5)",
-            )
+                    count = MAX(0, ",
+                sat_add!("count", "?5"),
+                ")"
+            ))
             .store()?
             .execute(params![window_start as i64, bucket_id, m.model, unit, d])
             .store()?;
@@ -820,16 +893,16 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     let priced_from = column::storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
     exec(
         tx,
-        "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
+        concat!("INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
              tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
-             tokens_input       = tokens_input + excluded.tokens_input,
-             tokens_output      = tokens_output + excluded.tokens_output,
-             tokens_cache_read  = tokens_cache_read + excluded.tokens_cache_read,
-             tokens_cache_write = tokens_cache_write + excluded.tokens_cache_write,
-             requests           = requests + excluded.requests,
-             billable_requests  = billable_requests + excluded.billable_requests",
+             tokens_input       = ", sat_add!("tokens_input", "excluded.tokens_input"), ",
+             tokens_output      = ", sat_add!("tokens_output", "excluded.tokens_output"), ",
+             tokens_cache_read  = ", sat_add!("tokens_cache_read", "excluded.tokens_cache_read"), ",
+             tokens_cache_write = ", sat_add!("tokens_cache_write", "excluded.tokens_cache_write"), ",
+             requests           = ", sat_add!("requests", "excluded.requests"), ",
+             billable_requests  = ", sat_add!("billable_requests", "excluded.billable_requests")),
         params![
             d.bucket as i64,
             d.key_id,
@@ -849,10 +922,10 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     for (unit, count) in &d.usage_units {
         exec(
             tx,
-            "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
+            concat!("INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
              VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
-                 count = count + excluded.count",
+                 count = ", sat_add!("count", "excluded.count")),
             params![
                 d.bucket as i64,
                 d.key_id,
@@ -873,35 +946,33 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
     // retry would compare unequal and be reported as a forked chain. Rejected outright.
     let seq = column::storable_i64("append_audit", "seq", entry.seq)?;
     let ts = column::storable_i64("append_audit", "ts", entry.ts)?;
-    let affected = tx
-        .execute(
-            "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+    let affected = exec(
+        tx,
+        "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(seq) DO NOTHING",
-            params![
-                seq,
-                ts,
-                entry.action,
-                entry.resource,
-                entry.outcome,
-                entry.principal,
-                entry.prev_hash,
-                entry.hash,
-            ],
-        )
-        .store()?;
+        params![
+            seq,
+            ts,
+            entry.action,
+            entry.resource,
+            entry.outcome,
+            entry.principal,
+            entry.prev_hash,
+            entry.hash,
+        ],
+    )?;
     // A collision is EITHER the write-through retrying (identical: Ok) or two records claiming one
     // chain position (a forked or tampered log, the thing an audit store must report).
     if affected == 0 {
-        let stored = tx
-            .query_row(
-                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                 FROM audit_log WHERE seq=?1",
-                params![seq],
-                row_to_audit,
-            )
-            .store()?;
-        if &stored != entry {
+        let stored = query_one(
+            tx,
+            "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+             FROM audit_log WHERE seq=?1",
+            params![seq],
+            row_to_audit,
+        )?;
+        if stored.as_ref() != Some(entry) {
             return Err(fork::audit_fork(entry.seq));
         }
     }
@@ -910,20 +981,20 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
 
 /// [`RecordStore::append_plane_record`]'s occupancy check and insert, inside the caller's transaction.
 fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    let seq = column::storable_i64("append_plane_record", "seq", record.seq)?;
     let row = PlaneRow::of(
         record,
         record.parent.unwrap_or(record.id),
+        seq,
         "append_plane_record",
     )?;
-    let existing: Option<StoredPlaneRow> = tx
-        .query_row(
-            "SELECT id, parent, ts, disposition, body FROM plane_records \
-             WHERE kind=?1 AND identity=?2 AND seq=?3",
-            params![record.kind, row.identity, row.seq],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()
-        .store()?;
+    let existing: Option<StoredPlaneRow> = query_one(
+        tx,
+        "SELECT id, parent, ts, disposition, body FROM plane_records \
+         WHERE kind=?1 AND identity=?2 AND seq=?3",
+        params![record.kind, row.identity, row.seq],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
     if let Some((id, parent, ts, disposition, body)) = existing {
         // Identical is the write-through retrying (success); different is a forked chain (an error,
         // as in `append_audit`). The message names the position and echoes no stored content.
@@ -937,18 +1008,20 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
         }
         return Err(fork::chain_fork(record.kind, &row.identity, record.seq));
     }
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         row.params(&record),
-    )
-    .store()?;
+    )?;
     Ok(())
 }
 
 impl RecordStore for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
-        self.write(false, |tx| put_key_inner(tx, key, Self::bump_revision(tx)?))
+        self.write(true, |tx| {
+            put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
+        })
     }
 
     fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
@@ -969,7 +1042,7 @@ impl RecordStore for SqliteStore {
         let sql = concat!(
             "SELECT ",
             key_cols!(),
-            " FROM keys WHERE revision > ?1 ORDER BY revision"
+            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision"
         );
         query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
     }
@@ -1021,7 +1094,7 @@ impl RecordStore for SqliteStore {
     ) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             let rev = Self::bump_revision(tx)?;
-            put_key_inner(tx, key, rev)?;
+            put_key_inner(tx, key, rev, "put_key_with_credential")?;
             put_credential_inner(tx, secret, rev)
         })
     }
@@ -1077,6 +1150,8 @@ impl RecordStore for SqliteStore {
 
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let conn = self.lock_reader();
+        // One deferred read transaction: every SELECT sees the same WAL snapshot (rolled back on drop).
+        let _snapshot = conn.unchecked_transaction().store()?;
         // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
         // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
         let (requests, billable_requests): (i64, i64) = query_one(
@@ -1209,6 +1284,7 @@ impl RecordStore for SqliteStore {
 
     fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let conn = self.lock_reader();
+        let _snapshot = conn.unchecked_transaction().store()?;
         let u = column::read_u64;
         let mut rows = query_all(
             &conn,
@@ -1302,7 +1378,7 @@ impl RecordStore for SqliteStore {
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(sub) DO UPDATE SET reason = excluded.reason",
+                 ON CONFLICT(sub) DO NOTHING",
                 params![sub, reason, now_secs()],
             )
             .store()
@@ -1323,7 +1399,7 @@ impl RecordStore for SqliteStore {
 
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         // Keyed on the record's own id, parent or not: the contract upserts by `(kind, id)`.
-        let row = PlaneRow::of(record, record.id, "upsert_plane_record")?;
+        let row = PlaneRow::of(record, record.id, UPSERT_SEQ, "upsert_plane_record")?;
         self.write(true, |tx| {
             tx.execute(
                 "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
@@ -1341,14 +1417,12 @@ impl RecordStore for SqliteStore {
     /// An upserted record lives at `(kind, id, 0)`. No caller-scoping filter: authorization stays
     /// engine-side, or an unauthorized reader bypasses it by configuring a different backend.
     fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
-        self.lock_reader()
-            .query_row(
-                "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
-                params![kind, id],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .store()
+        query_one(
+            &self.lock_reader(),
+            "SELECT body FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+            params![kind, id, UPSERT_SEQ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
     }
 
     fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
@@ -1494,18 +1568,18 @@ impl RecordStore for SqliteStore {
         if now > expires_at {
             return Ok(false);
         }
-        let disposition: Option<String> = self
-            .lock_reader()
-            .query_row(
-                "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=0",
-                params![kind, token],
-                |r| r.get(0),
-            )
-            .optional()
-            .store()?;
+        let disposition: Option<String> = query_one(
+            &self.lock_reader(),
+            "SELECT disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+            params![kind, token, UPSERT_SEQ],
+            |r| r.get(0),
+        )?;
         Ok(disposition.as_deref() == Some(DISPOSITION_ACTIVE))
     }
 }
+
+/// The `seq` an upserted record lives at: the contract upserts by `(kind, id)`.
+const UPSERT_SEQ: i64 = 0;
 
 /// A stored plane row's `(id, parent, ts, disposition, body)`, as the append verb's fork check reads it.
 type StoredPlaneRow = (String, Option<String>, i64, String, Vec<u8>);
@@ -1526,10 +1600,15 @@ impl PlaneRow {
     /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
     /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
     /// upserted record's own id.
-    fn of(record: PlaneRecordRef<'_>, identity: &str, method: &str) -> RecordStoreResult<Self> {
+    fn of(
+        record: PlaneRecordRef<'_>,
+        identity: &str,
+        seq: i64,
+        method: &str,
+    ) -> RecordStoreResult<Self> {
         Ok(Self {
             identity: identity.to_string(),
-            seq: column::storable_i64(method, "seq", record.seq)?,
+            seq,
             ts: column::storable_i64(method, "ts", record.ts)?,
             disposition: match record.disposition {
                 PlaneDisposition::Active => DISPOSITION_ACTIVE,
@@ -1584,6 +1663,20 @@ fn put_credential_inner(
         }
         Some(true) => {}
     }
+    let taken: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM credentials WHERE kind=?1 AND public_id=?2 \
+             AND NOT (key_id=?3 AND slot=?4))",
+            params![m.kind, m.public_id, m.key_id, m.slot as i64],
+            |r| r.get(0),
+        )
+        .store()?;
+    if taken {
+        return Err(RecordStoreError(format!(
+            "put_credential: public_id {} is already taken for kind {}",
+            m.public_id, m.kind
+        )));
+    }
     // UPSERT on (key_id, kind, slot): a LIVE slot must fail rather than silently destroy a working
     // credential mid-overlap-window, so only a revoked row is overwritten (the DO UPDATE's WHERE).
     // `updated_at` is its own parameter (?11), not a second use of `created_at`'s.
@@ -1603,24 +1696,11 @@ fn put_credential_inner(
             ],
         )
         .store()?;
+    // Zero changed rows: the DO UPDATE's WHERE failed, so a LIVE credential holds the slot.
     if changed == 0 {
-        // Zero changed rows: a LIVE credential holds the slot, or UNIQUE(kind, public_id) fired.
-        let occupied: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=?1 AND kind=?2 AND slot=?3 AND revoked_at IS NULL)",
-                params![m.key_id, m.kind, m.slot as i64],
-                |r| r.get(0),
-            )
-            .store()?;
-        if occupied {
-            return Err(RecordStoreError(format!(
-                "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
-                m.slot, m.key_id, m.kind
-            )));
-        }
         return Err(RecordStoreError(format!(
-            "put_credential: public_id {} is already taken for kind {}",
-            m.public_id, m.kind
+            "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
+            m.slot, m.key_id, m.kind
         )));
     }
     Ok(())

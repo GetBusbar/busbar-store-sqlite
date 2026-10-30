@@ -41,7 +41,7 @@ not assume they move together.
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-later, to v12). Nothing an operator already has is dropped: keys,
+later, to v13). Nothing an operator already has is dropped: keys,
 credentials, tombstones, usage and metering counts, the audit log and the
 denylist all read back exactly as before, and existing metering rows are
 attributed to the opening rate card. Back the file up before the first
@@ -65,13 +65,21 @@ registers — one source, both doors. The image carries no other export.
 - The **default durable store** for busbar's governance data: virtual
   keys, credentials, usage and metering ledgers, the durable audit log,
   and every plane's durable records (A2A tasks and their provenance
-  chains, the MCP call log and demotions, single-use approval tokens,
+  chains, MCP demotions, single-use approval tokens,
   push-callback capabilities, and any record kind a plane declares) —
   single-node, file-backed, zero external dependencies (SQLite is bundled).
 - The reference `kind: store` plugin: a minimal example of adapting an
   engine-agnostic storage backend to the plugin C ABI.
 
 ## Config
+
+```yaml
+store:
+  module: sqlite
+  settings:
+    db_path: /var/lib/busbar/governance.db
+    busy_timeout_ms: 5000
+```
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
@@ -89,7 +97,13 @@ database (no virtual keys, no budgets, no usage history). This looks
 like nothing is wrong at boot — it reads as data loss only once someone
 notices the governance state is missing. Always set `db_path` to a full
 absolute path (e.g. `/var/lib/busbar/governance.db`, as in the example
-above) in production.
+below) in production.
+
+Any other setting is refused, naming the accepted ones, so a typo such as
+`dbpath` cannot quietly open the default file; a settings value that is not
+a JSON object (other than empty or `null`) is refused too. `license_key`, the
+secret-valued key a 1.5.5 sqlite config carried, is the one exception: it is
+accepted and ignored.
 
 A `db_path`/`busy_timeout_ms` key that is *present* in the config but
 the wrong JSON type (a number for `db_path`, a string for

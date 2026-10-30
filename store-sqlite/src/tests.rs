@@ -120,6 +120,37 @@ fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
 // ── Basic key CRUD ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn oversized_labels_are_refused_with_a_clear_text() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_big", "g");
+    k.labels.insert("k".into(), "x".repeat(5000));
+    let n = serde_json::to_string(&k.labels).unwrap().chars().count();
+    assert_eq!(
+        s.put_key(&k).unwrap_err().0,
+        format!("put_key: labels of key vk_big are {n} characters, over the 4096-character limit")
+    );
+    assert_eq!(
+        s.put_key_with_credential(&k, &sample_credential("vk_big", "AKIA_BIG", 0))
+            .unwrap_err()
+            .0,
+        format!(
+            "put_key_with_credential: labels of key vk_big are {n} characters, over the 4096-character limit"
+        )
+    );
+}
+
+/// The CHECK counts characters (`length()` on TEXT), not bytes: multi-byte labels under 4096
+/// characters were always storable and still are.
+#[test]
+fn multibyte_labels_under_the_character_limit_are_accepted() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut k = sample_key("vk_cjk", "g");
+    k.labels.insert("k".into(), "\u{4e2d}".repeat(2000));
+    s.put_key(&k)
+        .expect("2000 characters fit the 4096-character CHECK");
+}
+
+#[test]
 fn put_get_roundtrips_a_key() {
     let s = SqliteStore::open_in_memory().unwrap();
     let k = sample_key("vk_1", "binding:vk_1:g1");
@@ -215,6 +246,23 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     let delta = s.list_keys_since(watermark).unwrap();
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].id, "vk_b");
+}
+
+/// A row never stamped with a revision (0) always reads as changed.
+#[test]
+fn list_keys_since_lists_an_unstamped_revision_zero_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_zero", "g")).unwrap();
+    s.lock_writer()
+        .execute("UPDATE keys SET revision = 0 WHERE id = 'vk_zero'", [])
+        .unwrap();
+    let ids: Vec<_> = s
+        .list_keys_since(5)
+        .unwrap()
+        .into_iter()
+        .map(|k| k.id)
+        .collect();
+    assert_eq!(ids, vec!["vk_zero".to_string()]);
 }
 
 /// The credential-side half of the same revision-based hydration mechanism as
@@ -520,6 +568,22 @@ fn credential_public_id_is_globally_unique_per_kind() {
     );
 }
 
+#[test]
+fn a_taken_public_id_is_refused_with_the_intended_text() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_a", "g")).unwrap();
+    s.put_key(&sample_key("vk_b", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
+        .unwrap();
+    let err = s
+        .put_credential(&sample_credential("vk_b", "AKIA_DUP", 0))
+        .unwrap_err();
+    assert_eq!(
+        err.0,
+        "put_credential: public_id AKIA_DUP is already taken for kind sigv4"
+    );
+}
+
 // ── Usage ledger ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -594,6 +658,64 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
     );
 }
 
+/// Accruals saturate at `i64::MAX`; an overflow must not poison the batch.
+#[test]
+fn add_usage_saturates_at_i64_max_instead_of_erroring() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut d = delta(i64::MAX, "m", i64::MAX, i64::MAX);
+    d.models[0]
+        .usage_units
+        .insert("custom".to_string(), i64::MAX);
+    s.add_usage("vk_sat", 1, &d).unwrap();
+    s.add_usage("vk_sat", 1, &d).unwrap();
+    let ledger = s.get_usage("vk_sat", 1).unwrap();
+    assert_eq!(ledger.requests, i64::MAX as u64);
+    assert_eq!(ledger.billable_requests, i64::MAX as u64);
+    let m = &ledger.models[0];
+    assert_eq!(m.tier(UNIT_INPUT), i64::MAX as u64);
+    assert_eq!(m.tier(UNIT_OUTPUT), i64::MAX as u64);
+    assert_eq!(m.tier("custom"), i64::MAX as u64);
+}
+
+#[test]
+fn add_metering_saturates_at_i64_max_instead_of_erroring() {
+    for v in [i64::MAX as u64, u64::MAX] {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let d = MeteringDelta {
+            key_id: "vk_sat".to_string(),
+            bucket: 1,
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            tokens_input: v,
+            tokens_output: v,
+            tokens_cache_read: v,
+            tokens_cache_write: v,
+            requests: v,
+            billable_requests: v,
+            key_group_at_use: String::new(),
+            pricing_version: String::new(),
+            priced_from_ms: 0,
+            usage_units: [("custom".to_string(), v)].into_iter().collect(),
+        };
+        s.add_metering(&d).unwrap();
+        s.add_metering(&d).unwrap();
+        let r = &s.list_metering(1).unwrap()[0];
+        let max = i64::MAX as u64;
+        assert_eq!(
+            [
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_write,
+                r.requests,
+                r.billable_requests
+            ],
+            [max; 6]
+        );
+        assert_eq!(r.usage_units["custom"], max);
+    }
+}
+
 // ── Metering ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -631,9 +753,23 @@ fn metering_accumulates_and_carries_group_and_pricing_attribution() {
 fn denylist_add_and_list_and_idempotent() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.add_denylist("vk_d", "compromised").unwrap();
-    s.add_denylist("vk_d", "compromised again").unwrap(); // idempotent, updates reason
+    s.add_denylist("vk_d", "compromised again").unwrap(); // idempotent, a no-op
     let list = s.list_denylist().unwrap();
     assert_eq!(list, vec!["vk_d".to_string()]);
+}
+
+#[test]
+fn add_denylist_twice_is_a_no_op_that_keeps_the_first_reason() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.add_denylist("vk_d", "a").unwrap();
+    s.add_denylist("vk_d", "b").unwrap();
+    let reason: String = s
+        .lock_writer()
+        .query_row("SELECT reason FROM denylist WHERE sub='vk_d'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(reason, "a");
 }
 
 // ── Audit log ────────────────────────────────────────────────────────────────────────────────
@@ -782,11 +918,28 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
         )
         .unwrap();
 
+    // The writer's busy handler flags that the store's write really met the held lock.
+    static MET_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    store
+        .lock_writer()
+        .busy_handler(Some(|_| {
+            MET_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }))
+        .unwrap();
     let call = sample_call("vk_contend", 1, 100, "", "h1");
     let result = std::thread::scope(|scope| {
         let writer = scope.spawn(|| append_call(&store, &call));
-        // Let the store's write start and meet the held lock, then commit a change underneath it.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Commit a change underneath the store's write only once it is waiting on the lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !MET_LOCK.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store's write never met the held lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         holder.execute_batch("COMMIT").unwrap();
         writer.join().unwrap()
     });
@@ -989,6 +1142,110 @@ fn lock_reader_round_robins_without_ever_indexing_out_of_bounds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A busy reader must not make `lock_reader` wait while another reader sits idle.
+#[test]
+fn lock_reader_skips_a_busy_reader_when_another_is_idle() {
+    let dir = tempdir();
+    let file = dir.join("readers_busy.db");
+    let s = std::sync::Arc::new(
+        SqliteStore::open_with_readers(file.to_str().unwrap(), 5000, 3).unwrap(),
+    );
+    let held = s.readers[0].lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let s2 = s.clone();
+    std::thread::spawn(move || {
+        for _ in 0..6 {
+            drop(s2.lock_reader());
+            let _ = tx.send(());
+        }
+    });
+    for i in 0..6 {
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("lock_reader call {i} blocked on the held reader"));
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `get_usage` is one snapshot: a writer adding requests and tokens together is never seen half-way.
+#[test]
+fn get_usage_reads_one_snapshot_while_a_writer_commits() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempdir();
+    let file = dir.join("snapshot.db");
+    let s = std::sync::Arc::new(SqliteStore::open(file.to_str().unwrap(), 5000).unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                s.add_usage("vk_snap", 1, &delta(1, "m", 1, 0)).unwrap();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut torn = None;
+    while torn.is_none() && std::time::Instant::now() < deadline {
+        let l = s.get_usage("vk_snap", 1).unwrap();
+        let tokens = l.models.first().map_or(0, |m| m.tier(UNIT_INPUT));
+        if l.requests != tokens {
+            torn = Some((l.requests, tokens));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(torn, None, "get_usage returned a torn (requests, tokens)");
+}
+
+/// `list_metering` is one snapshot too: the row and its open units move together.
+#[test]
+fn list_metering_reads_one_snapshot_while_a_writer_commits() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempdir();
+    let file = dir.join("snapshot_metering.db");
+    let s = std::sync::Arc::new(SqliteStore::open(file.to_str().unwrap(), 5000).unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let d = MeteringDelta {
+                key_id: "k".into(),
+                bucket: 1,
+                model: "m".into(),
+                provider: "p".into(),
+                tokens_input: 0,
+                tokens_output: 0,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+                requests: 1,
+                billable_requests: 1,
+                key_group_at_use: String::new(),
+                pricing_version: String::new(),
+                priced_from_ms: 0,
+                usage_units: [("u".to_string(), 1)].into_iter().collect(),
+            };
+            while !stop.load(Ordering::Relaxed) {
+                s.add_metering(&d).unwrap();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut torn = None;
+    while torn.is_none() && std::time::Instant::now() < deadline {
+        if let Some(r) = s.list_metering(1).unwrap().first() {
+            let u = r.usage_units.get("u").copied().unwrap_or(0);
+            if r.requests != u {
+                torn = Some((r.requests, u));
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(torn, None, "list_metering returned a torn row");
+}
+
 #[test]
 fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
     // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
@@ -1032,9 +1289,140 @@ fn now_secs_reflects_the_actual_current_time_not_a_constant() {
     );
 }
 
+/// `PRAGMA synchronous` on the writer: 1 = NORMAL, 2 = FULL.
+fn writer_synchronous(s: &SqliteStore) -> i64 {
+    s.lock_writer()
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Rotate/disable/tombstone and mint writes commit at FULL; the ledger path stays NORMAL.
+#[test]
+fn durable_writes_commit_at_synchronous_full_and_ledger_writes_at_normal() {
+    const NORMAL: i64 = 1;
+    const FULL: i64 = 2;
+    let dir = tempdir();
+    let s = SqliteStore::open(dir.join("sync.db").to_str().unwrap(), 5000).unwrap();
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    assert_eq!(writer_synchronous(&s), NORMAL, "add_usage");
+    s.put_key(&sample_key("vk_sync", "g")).unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "put_key");
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    assert_eq!(writer_synchronous(&s), NORMAL, "add_usage after put_key");
+    s.delete_key("vk_sync").unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "delete_key");
+    s.add_usage("vk_sync", 1, &delta(1, "m", 1, 1)).unwrap();
+    s.put_key_with_credential(
+        &sample_key("vk_sync2", "g"),
+        &sample_credential("vk_sync2", "AKIA_SYNC", 0),
+    )
+    .unwrap();
+    assert_eq!(writer_synchronous(&s), FULL, "put_key_with_credential");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A new database file holds recoverable secrets: created 0600, its WAL files alike; an operator's
+/// existing file keeps its mode.
+#[cfg(unix)]
+#[test]
+fn a_new_database_file_is_private_and_an_existing_one_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempdir();
+    let fresh = dir.join("fresh.db");
+    let s = SqliteStore::open(fresh.to_str().unwrap(), 5000).unwrap();
+    s.put_key(&sample_key("vk_mode", "g")).unwrap();
+    assert_eq!(mode(&fresh), 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let side = dir.join(format!("fresh.db{suffix}"));
+        assert!(side.exists(), "{suffix} should exist while open");
+        assert_eq!(mode(&side), 0o600, "{suffix}");
+    }
+    drop(s);
+    let existing = dir.join("existing.db");
+    drop(SqliteStore::open(existing.to_str().unwrap(), 5000).unwrap());
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(SqliteStore::open(existing.to_str().unwrap(), 5000).unwrap());
+    assert_eq!(mode(&existing), 0o644);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file-backed writer's WAL journal, its size limit and auto-checkpoint, read back.
+#[test]
+fn a_file_backed_writer_runs_wal_with_the_size_limit_and_autocheckpoint() {
+    let dir = tempdir();
+    let s = SqliteStore::open(dir.join("wal.db").to_str().unwrap(), 5000).unwrap();
+    let w = s.lock_writer();
+    let pragma = |name: &str| -> rusqlite::types::Value {
+        w.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        pragma("journal_mode"),
+        rusqlite::types::Value::Text("wal".into())
+    );
+    assert_eq!(
+        pragma("journal_size_limit"),
+        rusqlite::types::Value::Integer(67_108_864)
+    );
+    assert_eq!(
+        pragma("wal_autocheckpoint"),
+        rusqlite::types::Value::Integer(2000)
+    );
+    assert_eq!(
+        pragma("busy_timeout"),
+        rusqlite::types::Value::Integer(5000),
+        "the configured busy_timeout_ms reaches the writer"
+    );
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only credential slots 0 and 1 exist.
+#[test]
+fn a_credential_slot_other_than_0_or_1_is_refused() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_slot", "g")).unwrap();
+    for slot in [2u8, 255] {
+        assert!(
+            s.put_credential(&sample_credential(
+                "vk_slot",
+                &format!("AKIA_S{slot}"),
+                slot
+            ))
+            .is_err(),
+            "slot {slot}"
+        );
+    }
+    s.put_credential(&sample_credential("vk_slot", "AKIA_S1", 1))
+        .unwrap();
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────────────────────
 
-fn tempdir() -> std::path::PathBuf {
+/// A scratch directory removed on drop, so a failing test leaves nothing behind.
+pub(crate) struct TempDir(std::path::PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) fn tempdir() -> TempDir {
     let mut p = std::env::temp_dir();
     p.push(format!(
         "store-sqlite-test-{}-{}",
@@ -1042,7 +1430,7 @@ fn tempdir() -> std::path::PathBuf {
         unique_suffix()
     ));
     std::fs::create_dir_all(&p).unwrap();
-    p
+    TempDir(p)
 }
 
 fn unique_suffix() -> u64 {
@@ -1934,6 +2322,32 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     );
 }
 
+/// The contract upserts by `(kind, id)`: a record's own `seq` never makes a second row.
+#[test]
+fn upsert_plane_record_ignores_seq_and_keeps_one_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut r = task_record(&sample_task("t-seq", "working", 1));
+    r.seq = 3;
+    r.body = b"first".to_vec();
+    s.upsert_plane_record(r.view()).unwrap();
+    r.seq = 4;
+    r.body = b"second".to_vec();
+    s.upsert_plane_record(r.view()).unwrap();
+    assert_eq!(
+        s.get_plane_record("task", "t-seq").unwrap(),
+        Some(b"second".to_vec())
+    );
+    let n: i64 = s
+        .lock_writer()
+        .query_row(
+            "SELECT COUNT(*) FROM plane_records WHERE identity='t-seq'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
 /// A `seq`/`ts` past `i64::MAX` cannot be stored faithfully — `as i64` wraps it negative and the
 /// read clamps back — so the row read back would not be the row written: a wrapped `seq` reorders a
 /// chain, a wrapped `ts` changes what retention does to it. Refused outright, exactly as
@@ -2594,7 +3008,7 @@ fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
 // (store-sqlite v1.0.6 on busbar 1.5.5, schema v6) — the file every existing deployment has. Each test
 // copies it to a scratch dir, opens it with THIS build, and reads every row back.
 
-fn open_fixture(name: &str) -> (std::path::PathBuf, SqliteStore) {
+fn open_fixture(name: &str) -> (TempDir, SqliteStore) {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
@@ -2799,7 +3213,7 @@ fn a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly() {
 // migration conformance gate (a missing fixture fails CI).
 
 /// Copy the recorded database to a scratch dir; returns the dir and the copied file's path.
-fn copy_the_1_5_5_fixture() -> (std::path::PathBuf, String) {
+fn copy_the_1_5_5_fixture() -> (TempDir, String) {
     let src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1.5.5/governance.db");
     let dir = tempdir();

@@ -107,8 +107,10 @@ fn empty_and_bare_object_configs_use_defaults_and_succeed() {
 
 #[test]
 fn explicit_in_memory_db_path_is_honored() {
-    // Proves `db_path` is actually read (not ignored in favor of the default) via the one value
-    // that's observable without touching disk: `:memory:` opens instantly with no file created.
+    // `db_path` is read, not ignored for the default: nothing is created in the cwd, and two opens
+    // of `:memory:` do not share data, which a file would.
+    let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cwd = ScratchCwd::enter("explicit-memory");
     let store = open(r#"{"db_path": ":memory:"}"#).expect("in-memory db_path must open");
     let key = busbar_contract::records::VirtualKey {
         id: "vk_adapter_test".into(),
@@ -130,6 +132,12 @@ fn explicit_in_memory_db_path_is_honored() {
     assert_eq!(
         store.get_key("vk_adapter_test").unwrap().unwrap().id,
         "vk_adapter_test"
+    );
+    let other = open(r#"{"db_path": ":memory:"}"#).unwrap();
+    assert!(other.get_key("vk_adapter_test").unwrap().is_none());
+    assert!(
+        !cwd.scratch.join("busbar-governance.db").exists(),
+        "a `:memory:` db_path must not create the default file"
     );
 }
 
@@ -307,7 +315,7 @@ fn an_unknown_setting_is_refused() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
     assert_eq!(
         err,
-        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms)"
+        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms, license_key)"
     );
 }
 
@@ -323,4 +331,38 @@ fn an_empty_or_blank_db_path_is_refused() {
             "{p:?}: {err}"
         );
     }
+}
+
+/// A non-object top level must not skip the settings check and open the default database.
+#[test]
+fn a_non_object_top_level_is_refused_naming_only_its_type() {
+    use super::Settings;
+    for (cfg, ty) in [
+        (r#""/var/lib/x.db""#, "a string"),
+        ("[]", "an array"),
+        ("5", "a number"),
+        ("true", "a boolean"),
+    ] {
+        let err = Settings::parse(cfg).unwrap_err();
+        assert_eq!(
+            err,
+            format!("invalid sqlite plugin config: expected a JSON object, got {ty}")
+        );
+        assert!(!err.contains("/var/lib"), "{err}");
+    }
+    assert!(Settings::parse("null").is_ok());
+    assert!(Settings::parse("  ").is_ok());
+}
+
+/// The Statement declares `license_key` a secret ref, so the parser accepts and ignores it.
+#[test]
+fn license_key_is_accepted_and_ignored() {
+    use super::Settings;
+    let s = Settings::parse(r#"{"db_path":":memory:","license_key":"x"}"#).unwrap();
+    assert_eq!(s.db_path, ":memory:");
+    let err = Settings::parse(r#"{"x":1}"#).unwrap_err();
+    assert!(
+        err.contains("(accepted: db_path, busy_timeout_ms, license_key)"),
+        "{err}"
+    );
 }

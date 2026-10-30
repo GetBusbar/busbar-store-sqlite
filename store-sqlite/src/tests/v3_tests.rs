@@ -16,18 +16,10 @@ fn fresh() -> SqliteStore {
 }
 
 /// A store on a real file in a fresh scratch directory, and the file's path.
-fn on_file(tag: &str) -> (SqliteStore, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "store-sqlite-v3-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("v3.db").display().to_string();
-    (SqliteStore::open(&path, 5000).expect("open"), path)
+fn on_file(tag: &str) -> (SqliteStore, String, crate::tests::TempDir) {
+    let dir = crate::tests::tempdir();
+    let path = dir.join(format!("{tag}.db")).display().to_string();
+    (SqliteStore::open(&path, 5000).expect("open"), path, dir)
 }
 
 fn op(n: u64) -> OpId {
@@ -338,7 +330,7 @@ fn a_prefix_scan_returns_exactly_the_keys_the_prefix_starts() {
 /// nothing and answer the originals, and a reused id with another body is still a conflict.
 #[test]
 fn dedupe_survives_a_reopen_of_the_file() {
-    let (s, path) = on_file("durable");
+    let (s, path, _dir) = on_file("durable");
     s.v3_add_usage_batch(op(3), &[("k", 60, delta(1, 1))])
         .expect("usage");
     s.v3_record_put("plane", b"k", b"v").expect("record");
@@ -476,4 +468,204 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     )
     .expect("list")
     .is_empty());
+}
+
+/// A value the columns cannot hold is REFUSED (the host may re-send), not Failed (replayed forever),
+/// and nothing is applied or recorded.
+#[test]
+fn values_the_columns_cannot_hold_are_refused_not_failed() {
+    let s = fresh();
+    let rec = |seq: u64, ts: u64| PlaneRecordRef {
+        kind: "task_event",
+        id: "e1",
+        parent: Some("t1"),
+        seq,
+        ts,
+        disposition: busbar_contract::records::PlaneDisposition::Active,
+        body: b"{}",
+    };
+    for r in [rec(u64::MAX, 1), rec(1, u64::MAX)] {
+        assert!(matches!(
+            s.v3_append_plane_record_op(op(1), r),
+            Err(OpRefused::Refused(_))
+        ));
+    }
+    let m = MeteringDelta {
+        key_id: "k".into(),
+        bucket: 1,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: u64::MAX,
+        usage_units: Default::default(),
+    };
+    assert!(matches!(
+        s.v3_add_metering_batch(op(2), &[m]),
+        Err(OpRefused::Refused(_))
+    ));
+    assert!(RecordStore::list_plane_records(
+        &s,
+        "task_event",
+        &busbar_contract::records::PlaneSelector::All
+    )
+    .unwrap()
+    .is_empty());
+    assert!(RecordStore::list_metering(&s, 1).unwrap().is_empty());
+    let n: i64 = s
+        .lock_writer()
+        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "a refused op records nothing");
+}
+
+/// A bounded prefix scan stops at the prefix: the VM work does not grow with the rows past it.
+#[test]
+fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STEPS: AtomicU64 = AtomicU64::new(0);
+    let s = fresh();
+    s.v3_record_put("p", b"aa", b"v").expect("put");
+    let steps = |s: &SqliteStore| {
+        // `:memory:` has one connection, so the scan runs on the writer holding the handler.
+        s.lock_writer()
+            .progress_handler(
+                1,
+                Some(|| {
+                    STEPS.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+        STEPS.store(0, Ordering::Relaxed);
+        let rows = s.v3_record_scan("p", b"a", 100).expect("scan");
+        s.lock_writer()
+            .progress_handler(1, None::<fn() -> bool>)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        STEPS.load(Ordering::Relaxed)
+    };
+    steps(&s); // prepares and caches the statement
+    let few = steps(&s);
+    for i in 0..2000u32 {
+        s.v3_record_put("p", format!("z{i:05}").as_bytes(), b"v")
+            .expect("put");
+    }
+    let many = steps(&s);
+    // A deeper b-tree costs a step or two; stepping over 2000 rows costs thousands.
+    assert!(
+        many <= few + 10,
+        "rows past the prefix were stepped over: {few} vs {many}"
+    );
+}
+
+fn ops_recorded(s: &SqliteStore) -> i64 {
+    s.lock_writer()
+        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A failed op (a fork) records nothing, so the same `op_id` retried with a record that does not
+/// fork applies instead of conflicting.
+#[test]
+fn a_failed_op_records_nothing_and_its_op_id_can_be_retried() {
+    let s = fresh();
+    let rec = |seq: u64, body: &'static [u8]| PlaneRecordRef {
+        kind: "task_event",
+        id: "e1",
+        parent: Some("t1"),
+        seq,
+        ts: 5,
+        disposition: busbar_contract::records::PlaneDisposition::Active,
+        body,
+    };
+    s.v3_append_plane_record_op(op(1), rec(1, b"{}")).unwrap();
+    assert!(matches!(
+        s.v3_append_plane_record_op(op(2), rec(1, b"{\"x\":1}")),
+        Err(OpRefused::Failed(_))
+    ));
+    assert_eq!(ops_recorded(&s), 1, "the fork recorded its op_id");
+    s.v3_append_plane_record_op(op(2), rec(2, b"{}"))
+        .expect("the retry of the failed op_id applies");
+    assert_eq!(ops_recorded(&s), 2);
+}
+
+/// A usage batch whose second cell fails rolls back the first and records nothing.
+#[test]
+fn a_usage_batch_whose_second_cell_fails_rolls_back_the_first() {
+    let s = fresh();
+    s.lock_writer()
+        .execute_batch("ALTER TABLE usage_window_units RENAME TO units_away")
+        .unwrap();
+    let open_unit = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokensDelta {
+            model: "m".to_string(),
+            usage_units: [("custom".to_string(), 1)].into_iter().collect(),
+        }],
+    };
+    let cells = [("k", 60, delta(1, 1)), ("k", 61, open_unit)];
+    assert!(matches!(
+        s.v3_add_usage_batch(op(1), &cells),
+        Err(OpRefused::Failed(_))
+    ));
+    let rows: i64 = s
+        .lock_writer()
+        .query_row("SELECT COUNT(*) FROM usage_windows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the first cell was not rolled back");
+    assert_eq!(ops_recorded(&s), 0);
+    s.lock_writer()
+        .execute_batch("ALTER TABLE units_away RENAME TO usage_window_units")
+        .unwrap();
+    s.v3_add_usage_batch(op(1), &cells)
+        .expect("the retry applies");
+    assert_eq!(RecordStore::get_usage(&s, "k", 60).unwrap().requests, 1);
+}
+
+/// The retention sweep runs every `SWEEP_EVERY`th recorded op and drops only rows past retention.
+#[test]
+fn the_retention_sweep_deletes_aged_rows_every_sweep_every_ops() {
+    let s = fresh();
+    s.v3_add_usage_batch(op(0), &[("k", 60, delta(1, 1))])
+        .unwrap(); // the first op sweeps
+    let aged = |s: &SqliteStore| -> i64 {
+        s.lock_writer()
+            .query_row(
+                "SELECT COUNT(*) FROM store_ops WHERE recorded_at < 1000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    {
+        let c = s.lock_writer();
+        for i in 0..5u64 {
+            c.execute(
+                "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, 'x', '', 1)",
+                [OpId::from_parts(9, i).0.as_slice()],
+            )
+            .unwrap();
+        }
+    }
+    for n in 1..SWEEP_EVERY {
+        s.v3_add_usage_batch(op(n), &[("k", 60, delta(1, 1))])
+            .unwrap();
+    }
+    assert_eq!(aged(&s), 5, "swept before SWEEP_EVERY ops");
+    s.v3_add_usage_batch(op(SWEEP_EVERY), &[("k", 60, delta(1, 1))])
+        .unwrap();
+    assert_eq!(aged(&s), 0, "aged rows survived the sweep");
+    assert_eq!(
+        ops_recorded(&s),
+        SWEEP_EVERY as i64 + 1,
+        "fresh rows were swept"
+    );
 }
