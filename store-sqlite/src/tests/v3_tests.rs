@@ -477,3 +477,58 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     .expect("list")
     .is_empty());
 }
+
+/// A value the columns cannot hold is REFUSED (the host may re-send), not Failed (replayed forever),
+/// and nothing is applied or recorded.
+#[test]
+fn values_the_columns_cannot_hold_are_refused_not_failed() {
+    let s = fresh();
+    let rec = |seq: u64, ts: u64| PlaneRecordRef {
+        kind: "task_event",
+        id: "e1",
+        parent: Some("t1"),
+        seq,
+        ts,
+        disposition: busbar_contract::records::PlaneDisposition::Active,
+        body: b"{}",
+    };
+    for r in [rec(u64::MAX, 1), rec(1, u64::MAX)] {
+        assert!(matches!(
+            s.v3_append_plane_record_op(op(1), r),
+            Err(OpRefused::Refused(_))
+        ));
+    }
+    let m = MeteringDelta {
+        key_id: "k".into(),
+        bucket: 1,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: u64::MAX,
+        usage_units: Default::default(),
+    };
+    assert!(matches!(
+        s.v3_add_metering_batch(op(2), &[m]),
+        Err(OpRefused::Refused(_))
+    ));
+    assert!(RecordStore::list_plane_records(
+        &s,
+        "task_event",
+        &busbar_contract::records::PlaneSelector::All
+    )
+    .unwrap()
+    .is_empty());
+    assert!(RecordStore::list_metering(&s, 1).unwrap().is_empty());
+    let n: i64 = s
+        .lock_writer()
+        .query_row("SELECT COUNT(*) FROM store_ops", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "a refused op records nothing");
+}
