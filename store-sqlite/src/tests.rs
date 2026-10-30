@@ -1212,12 +1212,21 @@ fn append_audit_refuses_a_seq_it_cannot_store_faithfully() {
         .append_audit(&rec)
         .expect_err("a seq past i64::MAX must be refused, not wrapped");
     assert!(
-        err.0.contains("storable range"),
-        "the refusal must say why: {}",
+        err.0.contains("storable range") && err.0.starts_with("append_audit: seq "),
+        "the refusal must say why, naming the field: {}",
+        err.0
+    );
+    rec.seq = 1;
+    rec.ts = u64::MAX;
+    let err = s.append_audit(&rec).expect_err("a ts past i64::MAX too");
+    assert!(
+        err.0.starts_with("append_audit: ts "),
+        "naming the field: {}",
         err.0
     );
 
     // The boundary itself is storable, and an identical retry there is still the benign Ok path.
+    rec.ts = 1_700_000_000;
     rec.seq = i64::MAX as u64;
     s.append_audit(&rec).expect("i64::MAX is in range");
     s.append_audit(&rec)
