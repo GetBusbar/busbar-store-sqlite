@@ -2225,6 +2225,32 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 /// read clamps back — so the row read back would not be the row written: a wrapped `seq` reorders a
 /// chain, a wrapped `ts` changes what retention does to it. Refused outright, exactly as
 /// `append_audit` refuses it, rather than silently mangled.
+/// The contract upserts by `(kind, id)`: a record's own `seq` never makes a second row.
+#[test]
+fn upsert_plane_record_ignores_seq_and_keeps_one_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut r = task_record(&sample_task("t-seq", "working", 1));
+    r.seq = 3;
+    r.body = b"first".to_vec();
+    s.upsert_plane_record(r.view()).unwrap();
+    r.seq = 4;
+    r.body = b"second".to_vec();
+    s.upsert_plane_record(r.view()).unwrap();
+    assert_eq!(
+        s.get_plane_record("task", "t-seq").unwrap(),
+        Some(b"second".to_vec())
+    );
+    let n: i64 = s
+        .lock_writer()
+        .query_row(
+            "SELECT COUNT(*) FROM plane_records WHERE identity='t-seq'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
 #[test]
 fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
