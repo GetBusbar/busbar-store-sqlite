@@ -1010,7 +1010,7 @@ impl RecordStore for SqliteStore {
         let sql = concat!(
             "SELECT ",
             key_cols!(),
-            " FROM keys WHERE revision > ?1 ORDER BY revision"
+            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision"
         );
         query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
     }
