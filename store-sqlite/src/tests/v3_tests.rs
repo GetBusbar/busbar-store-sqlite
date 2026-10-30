@@ -542,16 +542,20 @@ fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
     s.v3_record_put("p", b"aa", b"v").expect("put");
     let steps = |s: &SqliteStore| {
         // `:memory:` has one connection, so the scan runs on the writer holding the handler.
-        s.lock_writer().progress_handler(
-            1,
-            Some(|| {
-                STEPS.fetch_add(1, Ordering::Relaxed);
-                false
-            }),
-        );
+        s.lock_writer()
+            .progress_handler(
+                1,
+                Some(|| {
+                    STEPS.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
         STEPS.store(0, Ordering::Relaxed);
         let rows = s.v3_record_scan("p", b"a", 100).expect("scan");
-        s.lock_writer().progress_handler(1, None::<fn() -> bool>);
+        s.lock_writer()
+            .progress_handler(1, None::<fn() -> bool>)
+            .unwrap();
         assert_eq!(rows.len(), 1);
         STEPS.load(Ordering::Relaxed)
     };
