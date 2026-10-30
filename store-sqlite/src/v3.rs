@@ -12,7 +12,7 @@
 //! records nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::column::prefix_end;
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -32,6 +32,11 @@ use crate::{
 
 fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
+}
+
+/// A value the columns cannot hold: nothing applied, the host may split or re-send.
+fn refused(e: RecordStoreError) -> OpRefused {
+    OpRefused::Refused(e.0)
 }
 
 /// The body recorded under `op` inside its retention, read inside `tx`.
@@ -113,6 +118,8 @@ impl SqliteStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> OpResult<()> {
+        storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
+        storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
         self.op(op, Dedupe::append(record), |tx| {
             append_plane_record_in(tx, record)
         })
@@ -170,15 +177,27 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); a NULL end
-        // (every byte `0xff`, or empty) is unbounded above.
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = query_all(
-            &self.lock_reader(),
-            "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
-             AND (?3 IS NULL OR record_key < ?3) ORDER BY record_key LIMIT ?4",
-            params![schema, prefix, prefix_end(prefix), i64::from(limit)],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); no successor
+        // (every byte `0xff`, or empty) is unbounded above. Two statements, so the bounded one stops
+        // at the end of the range instead of filtering every row past it.
+        let conn = self.lock_reader();
+        let row = |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?));
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = match prefix_end(prefix) {
+            Some(end) => query_all(
+                &conn,
+                "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
+                 AND record_key < ?3 ORDER BY record_key LIMIT ?4",
+                params![schema, prefix, end, i64::from(limit)],
+                row,
+            ),
+            None => query_all(
+                &conn,
+                "SELECT record_key, value FROM schema_records WHERE schema=?1 AND record_key >= ?2 \
+                 ORDER BY record_key LIMIT ?3",
+                params![schema, prefix, i64::from(limit)],
+                row,
+            ),
+        }
         .map_err(|e| e.0)?;
         rows.into_iter()
             .map(|(k, v)| Ok((k, record_bytes(v)?)))
@@ -198,6 +217,9 @@ impl SqliteStore {
     }
 
     pub(crate) fn v3_add_metering_batch(&self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
+        for d in deltas {
+            storable_i64("add_metering", "priced_from_ms", d.priced_from_ms).map_err(refused)?;
+        }
         self.op(op, Dedupe::metering(deltas), |tx| {
             deltas.iter().try_for_each(|d| add_metering_in(tx, d))
         })
