@@ -541,6 +541,25 @@ impl SqliteStore {
     }
 }
 
+/// `col + delta` in SQL, saturating at `i64::MAX` (a REAL result would be refused by STRICT INTEGER).
+macro_rules! sat_add {
+    ($col:literal, $delta:literal) => {
+        concat!(
+            "CASE WHEN ",
+            $delta,
+            " > 0 AND ",
+            $col,
+            " > 9223372036854775807 - ",
+            $delta,
+            " THEN 9223372036854775807 ELSE ",
+            $col,
+            " + ",
+            $delta,
+            " END"
+        )
+    };
+}
+
 /// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
 /// Every other unit name is an OPEN unit and lives in `usage_window_units`.
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
@@ -765,12 +784,17 @@ fn add_usage_in(
     // `requests` / `billable_requests` accumulate unconditionally on the `model=''` sentinel row,
     // whether or not the delta reached any model (a rejected request adds to `requests` alone).
     // `prepare_cached`: this fires once per admitted request, the hottest write path in the crate.
-    tx.prepare_cached(
+    tx.prepare_cached(concat!(
         "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
          VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
          ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-            requests = MAX(0, requests + ?3), billable_requests = MAX(0, billable_requests + ?4)",
-    )
+            requests = MAX(0, ",
+        sat_add!("requests", "?3"),
+        "),
+            billable_requests = MAX(0, ",
+        sat_add!("billable_requests", "?4"),
+        ")"
+    ))
     .store()?
     .execute(params![
         window_start as i64,
@@ -781,30 +805,37 @@ fn add_usage_in(
     .store()?;
     for m in &delta.models {
         let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
-        tx.prepare_cached(
+        tx.prepare_cached(concat!(
             "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
                  tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
              VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
              ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-                tokens_input       = MAX(0, tokens_input + ?4),
-                tokens_output      = MAX(0, tokens_output + ?5),
-                tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
-                tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
-        )
+                tokens_input       = MAX(0, ", sat_add!("tokens_input", "?4"), "),
+                tokens_output      = MAX(0, ", sat_add!("tokens_output", "?5"), "),
+                tokens_cache_read  = MAX(0, ", sat_add!("tokens_cache_read", "?6"), "),
+                tokens_cache_write = MAX(0, ", sat_add!("tokens_cache_write", "?7"), ")"
+        ))
         .store()?
         .execute(params![
-            window_start as i64, bucket_id, m.model,
-            d(UNIT_INPUT), d(UNIT_OUTPUT), d(UNIT_CACHE_READ), d(UNIT_CACHE_WRITE),
+            window_start as i64,
+            bucket_id,
+            m.model,
+            d(UNIT_INPUT),
+            d(UNIT_OUTPUT),
+            d(UNIT_CACHE_READ),
+            d(UNIT_CACHE_WRITE),
         ])
         .store()?;
         // Every open unit accumulates the same way, floored at 0 (a refund never drives a counter negative).
         for (unit, d) in open_units(&m.usage_units) {
-            tx.prepare_cached(
+            tx.prepare_cached(concat!(
                 "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
                  VALUES (?1,?2,?3,?4,MAX(0,?5))
                  ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
-                    count = MAX(0, count + ?5)",
-            )
+                    count = MAX(0, ",
+                sat_add!("count", "?5"),
+                ")"
+            ))
             .store()?
             .execute(params![window_start as i64, bucket_id, m.model, unit, d])
             .store()?;
@@ -820,16 +851,16 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     let priced_from = column::storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
     exec(
         tx,
-        "INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
+        concat!("INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
              tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
-             tokens_input       = tokens_input + excluded.tokens_input,
-             tokens_output      = tokens_output + excluded.tokens_output,
-             tokens_cache_read  = tokens_cache_read + excluded.tokens_cache_read,
-             tokens_cache_write = tokens_cache_write + excluded.tokens_cache_write,
-             requests           = requests + excluded.requests,
-             billable_requests  = billable_requests + excluded.billable_requests",
+             tokens_input       = ", sat_add!("tokens_input", "excluded.tokens_input"), ",
+             tokens_output      = ", sat_add!("tokens_output", "excluded.tokens_output"), ",
+             tokens_cache_read  = ", sat_add!("tokens_cache_read", "excluded.tokens_cache_read"), ",
+             tokens_cache_write = ", sat_add!("tokens_cache_write", "excluded.tokens_cache_write"), ",
+             requests           = ", sat_add!("requests", "excluded.requests"), ",
+             billable_requests  = ", sat_add!("billable_requests", "excluded.billable_requests")),
         params![
             d.bucket as i64,
             d.key_id,
@@ -849,10 +880,10 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     for (unit, count) in &d.usage_units {
         exec(
             tx,
-            "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
+            concat!("INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
              VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
-                 count = count + excluded.count",
+                 count = ", sat_add!("count", "excluded.count")),
             params![
                 d.bucket as i64,
                 d.key_id,
