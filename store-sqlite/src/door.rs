@@ -19,11 +19,18 @@ pub const NAME: &str = "busbar-store-sqlite";
 const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
     &[busbar_contract::abi::sdk::door::abi_str("license_key")];
 
+// `db_path` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
+// place (a 1.5.5 `db_path: {env: VAR}` keeps booting) and a literal passes as written.
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
+]);
+
 busbar_contract::store_door!(
     SqliteStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
+    extensions: EXTENSIONS,
     secret_refs: SECRET_REFS
 );
 
