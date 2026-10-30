@@ -594,6 +594,55 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
     );
 }
 
+/// Accruals saturate at `i64::MAX`; an overflow must not poison the batch.
+#[test]
+fn add_usage_saturates_at_i64_max_instead_of_erroring() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut d = delta(i64::MAX, "m", i64::MAX, i64::MAX);
+    d.models[0].usage_units.insert("custom".to_string(), i64::MAX);
+    s.add_usage("vk_sat", 1, &d).unwrap();
+    s.add_usage("vk_sat", 1, &d).unwrap();
+    let ledger = s.get_usage("vk_sat", 1).unwrap();
+    assert_eq!(ledger.requests, i64::MAX as u64);
+    assert_eq!(ledger.billable_requests, i64::MAX as u64);
+    let m = &ledger.models[0];
+    assert_eq!(m.tier(UNIT_INPUT), i64::MAX as u64);
+    assert_eq!(m.tier(UNIT_OUTPUT), i64::MAX as u64);
+    assert_eq!(m.tier("custom"), i64::MAX as u64);
+}
+
+#[test]
+fn add_metering_saturates_at_i64_max_instead_of_erroring() {
+    for v in [i64::MAX as u64, u64::MAX] {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let d = MeteringDelta {
+            key_id: "vk_sat".to_string(),
+            bucket: 1,
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            tokens_input: v,
+            tokens_output: v,
+            tokens_cache_read: v,
+            tokens_cache_write: v,
+            requests: v,
+            billable_requests: v,
+            key_group_at_use: String::new(),
+            pricing_version: String::new(),
+            priced_from_ms: 0,
+            usage_units: [("custom".to_string(), v)].into_iter().collect(),
+        };
+        s.add_metering(&d).unwrap();
+        s.add_metering(&d).unwrap();
+        let r = &s.list_metering(1).unwrap()[0];
+        let max = i64::MAX as u64;
+        assert_eq!(
+            [r.tokens_input, r.tokens_output, r.tokens_cache_read, r.tokens_cache_write, r.requests, r.billable_requests],
+            [max; 6]
+        );
+        assert_eq!(r.usage_units["custom"], max);
+    }
+}
+
 // ── Metering ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
