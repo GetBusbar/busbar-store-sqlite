@@ -1551,8 +1551,8 @@ impl RecordStore for SqliteStore {
 
     /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
     /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
-    /// sits still longest), `Age` every older row; a purged task takes its `task_event` chain with
-    /// it. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
+    /// sits still longest), `Age` every older row; under either, a purged task takes its
+    /// `task_event` chain with it, and the count is the task rows. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
     /// than the end of time".
     fn purge_plane_records(
         &self,
@@ -1568,7 +1568,7 @@ impl RecordStore for SqliteStore {
             } else {
                 "kind=?1 AND ts < ?2"
             };
-            if terminal_only && kind == "task" {
+            if kind == "task" {
                 tx.execute(
                     &format!(
                         "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
