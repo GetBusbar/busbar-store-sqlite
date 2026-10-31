@@ -3657,3 +3657,41 @@ fn a_revoked_credential_id_is_never_re_minted() {
     assert_eq!(rows[0].created_at, 99, "created_at is the new credential's");
     assert!(rows[0].revoked_at.is_none());
 }
+
+// ── Kind alignment: re-putting a live credential (R4) ────────────────────────────────────────
+
+/// Identical content (revision aside) is an Ok no-op that writes nothing; different content, or
+/// another id in the slot, is refused with the live-slot text.
+#[test]
+fn re_putting_a_live_credential_is_a_no_op_only_when_identical() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_r4", "g")).unwrap();
+    let cred = sample_credential("vk_r4", "AKIA_R4", 0);
+    s.put_credential(&cred).unwrap();
+    let stored = s.list_credentials("vk_r4").unwrap()[0].revision;
+
+    let mut again = cred.clone();
+    again.meta.revision = 4242;
+    s.put_credential(&again)
+        .expect("an identical re-put of a live credential is Ok");
+    assert_eq!(
+        s.list_credentials("vk_r4").unwrap()[0].revision,
+        stored,
+        "an identical re-put writes nothing"
+    );
+    assert!(
+        s.list_credentials_since(stored).unwrap().is_empty(),
+        "an identical re-put is no change to hydrate"
+    );
+
+    let live = "put_credential: slot 0 for key 'vk_r4' kind 'sigv4' holds a live credential; \
+                revoke it first";
+    let mut changed = cred.clone();
+    changed.secret = "v1:plain:other".to_string();
+    assert_eq!(s.put_credential(&changed).unwrap_err().0, live, "other secret");
+    let mut other_id = cred.clone();
+    other_id.meta.id = "cred_other".to_string();
+    other_id.meta.public_id = "AKIA_R4_OTHER".to_string();
+    assert_eq!(s.put_credential(&other_id).unwrap_err().0, live, "other id");
+    assert_eq!(s.list_credentials("vk_r4").unwrap().len(), 1);
+}
