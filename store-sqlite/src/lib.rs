@@ -849,7 +849,7 @@ fn put_key_inner(
     .store()?;
     if affected == 0 {
         return Err(RecordStoreError(format!(
-            "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
+            "{method}: '{}' is tombstoned and its id is never reissued; refusing to clear the \
              tombstone",
             key.id
         )));
@@ -1119,7 +1119,7 @@ impl RecordStore for SqliteStore {
                 )
                 .store()?;
             if changed == 0 {
-                return Err(RecordStoreError(format!("delete_key: no such key {id}")));
+                return Err(RecordStoreError(format!("delete_key: unknown id '{id}'")));
             }
             Ok(())
         })
@@ -1739,15 +1739,16 @@ fn put_credential_inner(
     match owner_live {
         None => {
             return Err(RecordStoreError(format!(
-                "put_credential: owning key '{}' does not exist",
+                "{method}: key '{}' does not exist; a credential must hang off a real key",
                 m.key_id
             )))
         }
         Some(false) => {
             return Err(RecordStoreError(format!(
-            "put_credential: owning key '{}' is tombstoned; a revoked key takes no new credential",
-            m.key_id
-        )))
+                "{method}: key '{}' is tombstoned; its credentials were revoked with it and are \
+                 never reissued",
+                m.key_id
+            )))
         }
         Some(true) => {}
     }
@@ -1801,7 +1802,7 @@ fn put_credential_inner(
         .store()?;
     if taken {
         return Err(RecordStoreError(format!(
-            "put_credential: public_id {} is already taken for kind {}",
+            "{method}: public_id '{}' is already in use for kind '{}'",
             m.public_id, m.kind
         )));
     }
