@@ -1371,7 +1371,8 @@ impl RecordStore for SqliteStore {
                 tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version,
                 priced_from_ms
              FROM usage_metering WHERE bucket = ?1",
-            params![bucket.to_string()],
+            // Match the legacy writer's signed bit-pattern key, including existing high-u64 rows.
+            params![(bucket as i64).to_string()],
             |r| {
                 Ok(MeteringRow {
                     key_id: r.get(0)?,
@@ -1394,7 +1395,7 @@ impl RecordStore for SqliteStore {
             &conn,
             "SELECT key_id, provider, model, priced_from_ms, unit, count
              FROM usage_metering_units WHERE bucket = ?1",
-            params![bucket.to_string()],
+            params![(bucket as i64).to_string()],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
