@@ -749,6 +749,65 @@ fn metering_accumulates_and_carries_group_and_pricing_attribution() {
     assert_eq!(rows[0].pricing_version, "2026-07");
 }
 
+#[test]
+fn metering_bucket_keys_preserve_the_full_unsigned_range_across_reopen() {
+    let dir = tempdir();
+    let path = dir.join("full-width-metering.db");
+    let path = path.to_str().unwrap();
+    let buckets = [0, 20260101, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX];
+    let expected = {
+        let store = SqliteStore::open(path, 5000).unwrap();
+        for bucket in buckets {
+            let delta = MeteringDelta {
+                key_id: format!("key-{bucket}"),
+                bucket,
+                model: "model".into(),
+                provider: "provider".into(),
+                tokens_input: 10,
+                tokens_output: 5,
+                tokens_cache_read: 2,
+                tokens_cache_write: 3,
+                requests: 1,
+                billable_requests: 1,
+                key_group_at_use: "group".into(),
+                pricing_version: "card".into(),
+                priced_from_ms: 7,
+                usage_units: std::collections::BTreeMap::from([("tool_calls".into(), 4)]),
+            };
+            store.add_metering(&delta).unwrap();
+            store.add_metering(&delta).unwrap();
+        }
+        buckets.map(|bucket| {
+            let rows = store.list_metering(bucket).unwrap();
+            assert_eq!(rows.len(), 1, "bucket {bucket} must read its own row");
+            let row = &rows[0];
+            assert_eq!(row.key_id, format!("key-{bucket}"));
+            assert_eq!((row.tokens_input, row.tokens_output), (20, 10));
+            assert_eq!((row.tokens_cache_read, row.tokens_cache_write), (4, 6));
+            assert_eq!((row.requests, row.billable_requests), (2, 2));
+            assert_eq!(
+                row.usage_units,
+                std::collections::BTreeMap::from([("tool_calls".into(), 8)])
+            );
+            assert_eq!((&*row.model, &*row.provider), ("model", "provider"));
+            assert_eq!(
+                (&*row.key_group_at_use, &*row.pricing_version),
+                ("group", "card")
+            );
+            assert_eq!(row.priced_from_ms, 7);
+            rows
+        })
+    };
+    let reopened = SqliteStore::open(path, 5000).unwrap();
+    for (bucket, rows) in buckets.into_iter().zip(expected) {
+        assert_eq!(
+            reopened.list_metering(bucket).unwrap(),
+            rows,
+            "bucket {bucket} survives reopen"
+        );
+    }
+}
+
 // ── Denylist ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
