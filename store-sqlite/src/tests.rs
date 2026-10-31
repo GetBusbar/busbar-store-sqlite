@@ -3953,7 +3953,7 @@ fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
     }
 }
 
-// ── Kind alignment: a purged or deleted task takes its event chain (R12) ────────────────
+// ── Kind alignment: a purged or deleted task takes its event chain (R13) ────────────────
 
 fn seed_task_with_events(s: &SqliteStore, id: &str, state: &str) {
     s.upsert_plane_record(task_record(&sample_task(id, state, 100)).view())
@@ -3979,3 +3979,21 @@ fn an_age_purge_of_tasks_takes_each_purged_tasks_event_chain() {
     assert_eq!(list_events(&s, "t-stays").len(), 2, "no other chain is touched");
 }
 
+#[test]
+fn deleting_a_task_deletes_its_event_chain() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    seed_task_with_events(&s, "t-del", "working");
+    seed_task_with_events(&s, "t-keep", "working");
+
+    s.delete_plane_record("task", "t-del").unwrap();
+    assert_eq!(get_task(&s, "t-del"), None);
+    assert!(list_events(&s, "t-del").is_empty(), "the chain goes with its task");
+    assert_eq!(list_events(&s, "t-keep").len(), 2);
+
+    s.delete_plane_record("task_event", "t-keep").unwrap();
+    assert!(
+        list_events(&s, "t-keep").is_empty(),
+        "deleting a non-task kind is unchanged: every seq under the identity"
+    );
+    assert!(get_task(&s, "t-keep").is_some());
+}
