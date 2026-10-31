@@ -36,20 +36,59 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 }
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-/// release ever wrote one. v6 -> v13 upgrades in place:
+/// release ever wrote one. v6 -> v14 upgrades in place:
 /// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
 ///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
 ///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
 ///   The v6 `mcp_calls` table is left unread: its body is a digest stream no backend can rebuild.
 /// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
+/// - v14: `credentials` is rebuilt so a revoked row may hold no secret (revoke destroys it); a row
+///   revoked under an older build loses the secret it kept.
 ///
 /// A file stamped by a later build is refused.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The oldest schema any release wrote.
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
-const SCHEMA: &str = "
+/// The `credentials` table, under `$head` (`IF NOT EXISTS credentials` in [`SCHEMA`], the scratch
+/// name in the v14 rebuild), so the two cannot drift.
+macro_rules! credentials_ddl {
+    ($head:literal) => {
+        concat!(
+            "CREATE TABLE ",
+            $head,
+            " (
+    id            TEXT NOT NULL PRIMARY KEY,
+    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    kind          TEXT NOT NULL,
+    -- 0 or 1: two rows per (key_id, kind) allow overlap-window rotation.
+    slot          INTEGER NOT NULL,
+    public_id     TEXT NOT NULL,
+    secret        TEXT,
+    secret_form   TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    expires_at    INTEGER,
+    revoked_at    INTEGER,
+    revoke_reason TEXT,
+    revision      INTEGER NOT NULL DEFAULT 0,
+    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),
+    CONSTRAINT cred_slot CHECK (slot IN (0,1)),
+    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),
+    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),
+    -- A revoked row has had its secret destroyed.
+    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable' OR revoked_at IS NOT NULL),
+    CONSTRAINT cred_revoked_bare CHECK (revoked_at IS NULL OR secret IS NULL),
+    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
+    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
+    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
+) STRICT;"
+        )
+    };
+}
+
+const SCHEMA: &str = concat!("
 CREATE TABLE IF NOT EXISTS store_meta (
     k TEXT NOT NULL PRIMARY KEY,
     v TEXT NOT NULL
@@ -86,30 +125,9 @@ CREATE INDEX IF NOT EXISTS keys_revision_idx ON keys (revision);
 CREATE INDEX IF NOT EXISTS keys_group_live_idx ON keys (key_group) WHERE deleted_at IS NULL;
 
 -- Only for auth verified by ROW LOOKUP from a wire-supplied public identifier (today: sigv4).
-CREATE TABLE IF NOT EXISTS credentials (
-    id            TEXT NOT NULL PRIMARY KEY,
-    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    kind          TEXT NOT NULL,
-    -- 0 or 1: two rows per (key_id, kind) allow overlap-window rotation.
-    slot          INTEGER NOT NULL,
-    public_id     TEXT NOT NULL,
-    secret        TEXT,
-    secret_form   TEXT NOT NULL,
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL,
-    expires_at    INTEGER,
-    revoked_at    INTEGER,
-    revoke_reason TEXT,
-    revision      INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),
-    CONSTRAINT cred_slot CHECK (slot IN (0,1)),
-    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),
-    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),
-    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),
-    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
-    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
-    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
-) STRICT;
+",
+    credentials_ddl!("IF NOT EXISTS credentials"),
+    "
 CREATE UNIQUE INDEX IF NOT EXISTS cred_public_id_uq ON credentials (kind, public_id);
 CREATE UNIQUE INDEX IF NOT EXISTS cred_slot_uq ON credentials (key_id, kind, slot);
 CREATE INDEX IF NOT EXISTS cred_revision_idx ON credentials (revision);
@@ -250,7 +268,7 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plane_records
   WHEN OLD.parent IS NOT NULL AND OLD.identity = OLD.parent
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
-";
+");
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
 /// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
@@ -541,6 +559,11 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
+        // v14: `credentials` gains the revoked-row CHECKs, which SQLite cannot add in place. Run
+        // BEFORE `SCHEMA` so its `IF NOT EXISTS` finds the rebuilt table.
+        if version != 0 && version < 14 && table_exists(&tx, "credentials")? {
+            rebuild_credentials_for_v14(&tx)?;
+        }
         // The chain trigger's condition narrowed to appended records (upsert-by-id): a file opened
         // by an older build holds the old one, and `SCHEMA` creates it only if it is absent.
         tx.execute_batch("DROP TRIGGER IF EXISTS plane_records_chain_no_update;")
@@ -652,6 +675,27 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
          DROP TABLE usage_metering;
          ALTER TABLE usage_metering_v10 RENAME TO usage_metering;",
     )
+    .store()
+}
+
+/// Rebuild a pre-v14 `credentials` with the v14 CHECKs, copying every row; a row revoked under an
+/// older build keeps its metadata and loses the secret it held. The trigger naming `credentials`
+/// is dropped first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates
+/// it and the indexes right after.
+fn rebuild_credentials_for_v14(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+    tx.execute_batch(concat!(
+        "DROP TRIGGER IF EXISTS keys_cascade_credentials;",
+        credentials_ddl!("credentials_v14"),
+        "INSERT INTO credentials_v14 (id, key_id, kind, slot, public_id, secret, secret_form,
+             created_at, updated_at, expires_at, revoked_at, revoke_reason, revision)
+           SELECT id, key_id, kind, slot, public_id,
+             CASE WHEN revoked_at IS NULL THEN secret END,
+             CASE WHEN revoked_at IS NULL THEN secret_form ELSE 'none' END,
+             created_at, updated_at, expires_at, revoked_at, revoke_reason, revision
+           FROM credentials;
+         DROP TABLE credentials;
+         ALTER TABLE credentials_v14 RENAME TO credentials;"
+    ))
     .store()
 }
 
@@ -1135,32 +1179,34 @@ impl RecordStore for SqliteStore {
 
     fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            let rev = Self::bump_revision(tx)?;
-            let affected = tx
-                .execute(
-                    "UPDATE credentials SET revoked_at=?2, revoke_reason=?3, updated_at=?2, revision=?4
-                     WHERE id=?1 AND revoked_at IS NULL",
-                    params![id, now_secs(), reason, rev],
+            // Read in the same transaction as the write, or a concurrent insert could make the
+            // answer a lie. Unknown is an error and already revoked is Ok (idempotent): collapsing
+            // them would tell an operator responding to a leak that a live credential is dead.
+            let revoked: Option<bool> = tx
+                .query_row(
+                    "SELECT revoked_at IS NOT NULL FROM credentials WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
                 )
+                .optional()
                 .store()?;
-            // A 0 count is "already revoked" (idempotent, Ok) or "no such id" (an error): collapsing
-            // them would tell an operator responding to a leak that a live credential is dead. The
-            // EXISTS runs in the same transaction, or a concurrent insert could make it a lie.
-            if affected == 0 {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=?1)",
-                        params![id],
-                        |r| r.get(0),
+            match revoked {
+                None => Err(RecordStoreError(format!(
+                    "revoke_credential: unknown id '{id}'"
+                ))),
+                Some(true) => Ok(()),
+                Some(false) => {
+                    let rev = Self::bump_revision(tx)?;
+                    // The secret is destroyed with the revocation: it must not outlive its use.
+                    tx.execute(
+                        "UPDATE credentials SET secret=NULL, secret_form='none', revoked_at=?2,
+                             revoke_reason=?3, updated_at=?2, revision=?4 WHERE id=?1",
+                        params![id, now_secs(), reason, rev],
                     )
-                    .store()?;
-                if !exists {
-                    return Err(RecordStoreError(format!(
-                        "revoke_credential: unknown id '{id}'"
-                    )));
+                    .store()
+                    .map(drop)
                 }
             }
-            Ok(())
         })
     }
 
