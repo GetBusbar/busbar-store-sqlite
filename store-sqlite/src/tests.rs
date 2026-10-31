@@ -3959,8 +3959,10 @@ fn seed_task_with_events(s: &SqliteStore, id: &str, state: &str) {
     s.upsert_plane_record(task_record(&sample_task(id, state, 100)).view())
         .unwrap();
     for (seq, prev, hash) in [(1, "", "h1"), (2, "h1", "h2")] {
-        s.append_plane_record(event_record(&sample_event(id, seq, "task.event", prev, hash)).view())
-            .unwrap();
+        s.append_plane_record(
+            event_record(&sample_event(id, seq, "task.event", prev, hash)).view(),
+        )
+        .unwrap();
     }
 }
 
@@ -3975,8 +3977,15 @@ fn an_age_purge_of_tasks_takes_each_purged_tasks_event_chain() {
     let purged = s.purge_plane_records("task", 200, Retention::Age).unwrap();
     assert_eq!(purged, 1, "the count is the task rows");
     assert_eq!(list_task_ids(&s), vec!["t-stays"]);
-    assert!(list_events(&s, "t-old").is_empty(), "the purged task's chain goes");
-    assert_eq!(list_events(&s, "t-stays").len(), 2, "no other chain is touched");
+    assert!(
+        list_events(&s, "t-old").is_empty(),
+        "the purged task's chain goes"
+    );
+    assert_eq!(
+        list_events(&s, "t-stays").len(),
+        2,
+        "no other chain is touched"
+    );
 }
 
 #[test]
@@ -3987,7 +3996,10 @@ fn deleting_a_task_deletes_its_event_chain() {
 
     s.delete_plane_record("task", "t-del").unwrap();
     assert_eq!(get_task(&s, "t-del"), None);
-    assert!(list_events(&s, "t-del").is_empty(), "the chain goes with its task");
+    assert!(
+        list_events(&s, "t-del").is_empty(),
+        "the chain goes with its task"
+    );
     assert_eq!(list_events(&s, "t-keep").len(), 2);
 
     s.delete_plane_record("task_event", "t-keep").unwrap();
@@ -3996,4 +4008,38 @@ fn deleting_a_task_deletes_its_event_chain() {
         "deleting a non-task kind is unchanged: every seq under the identity"
     );
     assert!(get_task(&s, "t-keep").is_some());
+}
+
+// ── Kind alignment: get_usage is sparse for open units (R19) ─────────────────────────────────
+
+#[test]
+fn get_usage_omits_zero_count_open_units() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let delta = |d: i64| UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokensDelta {
+            model: "rerank".into(),
+            usage_units: [
+                ("search_units".to_string(), d),
+                ("tool_calls".to_string(), 2),
+            ]
+            .into(),
+        }],
+    };
+    s.add_usage("vk_r19", 100, &delta(5)).unwrap();
+    s.add_usage("vk_r19", 100, &delta(-5)).unwrap();
+    let ledger = s.get_usage("vk_r19", 100).unwrap();
+    let units = &ledger.models[0].usage_units;
+    assert_eq!(units.get("tool_calls"), Some(&4));
+    assert!(
+        !units.contains_key("search_units"),
+        "a zero count is absent: {units:?}"
+    );
+
+    let mut put = ledger.clone();
+    put.models[0].usage_units.insert("idle".into(), 0);
+    s.put_usage("vk_r19", 200, &put).unwrap();
+    let back = s.get_usage("vk_r19", 200).unwrap();
+    assert!(!back.models[0].usage_units.contains_key("idle"));
 }
