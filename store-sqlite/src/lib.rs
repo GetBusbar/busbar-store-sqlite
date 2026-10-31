@@ -1557,21 +1557,22 @@ impl RecordStore for SqliteStore {
     /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
     /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
     /// sits still longest), `Age` every older row; under either, a purged task takes its
-    /// `task_event` chain with it, and the count is the task rows. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
-    /// than the end of time".
+    /// `task_event` chain with it, and the count is the task rows. A cutoff past the signed
+    /// timestamp range includes every storable timestamp, including the signed maximum.
     fn purge_plane_records(
         &self,
         kind: &str,
         before: u64,
         retention: Retention,
     ) -> RecordStoreResult<u64> {
+        let above_max = before > i64::MAX as u64;
         let before = column::clamp(before);
         let terminal_only = retention == Retention::TerminalOnly;
         self.write(false, |tx| {
             let predicate = if terminal_only {
-                "kind=?1 AND ts < ?2 AND disposition='terminal'"
+                "kind=?1 AND (?3 OR ts < ?2) AND disposition='terminal'"
             } else {
-                "kind=?1 AND ts < ?2"
+                "kind=?1 AND (?3 OR ts < ?2)"
             };
             if kind == "task" {
                 tx.execute(
@@ -1579,14 +1580,14 @@ impl RecordStore for SqliteStore {
                         "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
                          (SELECT identity FROM plane_records WHERE {predicate})"
                     ),
-                    params![kind, before],
+                    params![kind, before, above_max],
                 )
                 .store()?;
             }
             let removed = tx
                 .execute(
                     &format!("DELETE FROM plane_records WHERE {predicate}"),
-                    params![kind, before],
+                    params![kind, before, above_max],
                 )
                 .store()?;
             Ok(removed as u64)
