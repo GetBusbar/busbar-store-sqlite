@@ -36,20 +36,59 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 }
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-/// release ever wrote one. v6 -> v13 upgrades in place:
+/// release ever wrote one. v6 -> v14 upgrades in place:
 /// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
 ///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
 ///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
 ///   The v6 `mcp_calls` table is left unread: its body is a digest stream no backend can rebuild.
 /// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
+/// - v14: `credentials` is rebuilt so a revoked row may hold no secret (revoke destroys it); a row
+///   revoked under an older build loses the secret it kept.
 ///
 /// A file stamped by a later build is refused.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The oldest schema any release wrote.
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
-const SCHEMA: &str = "
+/// The `credentials` table, under `$head` (`IF NOT EXISTS credentials` in [`SCHEMA`], the scratch
+/// name in the v14 rebuild), so the two cannot drift.
+macro_rules! credentials_ddl {
+    ($head:literal) => {
+        concat!(
+            "CREATE TABLE ",
+            $head,
+            " (
+    id            TEXT NOT NULL PRIMARY KEY,
+    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    kind          TEXT NOT NULL,
+    -- 0 or 1: two rows per (key_id, kind) allow overlap-window rotation.
+    slot          INTEGER NOT NULL,
+    public_id     TEXT NOT NULL,
+    secret        TEXT,
+    secret_form   TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    expires_at    INTEGER,
+    revoked_at    INTEGER,
+    revoke_reason TEXT,
+    revision      INTEGER NOT NULL DEFAULT 0,
+    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),
+    CONSTRAINT cred_slot CHECK (slot IN (0,1)),
+    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),
+    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),
+    -- A revoked row has had its secret destroyed.
+    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable' OR revoked_at IS NOT NULL),
+    CONSTRAINT cred_revoked_bare CHECK (revoked_at IS NULL OR secret IS NULL),
+    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
+    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
+    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
+) STRICT;"
+        )
+    };
+}
+
+const SCHEMA: &str = concat!("
 CREATE TABLE IF NOT EXISTS store_meta (
     k TEXT NOT NULL PRIMARY KEY,
     v TEXT NOT NULL
@@ -86,30 +125,9 @@ CREATE INDEX IF NOT EXISTS keys_revision_idx ON keys (revision);
 CREATE INDEX IF NOT EXISTS keys_group_live_idx ON keys (key_group) WHERE deleted_at IS NULL;
 
 -- Only for auth verified by ROW LOOKUP from a wire-supplied public identifier (today: sigv4).
-CREATE TABLE IF NOT EXISTS credentials (
-    id            TEXT NOT NULL PRIMARY KEY,
-    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    kind          TEXT NOT NULL,
-    -- 0 or 1: two rows per (key_id, kind) allow overlap-window rotation.
-    slot          INTEGER NOT NULL,
-    public_id     TEXT NOT NULL,
-    secret        TEXT,
-    secret_form   TEXT NOT NULL,
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL,
-    expires_at    INTEGER,
-    revoked_at    INTEGER,
-    revoke_reason TEXT,
-    revision      INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),
-    CONSTRAINT cred_slot CHECK (slot IN (0,1)),
-    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),
-    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),
-    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),
-    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
-    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
-    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
-) STRICT;
+",
+    credentials_ddl!("IF NOT EXISTS credentials"),
+    "
 CREATE UNIQUE INDEX IF NOT EXISTS cred_public_id_uq ON credentials (kind, public_id);
 CREATE UNIQUE INDEX IF NOT EXISTS cred_slot_uq ON credentials (key_id, kind, slot);
 CREATE INDEX IF NOT EXISTS cred_revision_idx ON credentials (revision);
@@ -250,7 +268,7 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plane_records
   WHEN OLD.parent IS NOT NULL AND OLD.identity = OLD.parent
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
-";
+");
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
 /// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
@@ -541,6 +559,11 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
+        // v14: `credentials` gains the revoked-row CHECKs, which SQLite cannot add in place. Run
+        // BEFORE `SCHEMA` so its `IF NOT EXISTS` finds the rebuilt table.
+        if version != 0 && version < 14 && table_exists(&tx, "credentials")? {
+            rebuild_credentials_for_v14(&tx)?;
+        }
         // The chain trigger's condition narrowed to appended records (upsert-by-id): a file opened
         // by an older build holds the old one, and `SCHEMA` creates it only if it is absent.
         tx.execute_batch("DROP TRIGGER IF EXISTS plane_records_chain_no_update;")
@@ -652,6 +675,27 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
          DROP TABLE usage_metering;
          ALTER TABLE usage_metering_v10 RENAME TO usage_metering;",
     )
+    .store()
+}
+
+/// Rebuild a pre-v14 `credentials` with the v14 CHECKs, copying every row; a row revoked under an
+/// older build keeps its metadata and loses the secret it held. The trigger naming `credentials`
+/// is dropped first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates
+/// it and the indexes right after.
+fn rebuild_credentials_for_v14(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+    tx.execute_batch(concat!(
+        "DROP TRIGGER IF EXISTS keys_cascade_credentials;",
+        credentials_ddl!("credentials_v14"),
+        "INSERT INTO credentials_v14 (id, key_id, kind, slot, public_id, secret, secret_form,
+             created_at, updated_at, expires_at, revoked_at, revoke_reason, revision)
+           SELECT id, key_id, kind, slot, public_id,
+             CASE WHEN revoked_at IS NULL THEN secret END,
+             CASE WHEN revoked_at IS NULL THEN secret_form ELSE 'none' END,
+             created_at, updated_at, expires_at, revoked_at, revoke_reason, revision
+           FROM credentials;
+         DROP TABLE credentials;
+         ALTER TABLE credentials_v14 RENAME TO credentials;"
+    ))
     .store()
 }
 
@@ -805,7 +849,7 @@ fn put_key_inner(
     .store()?;
     if affected == 0 {
         return Err(RecordStoreError(format!(
-            "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
+            "{method}: '{}' is tombstoned and its id is never reissued; refusing to clear the \
              tombstone",
             key.id
         )));
@@ -1034,7 +1078,7 @@ impl RecordStore for SqliteStore {
     }
 
     fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at");
+        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at, id");
         query_all(&self.lock_reader(), sql, [], row_to_key)
     }
 
@@ -1042,7 +1086,7 @@ impl RecordStore for SqliteStore {
         let sql = concat!(
             "SELECT ",
             key_cols!(),
-            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision"
+            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision, id"
         );
         query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
     }
@@ -1075,7 +1119,7 @@ impl RecordStore for SqliteStore {
                 )
                 .store()?;
             if changed == 0 {
-                return Err(RecordStoreError(format!("delete_key: no such key {id}")));
+                return Err(RecordStoreError(format!("delete_key: unknown id '{id}'")));
             }
             Ok(())
         })
@@ -1083,7 +1127,7 @@ impl RecordStore for SqliteStore {
 
     fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            put_credential_inner(tx, secret, Self::bump_revision(tx)?)
+            put_credential_inner(tx, secret, Self::bump_revision, "put_credential")
         })
     }
 
@@ -1092,10 +1136,38 @@ impl RecordStore for SqliteStore {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
+        const OP: &str = "put_key_with_credential";
         self.write(true, |tx| {
+            // Refused before anything is written: the key is not minted, no revision is spent.
+            if key.deleted_at.is_some() {
+                return Err(RecordStoreError(format!(
+                    "{OP}: key '{}' is tombstoned; a credential is never minted onto it",
+                    key.id
+                )));
+            }
+            let stored_tombstone: Option<bool> = tx
+                .query_row(
+                    "SELECT deleted_at IS NOT NULL FROM keys WHERE id=?1",
+                    params![key.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .store()?;
+            if stored_tombstone == Some(true) {
+                return Err(RecordStoreError(format!(
+                    "{OP}: '{}' is tombstoned and its id is never reissued",
+                    key.id
+                )));
+            }
+            if secret.meta.key_id != key.id {
+                return Err(RecordStoreError(format!(
+                    "{OP}: the credential names key '{}', not the key '{}' being minted with it",
+                    secret.meta.key_id, key.id
+                )));
+            }
             let rev = Self::bump_revision(tx)?;
-            put_key_inner(tx, key, rev, "put_key_with_credential")?;
-            put_credential_inner(tx, secret, rev)
+            put_key_inner(tx, key, rev, OP)?;
+            put_credential_inner(tx, secret, |_| Ok(rev), OP)
         })
     }
 
@@ -1107,38 +1179,41 @@ impl RecordStore for SqliteStore {
 
     fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            let rev = Self::bump_revision(tx)?;
-            let affected = tx
-                .execute(
-                    "UPDATE credentials SET revoked_at=?2, revoke_reason=?3, updated_at=?2, revision=?4
-                     WHERE id=?1 AND revoked_at IS NULL",
-                    params![id, now_secs(), reason, rev],
+            // Read in the same transaction as the write, or a concurrent insert could make the
+            // answer a lie. Unknown is an error and already revoked is Ok (idempotent): collapsing
+            // them would tell an operator responding to a leak that a live credential is dead.
+            let revoked: Option<bool> = tx
+                .query_row(
+                    "SELECT revoked_at IS NOT NULL FROM credentials WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
                 )
+                .optional()
                 .store()?;
-            // A 0 count is "already revoked" (idempotent, Ok) or "no such id" (an error): collapsing
-            // them would tell an operator responding to a leak that a live credential is dead. The
-            // EXISTS runs in the same transaction, or a concurrent insert could make it a lie.
-            if affected == 0 {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=?1)",
-                        params![id],
-                        |r| r.get(0),
+            match revoked {
+                None => Err(RecordStoreError(format!(
+                    "revoke_credential: unknown id '{id}'"
+                ))),
+                Some(true) => Ok(()),
+                Some(false) => {
+                    let rev = Self::bump_revision(tx)?;
+                    // The secret is destroyed with the revocation: it must not outlive its use.
+                    tx.execute(
+                        "UPDATE credentials SET secret=NULL, secret_form='none', revoked_at=?2,
+                             revoke_reason=?3, updated_at=?2, revision=?4 WHERE id=?1",
+                        params![id, now_secs(), reason, rev],
                     )
-                    .store()?;
-                if !exists {
-                    return Err(RecordStoreError(format!(
-                        "revoke_credential: unknown id '{id}'"
-                    )));
+                    .store()
+                    .map(drop)
                 }
             }
-            Ok(())
         })
     }
 
     fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
         let sql = format!(
-            "SELECT {CRED_SECRET_COLS} FROM credentials WHERE revision > ?1 ORDER BY revision"
+            "SELECT {CRED_SECRET_COLS} FROM credentials WHERE revision > ?1 OR revision = 0 \
+             ORDER BY revision, id"
         );
         query_all(
             &self.lock_reader(),
@@ -1197,6 +1272,10 @@ impl RecordStore for SqliteStore {
             },
         )?;
         for (model, unit, count) in opens {
+            // Sparse, as the reserved units are: a zero count reads as absent.
+            if count == 0 {
+                continue;
+            }
             // An open-unit row is written beside its model's row, so the model is already listed;
             // the fallback only keeps an out-of-band edit readable.
             let at = match models.iter().position(|m| m.model == model) {
@@ -1476,8 +1555,8 @@ impl RecordStore for SqliteStore {
 
     /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
     /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
-    /// sits still longest), `Age` every older row; a purged task takes its `task_event` chain with
-    /// it. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
+    /// sits still longest), `Age` every older row; under either, a purged task takes its
+    /// `task_event` chain with it, and the count is the task rows. `before` is clamped, not refused: a cutoff past what SQLite holds means "everything older
     /// than the end of time".
     fn purge_plane_records(
         &self,
@@ -1493,7 +1572,7 @@ impl RecordStore for SqliteStore {
             } else {
                 "kind=?1 AND ts < ?2"
             };
-            if terminal_only && kind == "task" {
+            if kind == "task" {
                 tx.execute(
                     &format!(
                         "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
@@ -1514,8 +1593,16 @@ impl RecordStore for SqliteStore {
     }
 
     /// Absent is a no-op; every `seq` under the identity goes, so a chain is never left partial.
+    /// A task takes its `task_event` chain with it.
     fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
+            if kind == "task" {
+                tx.execute(
+                    "DELETE FROM plane_records WHERE kind='task_event' AND parent=?1",
+                    params![id],
+                )
+                .store()?;
+            }
             tx.execute(
                 "DELETE FROM plane_records WHERE kind=?1 AND identity=?2",
                 params![kind, id],
@@ -1634,7 +1721,8 @@ impl PlaneRow {
 fn put_credential_inner(
     tx: &rusqlite::Transaction,
     secret: &CredentialSecret,
-    revision: i64,
+    revision: impl FnOnce(&rusqlite::Transaction) -> RecordStoreResult<i64>,
+    method: &str,
 ) -> RecordStoreResult<()> {
     let m = &secret.meta;
     // The owning key must EXIST and be LIVE, checked in the caller's transaction: the FK covers only
@@ -1651,17 +1739,58 @@ fn put_credential_inner(
     match owner_live {
         None => {
             return Err(RecordStoreError(format!(
-                "put_credential: owning key '{}' does not exist",
+                "{method}: key '{}' does not exist; a credential must hang off a real key",
                 m.key_id
             )))
         }
         Some(false) => {
             return Err(RecordStoreError(format!(
-            "put_credential: owning key '{}' is tombstoned; a revoked key takes no new credential",
-            m.key_id
-        )))
+                "{method}: key '{}' is tombstoned; its credentials were revoked with it and are \
+                 never reissued",
+                m.key_id
+            )))
         }
         Some(true) => {}
+    }
+    let live_slot = |kind: &str, key_id: &str, slot: u8| {
+        RecordStoreError(format!(
+            "{method}: slot {slot} for key '{key_id}' kind '{kind}' holds a live credential; \
+             revoke it first"
+        ))
+    };
+    let by_id: Option<CredentialSecret> = query_one(
+        tx,
+        &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE id=?1"),
+        params![m.id],
+        row_to_cred_secret,
+    )?;
+    if let Some(stored) = by_id {
+        let sm = &stored.meta;
+        if sm.revoked_at.is_some() {
+            return Err(RecordStoreError(format!(
+                "{method}: credential '{}' is revoked; a revoked credential is never re-minted",
+                m.id
+            )));
+        }
+        // A live credential re-put identically (revision aside) is the retry of a write that
+        // landed: Ok, nothing written.
+        let mut same = secret.clone();
+        same.meta.revision = sm.revision;
+        if same == stored {
+            return Ok(());
+        }
+        return Err(live_slot(&sm.kind, &sm.key_id, sm.slot));
+    }
+    // A LIVE occupant of the slot must fail rather than silently destroy a working credential
+    // mid-overlap-window; a REVOKED one is replaced by the upsert below.
+    let occupant: Option<(String, bool)> = query_one(
+        tx,
+        "SELECT id, revoked_at IS NULL FROM credentials WHERE key_id=?1 AND kind=?2 AND slot=?3",
+        params![m.key_id, m.kind, m.slot as i64],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if matches!(occupant, Some((_, true))) {
+        return Err(live_slot(&m.kind, &m.key_id, m.slot));
     }
     let taken: bool = tx
         .query_row(
@@ -1673,36 +1802,26 @@ fn put_credential_inner(
         .store()?;
     if taken {
         return Err(RecordStoreError(format!(
-            "put_credential: public_id {} is already taken for kind {}",
+            "{method}: public_id '{}' is already in use for kind '{}'",
             m.public_id, m.kind
         )));
     }
-    // UPSERT on (key_id, kind, slot): a LIVE slot must fail rather than silently destroy a working
-    // credential mid-overlap-window, so only a revoked row is overwritten (the DO UPDATE's WHERE).
+    let revision = revision(tx)?;
     // `updated_at` is its own parameter (?11), not a second use of `created_at`'s.
-    let changed = tx
-        .execute(
-            "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)
-             ON CONFLICT(key_id,kind,slot) DO UPDATE SET
-                id=excluded.id, public_id=excluded.public_id, secret=excluded.secret, secret_form=excluded.secret_form,
-                created_at=excluded.created_at, updated_at=excluded.updated_at, expires_at=excluded.expires_at,
-                revoked_at=NULL, revoke_reason=NULL, revision=excluded.revision
-             WHERE credentials.revoked_at IS NOT NULL",
-            params![
-                m.id, m.key_id, m.kind, m.slot as i64, m.public_id, secret.secret,
-                secret_form_to_str(m.secret_form), m.created_at as i64, m.expires_at.map(|v| v as i64), revision,
-                m.updated_at as i64,
-            ],
-        )
-        .store()?;
-    // Zero changed rows: the DO UPDATE's WHERE failed, so a LIVE credential holds the slot.
-    if changed == 0 {
-        return Err(RecordStoreError(format!(
-            "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
-            m.slot, m.key_id, m.kind
-        )));
-    }
+    tx.execute(
+        "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)
+         ON CONFLICT(key_id,kind,slot) DO UPDATE SET
+            id=excluded.id, public_id=excluded.public_id, secret=excluded.secret, secret_form=excluded.secret_form,
+            created_at=excluded.created_at, updated_at=excluded.updated_at, expires_at=excluded.expires_at,
+            revoked_at=NULL, revoke_reason=NULL, revision=excluded.revision",
+        params![
+            m.id, m.key_id, m.kind, m.slot as i64, m.public_id, secret.secret,
+            secret_form_to_str(m.secret_form), m.created_at as i64, m.expires_at.map(|v| v as i64), revision,
+            m.updated_at as i64,
+        ],
+    )
+    .store()?;
     Ok(())
 }
 

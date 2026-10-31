@@ -41,10 +41,12 @@ not assume they move together.
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-later, to v13). Nothing an operator already has is dropped: keys,
+later, to v14). Nothing an operator already has is dropped: keys,
 credentials, tombstones, usage and metering counts, the audit log and the
 denylist all read back exactly as before, and existing metering rows are
-attributed to the opening rate card. Back the file up before the first
+attributed to the opening rate card. One thing is removed on purpose: a
+credential revoked under an older build loses the secret it kept (v14: a
+revoke now destroys the secret, and the row keeps only its metadata). Back the file up before the first
 boot on the new version — there is no downgrade path, and an older plugin
 build must not be pointed at an upgraded file.
 
@@ -62,7 +64,7 @@ through the same door a busbar build that LINKS `busbar-store-sqlite`
 registers — one source, both doors. The image carries no other export.
 
 
-- The **default durable store** for busbar's governance data: virtual
+- A durable store for busbar's governance data (the config names its store): virtual
   keys, credentials, usage and metering ledgers, the durable audit log,
   and every plane's durable records (A2A tasks and their provenance
   chains, MCP demotions, single-use approval tokens,
@@ -200,6 +202,12 @@ silently succeeding.
 Build under `cargo test` (which builds the cdylib as part of the test
 run) so the e2e test finds the library; it fails, rather than skipping,
 if the cdylib isn't present or is older than the sources.
+
+The end-to-end tests need a busbar checkout at the rev `.busbar-ref` pins:
+set `BUSBAR_CHECKOUT=/path/to/busbar` (or check it out as a sibling). A
+missing checkout is a FAILURE, locally and in CI alike, never a skip: they
+are the only proof the plugin installs through a real busbar's boot and
+admin paths. CI checks that rev out beside this repo.
 
 The upgrade path is tested against real database files the previous
 code wrote (`store-sqlite/tests/fixtures/`, with the programs that wrote

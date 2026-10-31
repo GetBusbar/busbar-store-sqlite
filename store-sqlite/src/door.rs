@@ -25,11 +25,15 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
 ]);
 
+/// The most ops the host may have in flight against this store at once. Every slot answers Ready
+/// on the host's bounded disk lane, so this only caps the queue it feeds.
+pub const MAX_INFLIGHT: u32 = 64;
+
 busbar_contract::store_door!(
     SqliteStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     extensions: EXTENSIONS,
     secret_refs: SECRET_REFS
 );
@@ -78,13 +82,10 @@ impl Settings {
             serde_json::Value::Null => serde_json::Value::Object(Default::default()),
             serde_json::Value::Object(_) => v,
             other => {
-                let ty = match other {
-                    serde_json::Value::String(_) => "a string",
-                    serde_json::Value::Array(_) => "an array",
-                    serde_json::Value::Number(_) => "a number",
-                    _ => "a boolean",
-                };
-                return Err(format!("{BAD}: expected a JSON object, got {ty}"));
+                return Err(format!(
+                    "{BAD}: expected a JSON object, got {}",
+                    json_type(&other)
+                ));
             }
         };
         // `license_key` is a declared secret ref a 1.5.5 config carried; accepted and ignored.
@@ -107,7 +108,12 @@ impl Settings {
                 ))
             }
             Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => return Err(format!("{BAD}: `db_path` must be a string, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "{BAD}: `db_path` must be a string, got {}",
+                    json_type(other)
+                ))
+            }
         };
         let busy_timeout_ms = match v.get("busy_timeout_ms") {
             None | Some(serde_json::Value::Null) => 5000,
@@ -132,7 +138,8 @@ impl Settings {
             }
             Some(other) => {
                 return Err(format!(
-                    "{BAD}: `busy_timeout_ms` must be an integer, got {other}"
+                    "{BAD}: `busy_timeout_ms` must be an integer, got {}",
+                    json_type(other)
                 ))
             }
         };
@@ -140,6 +147,18 @@ impl Settings {
             db_path: path,
             busy_timeout_ms,
         })
+    }
+}
+
+/// The JSON type a refusal names in place of the value.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 

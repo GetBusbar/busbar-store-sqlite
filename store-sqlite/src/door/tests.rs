@@ -366,3 +366,22 @@ fn license_key_is_accepted_and_ignored() {
         "{err}"
     );
 }
+
+/// A wrongly typed setting is refused naming the expected and the given JSON type, never the value
+/// (a template can put a secret where a path was expected).
+#[test]
+fn a_wrongly_typed_setting_names_types_never_the_value() {
+    use super::Settings;
+    for cfg in [
+        r#"{"db_path": 987654321}"#,
+        r#"{"db_path": ["s3cr3t-value"]}"#,
+        r#"{"busy_timeout_ms": "s3cr3t-value"}"#,
+        r#"{"busy_timeout_ms": 1.5}"#,
+    ] {
+        let err = Settings::parse(cfg).unwrap_err();
+        assert!(
+            !err.contains("987654321") && !err.contains("s3cr3t-value") && !err.contains("1.5"),
+            "{err}"
+        );
+    }
+}
