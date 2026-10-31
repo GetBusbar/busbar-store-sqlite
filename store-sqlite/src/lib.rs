@@ -1212,7 +1212,8 @@ impl RecordStore for SqliteStore {
 
     fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
         let sql = format!(
-            "SELECT {CRED_SECRET_COLS} FROM credentials WHERE revision > ?1 ORDER BY revision"
+            "SELECT {CRED_SECRET_COLS} FROM credentials WHERE revision > ?1 OR revision = 0 \
+             ORDER BY revision, id"
         );
         query_all(
             &self.lock_reader(),
