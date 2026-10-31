@@ -4173,3 +4173,71 @@ fn list_keys_and_list_keys_since_break_ties_by_id() {
     assert_eq!(ids(s.list_keys().unwrap()), ["vk_a", "vk_b", "vk_c"]);
     assert_eq!(ids(s.list_keys_since(9).unwrap()), ["vk_a", "vk_b", "vk_c"]);
 }
+
+#[test]
+fn plane_purge_preserves_strict_cutoffs_above_the_signed_timestamp_boundary() {
+    let max = i64::MAX as u64;
+    for retention in [Retention::Age, Retention::TerminalOnly] {
+        let s = SqliteStore::open_in_memory().unwrap();
+        for (id, state, ts) in [
+            ("terminal-old", "completed", max - 1),
+            ("terminal-max", "completed", max),
+            ("active-old", "working", max - 1),
+            ("active-max", "working", max),
+        ] {
+            seed_task_with_events(&s, id, state);
+            s.upsert_plane_record(task_record(&sample_task(id, state, ts)).view())
+                .unwrap();
+        }
+        assert_eq!(s.purge_plane_records("task", 0, retention).unwrap(), 0);
+        let age = retention == Retention::Age;
+        assert_eq!(
+            s.purge_plane_records("task", max, retention).unwrap(),
+            if age { 2 } else { 1 }
+        );
+        assert!(
+            get_task(&s, "terminal-max").is_some(),
+            "cutoff equality is retained"
+        );
+        assert!(get_task(&s, "active-max").is_some());
+        assert!(list_events(&s, "terminal-old").is_empty());
+        assert_eq!(list_events(&s, "terminal-max").len(), 2);
+        assert_eq!(
+            s.purge_plane_records("task", max + 1, retention).unwrap(),
+            if age { 2 } else { 1 },
+            "the stored signed maximum is below this unsigned cutoff"
+        );
+        assert!(get_task(&s, "terminal-max").is_none());
+        assert!(
+            list_events(&s, "terminal-max").is_empty(),
+            "purged tasks take their event chains"
+        );
+        if age {
+            assert!(get_task(&s, "active-max").is_none());
+            assert!(list_events(&s, "active-max").is_empty());
+        } else {
+            assert!(get_task(&s, "active-old").is_some());
+            assert!(get_task(&s, "active-max").is_some());
+            assert_eq!(list_events(&s, "active-old").len(), 2);
+            assert_eq!(list_events(&s, "active-max").len(), 2);
+        }
+        assert_eq!(
+            s.purge_plane_records("task", u64::MAX, retention).unwrap(),
+            0
+        );
+    }
+    let s = SqliteStore::open_in_memory().unwrap();
+    let record = PlaneRecord {
+        kind: "opaque".into(),
+        id: "edge".into(),
+        parent: None,
+        seq: 0,
+        ts: max,
+        disposition: PlaneDisposition::Active,
+        body: vec![1],
+    };
+    s.upsert_plane_record(record.view()).unwrap();
+    assert_eq!(s.purge_plane_records_before("opaque", max).unwrap(), 0);
+    assert_eq!(s.purge_plane_records_before("opaque", max + 1).unwrap(), 1);
+    assert_eq!(s.purge_plane_records_before("opaque", u64::MAX).unwrap(), 0);
+}
