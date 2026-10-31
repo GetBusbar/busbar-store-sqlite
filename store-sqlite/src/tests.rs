@@ -3930,3 +3930,25 @@ fn a_v13_database_upgrades_its_credentials_table_losslessly() {
         "the cascade trigger is back"
     );
 }
+
+// ── Kind alignment: list_credentials_since lists unstamped rows (R9) ─────────────────────────
+
+#[test]
+fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_r9", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_r9", "AKIA_R9", 0))
+        .unwrap();
+    s.lock_writer()
+        .execute("UPDATE credentials SET revision = 0", [])
+        .unwrap();
+    for since in [0, 5, 1 << 40] {
+        let ids: Vec<_> = s
+            .list_credentials_since(since)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.meta.id)
+            .collect();
+        assert_eq!(ids, vec!["cred_AKIA_R9".to_string()], "since {since}");
+    }
+}
