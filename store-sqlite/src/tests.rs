@@ -561,7 +561,9 @@ fn credential_public_id_is_globally_unique_per_kind() {
     s.put_key(&sample_key("vk_b", "g")).unwrap();
     s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
         .unwrap();
-    let result = s.put_credential(&sample_credential("vk_b", "AKIA_DUP", 0));
+    let mut other = sample_credential("vk_b", "AKIA_DUP", 0);
+    other.meta.id = "cred_other_key".into();
+    let result = s.put_credential(&other);
     assert!(
         result.is_err(),
         "the same public_id must not resolve to two different keys"
@@ -575,9 +577,9 @@ fn a_taken_public_id_is_refused_with_the_intended_text() {
     s.put_key(&sample_key("vk_b", "g")).unwrap();
     s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
         .unwrap();
-    let err = s
-        .put_credential(&sample_credential("vk_b", "AKIA_DUP", 0))
-        .unwrap_err();
+    let mut other = sample_credential("vk_b", "AKIA_DUP", 0);
+    other.meta.id = "cred_other_key".into();
+    let err = s.put_credential(&other).unwrap_err();
     assert_eq!(
         err.0,
         "put_credential: public_id 'AKIA_DUP' is already in use for kind 'sigv4'"
@@ -4076,13 +4078,12 @@ fn refusal_texts_name_the_real_op_and_quote_ids() {
     s.put_key(&sample_key("vk_a", "g")).unwrap();
     s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
         .unwrap();
+    let mut other = sample_credential("vk_n", "AKIA_DUP", 0);
+    other.meta.id = "cred_new_key".into();
     assert_eq!(
-        s.put_key_with_credential(
-            &sample_key("vk_n", "g"),
-            &sample_credential("vk_n", "AKIA_DUP", 0)
-        )
-        .unwrap_err()
-        .0,
+        s.put_key_with_credential(&sample_key("vk_n", "g"), &other)
+            .unwrap_err()
+            .0,
         "put_key_with_credential: public_id 'AKIA_DUP' is already in use for kind 'sigv4'"
     );
     assert!(s.get_key("vk_n").unwrap().is_none());
