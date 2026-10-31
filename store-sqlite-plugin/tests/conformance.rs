@@ -52,6 +52,14 @@ busbar_test_kit::conformance_suite! {
     door: busbar_store_sqlite::door::MACRO_DOOR,
     cdylib: "busbar_store_sqlite_plugin",
     inputs: include_str!("conformance.json"),
+    newer_schema: stamp_newer_schema,
+}
+
+fn stamp_newer_schema(_: &str, settings: &[u8]) {
+    let settings: serde_json::Value = serde_json::from_slice(settings).unwrap();
+    let path = settings["db_path"].as_str().expect("SQLite file path");
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "user_version", i32::MAX).unwrap();
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
