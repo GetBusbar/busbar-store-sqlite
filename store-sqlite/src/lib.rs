@@ -1092,10 +1092,38 @@ impl RecordStore for SqliteStore {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
+        const OP: &str = "put_key_with_credential";
         self.write(true, |tx| {
+            // Refused before anything is written: the key is not minted, no revision is spent.
+            if key.deleted_at.is_some() {
+                return Err(RecordStoreError(format!(
+                    "{OP}: key '{}' is tombstoned; a credential is never minted onto it",
+                    key.id
+                )));
+            }
+            let stored_tombstone: Option<bool> = tx
+                .query_row(
+                    "SELECT deleted_at IS NOT NULL FROM keys WHERE id=?1",
+                    params![key.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .store()?;
+            if stored_tombstone == Some(true) {
+                return Err(RecordStoreError(format!(
+                    "{OP}: '{}' is tombstoned and its id is never reissued",
+                    key.id
+                )));
+            }
+            if secret.meta.key_id != key.id {
+                return Err(RecordStoreError(format!(
+                    "{OP}: the credential names key '{}', not the key '{}' being minted with it",
+                    secret.meta.key_id, key.id
+                )));
+            }
             let rev = Self::bump_revision(tx)?;
-            put_key_inner(tx, key, rev, "put_key_with_credential")?;
-            put_credential_inner(tx, secret, |_| Ok(rev), "put_key_with_credential")
+            put_key_inner(tx, key, rev, OP)?;
+            put_credential_inner(tx, secret, |_| Ok(rev), OP)
         })
     }
 
