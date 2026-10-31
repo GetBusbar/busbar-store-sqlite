@@ -3642,11 +3642,17 @@ fn a_revoked_credential_id_is_never_re_minted() {
     let err = s
         .put_key_with_credential(&sample_key("vk_r3", "g"), &old)
         .unwrap_err();
-    assert_eq!(err.0, refusal.replace("put_credential", "put_key_with_credential"));
+    assert_eq!(
+        err.0,
+        refusal.replace("put_credential", "put_key_with_credential")
+    );
 
     let rows = s.list_credentials("vk_r3").unwrap();
     assert_eq!(rows.len(), 1, "a refusal writes nothing");
-    assert!(rows[0].revoked_at.is_some(), "the revoked row stays revoked");
+    assert!(
+        rows[0].revoked_at.is_some(),
+        "the revoked row stays revoked"
+    );
 
     let mut fresh = sample_credential("vk_r3", "AKIA_R3_NEW", 0);
     fresh.meta.created_at = 99;
@@ -3688,7 +3694,11 @@ fn re_putting_a_live_credential_is_a_no_op_only_when_identical() {
                 revoke it first";
     let mut changed = cred.clone();
     changed.secret = "v1:plain:other".to_string();
-    assert_eq!(s.put_credential(&changed).unwrap_err().0, live, "other secret");
+    assert_eq!(
+        s.put_credential(&changed).unwrap_err().0,
+        live,
+        "other secret"
+    );
     let mut other_id = cred.clone();
     other_id.meta.id = "cred_other".to_string();
     other_id.meta.public_id = "AKIA_R4_OTHER".to_string();
@@ -3761,4 +3771,162 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     .unwrap();
     assert_eq!(s.get_key("vk_r5d").unwrap().unwrap().generation_hash, "g2");
     assert_eq!(s.list_credentials("vk_r5d").unwrap().len(), 1);
+}
+
+// ── Kind alignment: revoke destroys the secret (R7) ──────────────────────────────────────────
+
+fn store_revision(s: &SqliteStore) -> i64 {
+    s.lock_writer()
+        .query_row("SELECT revision FROM store_revision", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn revoking_a_credential_destroys_its_secret() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_r7", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_r7", "AKIA_R7", 0))
+        .unwrap();
+    let before = store_revision(&s);
+    s.revoke_credential("cred_AKIA_R7", "leak").unwrap();
+    assert_eq!(store_revision(&s), before + 1, "revision bumped once");
+
+    let raw: (Option<String>, String) = s
+        .lock_writer()
+        .query_row(
+            "SELECT secret, secret_form FROM credentials WHERE id='cred_AKIA_R7'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        raw,
+        (None, "none".to_string()),
+        "no secret material stays on disk"
+    );
+
+    let rows = s.list_credentials_since(before as u64).unwrap();
+    assert_eq!(rows.len(), 1, "the revoked row is still listed");
+    assert_eq!(rows[0].secret, "");
+    assert_eq!(rows[0].meta.secret_form, SecretForm::None);
+    assert_eq!(rows[0].meta.revoke_reason.as_deref(), Some("leak"));
+    assert_eq!(rows[0].meta.revision as i64, before + 1);
+}
+
+#[test]
+fn a_repeat_revoke_is_a_no_op() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_r7b", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_r7b", "AKIA_R7B", 0))
+        .unwrap();
+    s.revoke_credential("cred_AKIA_R7B", "leak").unwrap();
+    let first = s.list_credentials_since(0).unwrap();
+    let rev = store_revision(&s);
+    s.revoke_credential("cred_AKIA_R7B", "again").unwrap();
+    assert_eq!(store_revision(&s), rev, "a repeat revoke bumps nothing");
+    assert_eq!(s.list_credentials_since(0).unwrap(), first);
+}
+
+/// The v13 `credentials` DDL: its CHECKs forbid a revoked row without a secret.
+const V13_CREDENTIALS: &str = "
+CREATE TABLE credentials_v13 (
+    id            TEXT NOT NULL PRIMARY KEY,
+    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    kind          TEXT NOT NULL,
+    slot          INTEGER NOT NULL,
+    public_id     TEXT NOT NULL,
+    secret        TEXT,
+    secret_form   TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    expires_at    INTEGER,
+    revoked_at    INTEGER,
+    revoke_reason TEXT,
+    revision      INTEGER NOT NULL DEFAULT 0,
+    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),
+    CONSTRAINT cred_slot CHECK (slot IN (0,1)),
+    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),
+    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),
+    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),
+    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
+    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
+    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
+) STRICT;
+";
+
+/// A v13 file (current rows, the old `credentials` table) upgrades in place: every row survives,
+/// a row revoked under v13 loses the secret it kept, and a revoke works afterwards.
+#[test]
+fn a_v13_database_upgrades_its_credentials_table_losslessly() {
+    let dir = tempdir();
+    let path = dir.join("v13.db");
+    let path = path.to_str().unwrap();
+    let before = {
+        let s = SqliteStore::open(path, 5000).unwrap();
+        s.put_key(&sample_key("vk_a", "g")).unwrap();
+        s.put_key(&sample_key("vk_b", "g")).unwrap();
+        let mut a0 = sample_credential("vk_a", "AKIA_A0", 0);
+        a0.meta.expires_at = Some(500);
+        s.put_credential(&a0).unwrap();
+        s.put_credential(&sample_credential("vk_a", "AKIA_A1", 1))
+            .unwrap();
+        s.put_credential(&sample_credential("vk_b", "AKIA_B0", 0))
+            .unwrap();
+        s.list_credentials_since(0).unwrap()
+    };
+    {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(V13_CREDENTIALS).unwrap();
+        c.execute_batch(
+            "INSERT INTO credentials_v13 SELECT * FROM credentials;
+             UPDATE credentials_v13 SET revoked_at=100, revoke_reason='old', updated_at=100
+               WHERE id='cred_AKIA_B0';
+             DROP TRIGGER keys_cascade_credentials;
+             DROP TABLE credentials;
+             ALTER TABLE credentials_v13 RENAME TO credentials;
+             CREATE UNIQUE INDEX cred_public_id_uq ON credentials (kind, public_id);
+             CREATE UNIQUE INDEX cred_slot_uq ON credentials (key_id, kind, slot);
+             CREATE INDEX cred_revision_idx ON credentials (revision);
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+    }
+
+    let s = SqliteStore::open(path, 5000).unwrap();
+    let after = s.list_credentials_since(0).unwrap();
+    assert_eq!(after.len(), before.len(), "every row survives");
+    for (b, a) in before.iter().zip(&after) {
+        if b.meta.id == "cred_AKIA_B0" {
+            assert_eq!(a.secret, "", "the secret a revoked row kept is gone");
+            assert_eq!(a.meta.secret_form, SecretForm::None);
+            assert_eq!(a.meta.revoked_at, Some(100));
+            assert_eq!(a.meta.revoke_reason.as_deref(), Some("old"));
+            assert_eq!(a.meta.revision, b.meta.revision);
+            assert_eq!(a.meta.created_at, b.meta.created_at);
+        } else {
+            assert_eq!(a, b, "a live row is untouched");
+        }
+    }
+    let v: i64 = s
+        .lock_writer()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 14);
+    assert_schema_matches_a_fresh_one(&s, &[]);
+    s.revoke_credential("cred_AKIA_A0", "rotated").unwrap();
+    let a0 = s
+        .list_credentials_since(0)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.meta.id == "cred_AKIA_A0")
+        .unwrap();
+    assert_eq!(
+        (a0.secret.as_str(), a0.meta.secret_form),
+        ("", SecretForm::None)
+    );
+    s.delete_key("vk_a").unwrap();
+    assert!(
+        s.list_credentials("vk_a").unwrap().is_empty(),
+        "the cascade trigger is back"
+    );
 }
