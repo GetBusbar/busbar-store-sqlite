@@ -1589,8 +1589,16 @@ impl RecordStore for SqliteStore {
     }
 
     /// Absent is a no-op; every `seq` under the identity goes, so a chain is never left partial.
+    /// A task takes its `task_event` chain with it.
     fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
+            if kind == "task" {
+                tx.execute(
+                    "DELETE FROM plane_records WHERE kind='task_event' AND parent=?1",
+                    params![id],
+                )
+                .store()?;
+            }
             tx.execute(
                 "DELETE FROM plane_records WHERE kind=?1 AND identity=?2",
                 params![kind, id],
