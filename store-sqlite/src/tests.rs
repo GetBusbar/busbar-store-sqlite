@@ -580,7 +580,7 @@ fn a_taken_public_id_is_refused_with_the_intended_text() {
         .unwrap_err();
     assert_eq!(
         err.0,
-        "put_credential: public_id AKIA_DUP is already taken for kind sigv4"
+        "put_credential: public_id 'AKIA_DUP' is already in use for kind 'sigv4'"
     );
 }
 
@@ -4042,4 +4042,58 @@ fn get_usage_omits_zero_count_open_units() {
     s.put_usage("vk_r19", 200, &put).unwrap();
     let back = s.get_usage("vk_r19", 200).unwrap();
     assert!(!back.models[0].usage_units.contains_key("idle"));
+}
+
+// ── Kind alignment: one text per condition (W2) ──────────────────────────────────────────────
+
+#[test]
+fn refusal_texts_name_the_real_op_and_quote_ids() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    assert_eq!(
+        s.delete_key("nope").unwrap_err().0,
+        "delete_key: unknown id 'nope'"
+    );
+    assert_eq!(
+        s.revoke_credential("nope", "x").unwrap_err().0,
+        "revoke_credential: unknown id 'nope'"
+    );
+    assert_eq!(
+        s.put_credential(&sample_credential("vk_none", "AKIA_N", 0))
+            .unwrap_err()
+            .0,
+        "put_credential: key 'vk_none' does not exist; a credential must hang off a real key"
+    );
+    s.put_key(&sample_key("vk_t", "g")).unwrap();
+    s.delete_key("vk_t").unwrap();
+    assert_eq!(
+        s.put_credential(&sample_credential("vk_t", "AKIA_T", 0))
+            .unwrap_err()
+            .0,
+        "put_credential: key 'vk_t' is tombstoned; its credentials were revoked with it and are \
+         never reissued"
+    );
+
+    s.put_key(&sample_key("vk_a", "g")).unwrap();
+    s.put_credential(&sample_credential("vk_a", "AKIA_DUP", 0))
+        .unwrap();
+    assert_eq!(
+        s.put_key_with_credential(
+            &sample_key("vk_n", "g"),
+            &sample_credential("vk_n", "AKIA_DUP", 0)
+        )
+        .unwrap_err()
+        .0,
+        "put_key_with_credential: public_id 'AKIA_DUP' is already in use for kind 'sigv4'"
+    );
+    assert!(s.get_key("vk_n").unwrap().is_none());
+    assert_eq!(
+        s.put_key_with_credential(
+            &sample_key("vk_a", "g"),
+            &sample_credential("vk_a", "AKIA_OTHER", 0)
+        )
+        .unwrap_err()
+        .0,
+        "put_key_with_credential: slot 0 for key 'vk_a' kind 'sigv4' holds a live credential; \
+         revoke it first"
+    );
 }
