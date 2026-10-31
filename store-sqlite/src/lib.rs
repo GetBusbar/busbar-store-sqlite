@@ -1272,6 +1272,10 @@ impl RecordStore for SqliteStore {
             },
         )?;
         for (model, unit, count) in opens {
+            // Sparse, as the reserved units are: a zero count reads as absent.
+            if count == 0 {
+                continue;
+            }
             // An open-unit row is written beside its model's row, so the model is already listed;
             // the fallback only keeps an out-of-band edit readable.
             let at = match models.iter().position(|m| m.model == model) {
