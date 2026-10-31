@@ -1083,7 +1083,7 @@ impl RecordStore for SqliteStore {
 
     fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            put_credential_inner(tx, secret, Self::bump_revision(tx)?, "put_credential")
+            put_credential_inner(tx, secret, Self::bump_revision, "put_credential")
         })
     }
 
@@ -1095,7 +1095,7 @@ impl RecordStore for SqliteStore {
         self.write(true, |tx| {
             let rev = Self::bump_revision(tx)?;
             put_key_inner(tx, key, rev, "put_key_with_credential")?;
-            put_credential_inner(tx, secret, rev, "put_key_with_credential")
+            put_credential_inner(tx, secret, |_| Ok(rev), "put_key_with_credential")
         })
     }
 
@@ -1634,7 +1634,7 @@ impl PlaneRow {
 fn put_credential_inner(
     tx: &rusqlite::Transaction,
     secret: &CredentialSecret,
-    revision: i64,
+    revision: impl FnOnce(&rusqlite::Transaction) -> RecordStoreResult<i64>,
     method: &str,
 ) -> RecordStoreResult<()> {
     let m = &secret.meta;
@@ -1664,18 +1664,45 @@ fn put_credential_inner(
         }
         Some(true) => {}
     }
-    let revoked_id: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=?1 AND revoked_at IS NOT NULL)",
-            params![m.id],
-            |r| r.get(0),
-        )
-        .store()?;
-    if revoked_id {
-        return Err(RecordStoreError(format!(
-            "{method}: credential '{}' is revoked; a revoked credential is never re-minted",
-            m.id
-        )));
+    let live_slot = |kind: &str, key_id: &str, slot: u8| {
+        RecordStoreError(format!(
+            "{method}: slot {slot} for key '{key_id}' kind '{kind}' holds a live credential; \
+             revoke it first"
+        ))
+    };
+    let by_id: Option<CredentialSecret> = query_one(
+        tx,
+        &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE id=?1"),
+        params![m.id],
+        row_to_cred_secret,
+    )?;
+    if let Some(stored) = by_id {
+        let sm = &stored.meta;
+        if sm.revoked_at.is_some() {
+            return Err(RecordStoreError(format!(
+                "{method}: credential '{}' is revoked; a revoked credential is never re-minted",
+                m.id
+            )));
+        }
+        // A live credential re-put identically (revision aside) is the retry of a write that
+        // landed: Ok, nothing written.
+        let mut same = secret.clone();
+        same.meta.revision = sm.revision;
+        if same == stored {
+            return Ok(());
+        }
+        return Err(live_slot(&sm.kind, &sm.key_id, sm.slot));
+    }
+    // A LIVE occupant of the slot must fail rather than silently destroy a working credential
+    // mid-overlap-window; a REVOKED one is replaced by the upsert below.
+    let occupant: Option<(String, bool)> = query_one(
+        tx,
+        "SELECT id, revoked_at IS NULL FROM credentials WHERE key_id=?1 AND kind=?2 AND slot=?3",
+        params![m.key_id, m.kind, m.slot as i64],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if matches!(occupant, Some((_, true))) {
+        return Err(live_slot(&m.kind, &m.key_id, m.slot));
     }
     let taken: bool = tx
         .query_row(
@@ -1691,32 +1718,22 @@ fn put_credential_inner(
             m.public_id, m.kind
         )));
     }
-    // UPSERT on (key_id, kind, slot): a LIVE slot must fail rather than silently destroy a working
-    // credential mid-overlap-window, so only a revoked row is overwritten (the DO UPDATE's WHERE).
+    let revision = revision(tx)?;
     // `updated_at` is its own parameter (?11), not a second use of `created_at`'s.
-    let changed = tx
-        .execute(
-            "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)
-             ON CONFLICT(key_id,kind,slot) DO UPDATE SET
-                id=excluded.id, public_id=excluded.public_id, secret=excluded.secret, secret_form=excluded.secret_form,
-                created_at=excluded.created_at, updated_at=excluded.updated_at, expires_at=excluded.expires_at,
-                revoked_at=NULL, revoke_reason=NULL, revision=excluded.revision
-             WHERE credentials.revoked_at IS NOT NULL",
-            params![
-                m.id, m.key_id, m.kind, m.slot as i64, m.public_id, secret.secret,
-                secret_form_to_str(m.secret_form), m.created_at as i64, m.expires_at.map(|v| v as i64), revision,
-                m.updated_at as i64,
-            ],
-        )
-        .store()?;
-    // Zero changed rows: the DO UPDATE's WHERE failed, so a LIVE credential holds the slot.
-    if changed == 0 {
-        return Err(RecordStoreError(format!(
-            "put_credential: slot {} for key {} kind {} holds a live credential; revoke it first",
-            m.slot, m.key_id, m.kind
-        )));
-    }
+    tx.execute(
+        "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)
+         ON CONFLICT(key_id,kind,slot) DO UPDATE SET
+            id=excluded.id, public_id=excluded.public_id, secret=excluded.secret, secret_form=excluded.secret_form,
+            created_at=excluded.created_at, updated_at=excluded.updated_at, expires_at=excluded.expires_at,
+            revoked_at=NULL, revoke_reason=NULL, revision=excluded.revision",
+        params![
+            m.id, m.key_id, m.kind, m.slot as i64, m.public_id, secret.secret,
+            secret_form_to_str(m.secret_form), m.created_at as i64, m.expires_at.map(|v| v as i64), revision,
+            m.updated_at as i64,
+        ],
+    )
+    .store()?;
     Ok(())
 }
 
