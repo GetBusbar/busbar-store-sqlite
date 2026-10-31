@@ -25,11 +25,15 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
 ]);
 
+/// The most ops the host may have in flight against this store at once. Every slot answers Ready
+/// on the host's bounded disk lane, so this only caps the queue it feeds.
+pub const MAX_INFLIGHT: u32 = 64;
+
 busbar_contract::store_door!(
     SqliteStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     extensions: EXTENSIONS,
     secret_refs: SECRET_REFS
 );
