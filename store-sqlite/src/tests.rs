@@ -4097,3 +4097,19 @@ fn refusal_texts_name_the_real_op_and_quote_ids() {
          revoke it first"
     );
 }
+
+// ── Kind alignment: deterministic list orders (W5) ───────────────────────────────────────────
+
+#[test]
+fn list_keys_and_list_keys_since_break_ties_by_id() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    for id in ["vk_b", "vk_c", "vk_a"] {
+        s.put_key(&sample_key(id, "g")).unwrap();
+    }
+    s.lock_writer()
+        .execute("UPDATE keys SET revision = 0", [])
+        .unwrap();
+    let ids = |v: Vec<VirtualKey>| v.into_iter().map(|k| k.id).collect::<Vec<_>>();
+    assert_eq!(ids(s.list_keys().unwrap()), ["vk_a", "vk_b", "vk_c"]);
+    assert_eq!(ids(s.list_keys_since(9).unwrap()), ["vk_a", "vk_b", "vk_c"]);
+}
