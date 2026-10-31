@@ -3617,3 +3617,43 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
         Some(b"two".to_vec())
     );
 }
+
+// ── Kind alignment: credential re-mint (R3) ──────────────────────────────────────────────────
+
+/// A revoked credential id is spent: re-putting it, into its own slot or another, is refused and
+/// writes nothing; a NEW id into the revoked slot reclaims the slot with its own `created_at`.
+#[test]
+fn a_revoked_credential_id_is_never_re_minted() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.put_key(&sample_key("vk_r3", "g")).unwrap();
+    let mut old = sample_credential("vk_r3", "AKIA_R3", 0);
+    old.meta.created_at = 10;
+    s.put_credential(&old).unwrap();
+    s.revoke_credential(&old.meta.id, "leak").unwrap();
+    let refusal = "put_credential: credential 'cred_AKIA_R3' is revoked; a revoked credential is \
+                   never re-minted";
+
+    let err = s.put_credential(&old).unwrap_err();
+    assert_eq!(err.0, refusal, "same slot");
+    let mut other_slot = old.clone();
+    other_slot.meta.slot = 1;
+    let err = s.put_credential(&other_slot).unwrap_err();
+    assert_eq!(err.0, refusal, "another slot");
+    let err = s
+        .put_key_with_credential(&sample_key("vk_r3", "g"), &old)
+        .unwrap_err();
+    assert_eq!(err.0, refusal.replace("put_credential", "put_key_with_credential"));
+
+    let rows = s.list_credentials("vk_r3").unwrap();
+    assert_eq!(rows.len(), 1, "a refusal writes nothing");
+    assert!(rows[0].revoked_at.is_some(), "the revoked row stays revoked");
+
+    let mut fresh = sample_credential("vk_r3", "AKIA_R3_NEW", 0);
+    fresh.meta.created_at = 99;
+    s.put_credential(&fresh).unwrap();
+    let rows = s.list_credentials("vk_r3").unwrap();
+    assert_eq!(rows.len(), 1, "the new id replaces the revoked occupant");
+    assert_eq!(rows[0].id, "cred_AKIA_R3_NEW");
+    assert_eq!(rows[0].created_at, 99, "created_at is the new credential's");
+    assert!(rows[0].revoked_at.is_none());
+}
