@@ -2935,8 +2935,8 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     assert_eq!(m.usage_units.get("search_units"), Some(&7));
     assert_eq!(
         m.usage_units.get("tool_calls"),
-        Some(&0),
-        "an open unit floors at 0 like every durable counter"
+        None,
+        "an open unit floors at 0 like every durable counter, and a zero reads as absent"
     );
     assert_eq!(ledger.requests, 2);
 
