@@ -1078,7 +1078,7 @@ impl RecordStore for SqliteStore {
     }
 
     fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at");
+        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at, id");
         query_all(&self.lock_reader(), sql, [], row_to_key)
     }
 
@@ -1086,7 +1086,7 @@ impl RecordStore for SqliteStore {
         let sql = concat!(
             "SELECT ",
             key_cols!(),
-            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision"
+            " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision, id"
         );
         query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
     }
