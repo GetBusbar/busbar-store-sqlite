@@ -52,6 +52,14 @@ busbar_test_kit::conformance_suite! {
     door: busbar_store_sqlite::door::MACRO_DOOR,
     cdylib: "busbar_store_sqlite_plugin",
     inputs: include_str!("conformance.json"),
+    newer_schema: stamp_newer_schema,
+}
+
+fn stamp_newer_schema(_: &str, settings: &[u8]) {
+    let settings: serde_json::Value = serde_json::from_slice(settings).unwrap();
+    let path = settings["db_path"].as_str().expect("SQLite file path");
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "user_version", i32::MAX).unwrap();
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
@@ -450,4 +458,206 @@ fn the_statement_declares_exactly_its_secret_fields() {
     )
     .expect("the rendering reads back");
     assert_eq!(stated.secret_refs, ["license_key".to_string()]);
+}
+
+fn cleanup_ledger() -> busbar_contract::records::UsageLedger {
+    busbar_contract::records::UsageLedger {
+        requests: 7,
+        billable_requests: 6,
+        models: ["a", "b"]
+            .into_iter()
+            .map(|model| busbar_contract::records::ModelTokens {
+                model: model.into(),
+                usage_units: [("input".into(), 11), ("tool_calls".into(), 3)].into(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn usage_cleanup_is_strict_and_durable_through_either_door() {
+    use busbar_contract::records::{MeteringDelta, UsageLedger};
+
+    for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
+        let dir = scratch(&format!("usage-cleanup-{tag}"));
+        let path = dir.join("store.db");
+        let cfg = serde_json::json!({"db_path": path}).to_string();
+        let s = open(by, &cfg).expect("the store opens");
+        let ledger = cleanup_ledger();
+        let high = i64::MAX as u64;
+        for (bucket, window) in [
+            ("a", 0),
+            ("a", 10),
+            ("b", 10),
+            ("a", 19),
+            ("b", 19),
+            ("a", 20),
+            ("b", 21),
+            ("a", high),
+            ("a", high + 1),
+            ("a", u64::MAX - 1),
+            ("a", u64::MAX),
+        ] {
+            let value = if (bucket, window) == ("a", 19) {
+                UsageLedger {
+                    models: Vec::new(),
+                    ..ledger.clone()
+                }
+            } else {
+                ledger.clone()
+            };
+            s.put_usage(bucket, window, &value).unwrap();
+        }
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        // A migrated window may have model rows without the request-count sentinel.
+        raw.execute(
+            "DELETE FROM usage_windows WHERE bucket_id='b' AND window_start=19 AND model=''",
+            [],
+        )
+        .unwrap();
+        s.put_key(&key("keep")).unwrap();
+        s.upsert_plane_record(record("task", "keep", None, 0, "keep").view())
+            .unwrap();
+        let billing = MeteringDelta {
+            key_id: "keep".into(),
+            bucket: 100,
+            model: "a".into(),
+            provider: "p".into(),
+            tokens_input: 11,
+            tokens_output: 2,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: String::new(),
+            pricing_version: String::new(),
+            priced_from_ms: 0,
+            usage_units: [("tool_calls".into(), 3)].into(),
+        };
+        s.add_metering(&billing).unwrap();
+        let billed = s.list_metering(100).unwrap();
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, 20)).unwrap(),
+            4,
+            "count logical windows, including model-only and counters-only windows"
+        );
+        for (bucket, window) in [("a", 10), ("b", 10), ("a", 19), ("b", 19)] {
+            assert_eq!(s.get_usage(bucket, window).unwrap(), UsageLedger::default());
+        }
+        for table in ["usage_windows", "usage_window_units"] {
+            let count: i64 = raw
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM {table} WHERE window_start>0 AND window_start<20"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "no old model or open-unit rows remain in {table}");
+        }
+        for (bucket, window) in [
+            ("a", 0),
+            ("a", 20),
+            ("b", 21),
+            ("a", high),
+            ("a", high + 1),
+            ("a", u64::MAX - 1),
+            ("a", u64::MAX),
+        ] {
+            assert_eq!(s.get_usage(bucket, window).unwrap(), ledger);
+        }
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, 20)).unwrap(),
+            0
+        );
+        assert_eq!(block(sc::StoreCalls::purge_usage_before(&s, 0)).unwrap(), 0);
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, high)).unwrap(),
+            2
+        );
+        assert_eq!(
+            s.get_usage("a", high).unwrap(),
+            ledger,
+            "cutoff equality survives"
+        );
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, high + 1)).unwrap(),
+            1
+        );
+        assert_eq!(s.get_usage("a", high + 1).unwrap(), ledger);
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, u64::MAX)).unwrap(),
+            2
+        );
+        assert_eq!(s.get_usage("a", 0).unwrap(), ledger);
+        assert_eq!(s.get_usage("a", u64::MAX).unwrap(), ledger);
+        assert_eq!(
+            s.list_metering(100).unwrap(),
+            billed,
+            "billing history is separate"
+        );
+        assert!(s.get_key("keep").unwrap().is_some());
+        assert_eq!(
+            s.get_plane_record("task", "keep").unwrap(),
+            Some(b"keep".to_vec())
+        );
+        drop(raw);
+        close(s);
+        let reopened = open(by, &cfg).unwrap();
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&reopened, u64::MAX)).unwrap(),
+            0
+        );
+        assert_eq!(reopened.get_usage("a", 0).unwrap(), ledger);
+        assert_eq!(reopened.get_usage("a", u64::MAX).unwrap(), ledger);
+        assert_eq!(reopened.list_metering(100).unwrap(), billed);
+        close(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn a_failed_usage_cleanup_rolls_back_both_tables_through_either_door() {
+    for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
+        let dir = scratch(&format!("usage-cleanup-rollback-{tag}"));
+        let path = dir.join("store.db");
+        let cfg = serde_json::json!({"db_path": path}).to_string();
+        let s = open(by, &cfg).unwrap();
+        let ledger = cleanup_ledger();
+        s.put_usage("a", 10, &ledger).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        // Whichever table is deleted second refuses, after the other deletion took effect.
+        raw.execute_batch(
+            "
+            CREATE TRIGGER reject_window_without_units BEFORE DELETE ON usage_windows
+            WHEN NOT EXISTS (SELECT 1 FROM usage_window_units WHERE
+                window_start=OLD.window_start AND bucket_id=OLD.bucket_id)
+            BEGIN SELECT RAISE(ABORT, 'cleanup rollback fixture'); END;
+            CREATE TRIGGER reject_units_without_window BEFORE DELETE ON usage_window_units
+            WHEN NOT EXISTS (SELECT 1 FROM usage_windows WHERE
+                window_start=OLD.window_start AND bucket_id=OLD.bucket_id)
+            BEGIN SELECT RAISE(ABORT, 'cleanup rollback fixture'); END;
+        ",
+        )
+        .unwrap();
+        assert!(block(sc::StoreCalls::purge_usage_before(&s, 20)).is_err());
+        assert_eq!(
+            s.get_usage("a", 10).unwrap(),
+            ledger,
+            "all models and units roll back"
+        );
+        raw.execute_batch(
+            "DROP TRIGGER reject_window_without_units; DROP TRIGGER reject_units_without_window;",
+        )
+        .unwrap();
+        assert_eq!(
+            block(sc::StoreCalls::purge_usage_before(&s, 20)).unwrap(),
+            1
+        );
+        assert_eq!(s.get_usage("a", 10).unwrap(), Default::default());
+        drop(raw);
+        close(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

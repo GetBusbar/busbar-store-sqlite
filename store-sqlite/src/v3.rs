@@ -204,6 +204,35 @@ impl SqliteStore {
             .collect()
     }
 
+    pub(crate) fn v3_purge_usage_before(&self, before: u64) -> RecordStoreResult<u64> {
+        if before == 0 {
+            return Ok(0);
+        }
+        // Existing usage timestamps preserve all u64 bits in SQLite's signed INTEGER.
+        // Positive values precede the wrapped negative half; zero is the all-time window.
+        const OLD: &str = "(window_start > 0 AND (?1 < 0 OR window_start < ?1)) \
+            OR (window_start < 0 AND ?1 < 0 AND window_start < ?1)";
+        self.write(true, |tx| {
+            let count: Option<i64> = query_one(
+                tx,
+                &format!(
+                    "SELECT count(*) FROM (SELECT DISTINCT window_start, bucket_id \
+                    FROM usage_windows WHERE {OLD})"
+                ),
+                params![before as i64],
+                |r| r.get(0),
+            )?;
+            for table in ["usage_windows", "usage_window_units"] {
+                exec(
+                    tx,
+                    &format!("DELETE FROM {table} WHERE {OLD}"),
+                    params![before as i64],
+                )?;
+            }
+            Ok(count.unwrap_or(0) as u64)
+        })
+    }
+
     pub(crate) fn v3_add_usage_batch(
         &self,
         op: OpId,
@@ -266,6 +295,7 @@ impl StoreSlots for SqliteStore {
         list_keys_since => RecordStore::list_keys_since(since: u64) -> RecordStoreResult<Vec<VirtualKey>>;
         get_usage => RecordStore::get_usage(bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger>;
         put_usage => RecordStore::put_usage(bucket_id: &str, window_start: u64, ledger: &UsageLedger) -> RecordStoreResult<()>;
+        purge_usage_before => Self::v3_purge_usage_before(before: u64) -> RecordStoreResult<u64>;
         list_metering => RecordStore::list_metering(bucket: u64) -> RecordStoreResult<Vec<MeteringRow>>;
         put_credential => RecordStore::put_credential(secret: &CredentialSecret) -> RecordStoreResult<()>;
         put_key_with_credential => RecordStore::put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> RecordStoreResult<()>;
