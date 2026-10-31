@@ -3695,3 +3695,70 @@ fn re_putting_a_live_credential_is_a_no_op_only_when_identical() {
     assert_eq!(s.put_credential(&other_id).unwrap_err().0, live, "other id");
     assert_eq!(s.list_credentials("vk_r4").unwrap().len(), 1);
 }
+
+// ── Kind alignment: put_key_with_credential refuses up front (R5) ────────────────────────────
+
+#[test]
+fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let op = "put_key_with_credential";
+    let revision = |s: &SqliteStore| -> i64 {
+        s.lock_writer()
+            .query_row("SELECT revision FROM store_revision", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    let mut tomb = sample_key("vk_r5a", "g");
+    tomb.enabled = false;
+    tomb.deleted_at = Some(5);
+    let before = revision(&s);
+    let err = s
+        .put_key_with_credential(&tomb, &sample_credential("vk_r5a", "AKIA_5A", 0))
+        .unwrap_err();
+    assert_eq!(
+        err.0,
+        format!("{op}: key 'vk_r5a' is tombstoned; a credential is never minted onto it")
+    );
+    assert!(s.get_key("vk_r5a").unwrap().is_none());
+    assert_eq!(revision(&s), before, "a refusal bumps no revision");
+
+    s.put_key(&sample_key("vk_r5b", "g")).unwrap();
+    s.delete_key("vk_r5b").unwrap();
+    let err = s
+        .put_key_with_credential(
+            &sample_key("vk_r5b", "g"),
+            &sample_credential("vk_r5b", "AKIA_5B", 0),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.0,
+        format!("{op}: 'vk_r5b' is tombstoned and its id is never reissued")
+    );
+    assert!(s.get_key("vk_r5b").unwrap().unwrap().deleted_at.is_some());
+
+    s.put_key(&sample_key("vk_r5other", "g")).unwrap();
+    let err = s
+        .put_key_with_credential(
+            &sample_key("vk_r5c", "g"),
+            &sample_credential("vk_r5other", "AKIA_5C", 0),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.0,
+        format!(
+            "{op}: the credential names key 'vk_r5other', not the key 'vk_r5c' being minted with it"
+        )
+    );
+    assert!(s.get_key("vk_r5c").unwrap().is_none());
+    assert!(s.list_credentials("vk_r5other").unwrap().is_empty());
+
+    // Over an existing LIVE key id it upserts.
+    s.put_key(&sample_key("vk_r5d", "g1")).unwrap();
+    s.put_key_with_credential(
+        &sample_key("vk_r5d", "g2"),
+        &sample_credential("vk_r5d", "AKIA_5D", 0),
+    )
+    .unwrap();
+    assert_eq!(s.get_key("vk_r5d").unwrap().unwrap().generation_hash, "g2");
+    assert_eq!(s.list_credentials("vk_r5d").unwrap().len(), 1);
+}
