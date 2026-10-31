@@ -3952,3 +3952,30 @@ fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
         assert_eq!(ids, vec!["cred_AKIA_R9".to_string()], "since {since}");
     }
 }
+
+// ── Kind alignment: a purged or deleted task takes its event chain (R12) ────────────────
+
+fn seed_task_with_events(s: &SqliteStore, id: &str, state: &str) {
+    s.upsert_plane_record(task_record(&sample_task(id, state, 100)).view())
+        .unwrap();
+    for (seq, prev, hash) in [(1, "", "h1"), (2, "h1", "h2")] {
+        s.append_plane_record(event_record(&sample_event(id, seq, "task.event", prev, hash)).view())
+            .unwrap();
+    }
+}
+
+#[test]
+fn an_age_purge_of_tasks_takes_each_purged_tasks_event_chain() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    seed_task_with_events(&s, "t-old", "working");
+    seed_task_with_events(&s, "t-stays", "working");
+    s.upsert_plane_record(task_record(&sample_task("t-stays", "working", 900)).view())
+        .unwrap();
+
+    let purged = s.purge_plane_records("task", 200, Retention::Age).unwrap();
+    assert_eq!(purged, 1, "the count is the task rows");
+    assert_eq!(list_task_ids(&s), vec!["t-stays"]);
+    assert!(list_events(&s, "t-old").is_empty(), "the purged task's chain goes");
+    assert_eq!(list_events(&s, "t-stays").len(), 2, "no other chain is touched");
+}
+
