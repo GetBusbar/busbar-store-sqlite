@@ -1083,7 +1083,7 @@ impl RecordStore for SqliteStore {
 
     fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            put_credential_inner(tx, secret, Self::bump_revision(tx)?)
+            put_credential_inner(tx, secret, Self::bump_revision(tx)?, "put_credential")
         })
     }
 
@@ -1095,7 +1095,7 @@ impl RecordStore for SqliteStore {
         self.write(true, |tx| {
             let rev = Self::bump_revision(tx)?;
             put_key_inner(tx, key, rev, "put_key_with_credential")?;
-            put_credential_inner(tx, secret, rev)
+            put_credential_inner(tx, secret, rev, "put_key_with_credential")
         })
     }
 
@@ -1635,6 +1635,7 @@ fn put_credential_inner(
     tx: &rusqlite::Transaction,
     secret: &CredentialSecret,
     revision: i64,
+    method: &str,
 ) -> RecordStoreResult<()> {
     let m = &secret.meta;
     // The owning key must EXIST and be LIVE, checked in the caller's transaction: the FK covers only
@@ -1662,6 +1663,19 @@ fn put_credential_inner(
         )))
         }
         Some(true) => {}
+    }
+    let revoked_id: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=?1 AND revoked_at IS NOT NULL)",
+            params![m.id],
+            |r| r.get(0),
+        )
+        .store()?;
+    if revoked_id {
+        return Err(RecordStoreError(format!(
+            "{method}: credential '{}' is revoked; a revoked credential is never re-minted",
+            m.id
+        )));
     }
     let taken: bool = tx
         .query_row(
