@@ -63,6 +63,50 @@ fn a_replayed_usage_batch_applies_once() {
 }
 
 #[test]
+fn direct_provided_id_batch_replays_a_lost_answer_after_reopen_and_conflicts_without_effects() {
+    let (store, path, _dir) = on_file("direct-provided-id-batch");
+    let cells = [("k", 60, delta(7, 11))];
+    let _lost_answer = RecordStore::add_usage_batch_deduped(&store, op(1), &cells).unwrap();
+    let committed = RecordStore::get_usage(&store, "k", 60).unwrap();
+    assert_eq!(
+        (
+            committed.requests,
+            committed.billable_requests,
+            committed.tokens_for("m")
+        ),
+        (7, 7, Some(11))
+    );
+    drop(store);
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    RecordStore::add_usage_batch_deduped(&reopened, op(1), &cells).unwrap();
+    assert_eq!(
+        RecordStore::get_usage(&reopened, "k", 60).unwrap(),
+        committed
+    );
+    let changed = [("k", 60, delta(13, 17))];
+    assert_eq!(
+        RecordStore::add_usage_batch_deduped(&reopened, op(1), &changed)
+            .unwrap_err()
+            .0,
+        busbar_contract::abi::store::DIAG_OPID_CONFLICT
+    );
+    assert_eq!(
+        RecordStore::get_usage(&reopened, "k", 60).unwrap(),
+        committed
+    );
+    RecordStore::add_usage_batch_deduped(&reopened, op(2), &cells).unwrap();
+    let second = RecordStore::get_usage(&reopened, "k", 60).unwrap();
+    assert_eq!(
+        (
+            second.requests,
+            second.billable_requests,
+            second.tokens_for("m")
+        ),
+        (14, 14, Some(22))
+    );
+}
+
+#[test]
 fn equal_bodies_under_distinct_op_ids_both_apply() {
     let s = fresh();
     let cells = [("k", 60, delta(2, 4))];

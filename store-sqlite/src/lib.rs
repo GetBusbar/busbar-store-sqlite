@@ -1591,6 +1591,20 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
 }
 
 impl RecordStore for SqliteStore {
+    fn add_usage_batch_deduped(
+        &self,
+        op: busbar_contract::abi::store::OpId,
+        cells: &[(&str, u64, UsageDelta)],
+    ) -> RecordStoreResult<()> {
+        use busbar_contract::abi::sdk::store::OpRefused;
+        self.v3_add_usage_batch(op, cells).map_err(|error| {
+            RecordStoreError(match error {
+                OpRefused::Conflict => busbar_contract::abi::store::DIAG_OPID_CONFLICT.into(),
+                OpRefused::Refused(reason) | OpRefused::Failed(reason) => reason,
+            })
+        })
+    }
+
     fn apply_usage_correction(
         &self,
         request: &busbar_contract::abi::sdk::store::correction::Request,
