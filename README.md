@@ -37,18 +37,32 @@ replaced the per-protocol task/MCP methods, and the 1.6.0 key, usage and
 metering record shapes). Pin both versions explicitly in production; do
 not assume they move together.
 
+Single-use token redemption uses SQLite's Unix clock inside its write transaction. The caller's
+`now` does not authorize expiry or cleanup. SQLite has no separate server clock: connections to one
+local file must share one host clock. Sharing a database file across hosts with independent clocks
+is not a supported shared-clock deployment; use a server-backed store for that topology. Expired
+candidates leave the replay ledger unchanged. Generic multi-use token checks retain their separate policy. Reserved ticket preflight reads a terminal record with the exact signed deadline against the store clock and never spends the token. The reserved kernel `ticket` record kind stores an absolute deadline in `ts`; its age cleanup is capped at the same store clock. Other record kinds keep their existing retention policy.
+
 ### Upgrading an existing database
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-later, to v14). Nothing an operator already has is dropped: keys,
-credentials, tombstones, usage and metering counts, the audit log and the
-denylist all read back exactly as before, and existing metering rows are
-attributed to the opening rate card. One thing is removed on purpose: a
-credential revoked under an older build loses the secret it kept (v14: a
-revoke now destroys the secret, and the row keeps only its metadata). Back the file up before the first
-boot on the new version — there is no downgrade path, and an older plugin
-build must not be pointed at an upgraded file.
+later, to v17). Keys and credentials retain their full-width unsigned
+timestamps. An older signed expiry check could admit an expiry that
+precedes creation in unsigned order; such a row refuses the upgrade with
+its identity and decoded timestamps. The transaction leaves the schema,
+rows and revision counter unchanged on refusal, so the source data can be
+reviewed before retrying.
+
+Schema v17 preserves each metering row’s recorded group and price version in its identity, including open units. Existing rows keep their recorded attribution; history already combined by an older writer cannot be reconstructed. An open-unit row without its parent refuses the transaction rather than guessing attribution. Stop older writers before upgrading; they cannot safely write the new metering keys.
+
+On a successful upgrade, keys, credentials, tombstones, usage and metering
+counts, the audit log and the denylist retain their data; existing
+metering rows are attributed to the opening rate card. A credential
+revoked under an older build loses the secret it kept (v14: a revoke now
+destroys the secret, and the row keeps only its metadata). Back the file
+up before the first boot on the new version — there is no downgrade path,
+and an older plugin build must not be pointed at an upgraded file.
 
 All the actual SQLite logic — schema, key/usage/audit persistence, a
 mutex-guarded writer connection plus a small pool of `query_only` reader

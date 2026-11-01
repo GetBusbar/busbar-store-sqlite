@@ -10,18 +10,18 @@
 //! tarball (the same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real
 //! `plugins.dir`, and runs the REAL `busbar --validate` binary against a config naming
 //! `store: { module: sqlite }` — the documented file-drop install path (see
-//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` genuinely
-//! exercises the trust gate + ABI dlopen + `Store::open`/schema migration, so a successful validate
-//! is real proof the plugin loads and initializes through busbar's own boot path, not a proxy for
-//! it. Mirrors the pattern `GetBusbar/busbar-store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
+//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). Validation checks
+//! configuration and trust; a real boot then opens the provider. An independent read-only
+//! connection witnesses the committed schema, and a live HTTP health request proves the same child
+//! reached serving readiness before it stops. Mirrors the pattern
+//! `GetBusbar/busbar-store-postgres`'s `store-postgres-plugin/tests/e2e.rs` uses
 //! (see that file's module doc for the fuller rationale); SQLite needs no external service, so
 //! there is no `postgres_url()`-style skip gate here.
 //!
 //! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
 //! this part was always sound, only the LOADING mechanism was wrong):
-//!   1. `--validate` itself (via the plugin's `open()`) causes a real `SqliteStore::open`, which
-//!      runs the real schema migration against a real file on disk — confirmed by checking the
-//!      configured `db_path` now exists and has the schema.
+//!   1. The real child boot initializes the configured file; the read-only witness observes its
+//!      committed schema, version stamp and initial revision without running any migration.
 //!   2. A second, independent `SqliteStore::open` (bypassing the plugin/ABI/loader entirely)
 //!      confirms the data physically landed in the file, not an in-process cache.
 //!
@@ -319,6 +319,10 @@ fn busbar_root() -> PathBuf {
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
     // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` (roster def 14:
     // author-side packaging lives with the loader that verifies what it packs).
     for args in [
@@ -327,8 +331,6 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
             "--release",
             "--manifest-path",
             "dist/default/Cargo.toml",
-            "--target-dir",
-            "target",
             "--bin",
             "busbar",
         ][..],
@@ -345,6 +347,8 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     ] {
         let status = Command::new("cargo")
             .args(args)
+            .arg("--target-dir")
+            .arg(&target)
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -353,21 +357,44 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
             "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
         );
     }
-    // The nested `cargo build` inherits this process's environment, so a `CARGO_TARGET_DIR` set for
-    // the outer `cargo test` redirects it too; look where it actually put the binaries, or this
-    // runs whatever stale `busbar` an earlier build left under the checkout's own `target/`.
-    let target = match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => root.join(dir),
-        None => root.join("target"),
-    };
+    // Both builds and both returned paths use this same directory, including when the outer
+    // test set CARGO_TARGET_DIR. Never mix one explicit target with the other build's default.
     (
         target.join("release/busbar"),
         target.join("release/busbar-plugin-pack"),
     )
 }
 
+/// Observe the child's committed migration without opening the provider or creating a file.
+fn migrated_schema(path: &std::path::Path) -> rusqlite::Result<bool> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 16 {
+        return Ok(false);
+    }
+    let revision: i64 = conn.query_row(
+        "SELECT revision FROM store_revision WHERE id=0",
+        [],
+        |row| row.get(0),
+    )?;
+    let empty: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM keys) AND NOT EXISTS(SELECT 1 FROM credentials)",
+        [],
+        |row| row.get(0),
+    )?;
+    let objects: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE
+         (type='index' AND name IN ('keys_revision_idx','cred_public_id_uq','cred_slot_uq')) OR
+         (type='trigger' AND name IN ('keys_cascade_credentials','keys_guard_hard_delete'))",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(revision == 0 && empty && objects == 5)
+}
+
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the
-/// real `busbar --validate` against a config naming `store: { module: sqlite }`, and confirm the
+/// real validation and boot against a config naming `store: { module: sqlite }`, and confirm the
 /// real on-disk sqlite file was actually initialized — via the documented file-drop mechanism,
 /// never a direct `load_store()` call. Persistence is then proven through the real file across a
 /// full close + reopen, using an independent connection that never touches the plugin/ABI/loader.
@@ -420,6 +447,8 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
 
     let config = work.join("config.yaml");
     let providers = work.join("providers.yaml");
+    let data_listener = reserve_port();
+    let data_addr = data_listener.local_addr().expect("reserved data address");
     // providers.yaml is the flat CATALOG (provider name at the document root, no wrapping key) --
     // config.yaml separately has its OWN `providers:`/`models:` blocks naming which catalog
     // entries are enabled. Mirrors the known-good fixture in
@@ -430,7 +459,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     )
     .unwrap();
     let config_text = format!(
-        "listen: \"127.0.0.1:0\"\n\
+        "listen: \"{data_addr}\"\n\
          store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n\
          plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
          auth:\n  chain: []\n\
@@ -471,9 +500,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     );
 
     // REAL BOOT: run the actual gateway process (no --validate) against the same file-dropped
-    // plugin + config, and poll for the real sqlite file to appear -- the only genuine proof that
-    // boot actually dlopened the plugin and called Store::open (which creates/migrates the file)
-    // before ever handling a request.
+    // plugin + config, observe its committed schema and serve a real health request before stopping it.
     //
     // busbar 1.6.0 refuses to BOOT (not only to validate) when a provider credential cannot resolve
     // (BUSBAR-9007), so the real boot needs the same placeholders `--validate` got above.
@@ -485,19 +512,33 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     for name in referenced_env_vars(&config_text) {
         boot_cmd.env(name, SECRET_PLACEHOLDER);
     }
+    // The child binds this address itself. Releasing the reservation leaves an external-process
+    // bind race; the readiness probe below also checks that this child remains alive.
+    drop(data_listener);
     let child = boot_cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn a real busbar boot");
     let mut child = KillOnDrop(child);
+    let client = reqwest::blocking::Client::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let booted = loop {
-        if db_path.exists() {
-            break true;
+        if let Some(status) = child.try_wait().expect("check the booting child") {
+            panic!("busbar exited before sqlite serving readiness (status: {status})");
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("busbar exited before creating the sqlite file (status: {status})");
+        let serving = migrated_schema(&db_path).unwrap_or(false)
+            && client
+                .get(format!("http://{data_addr}/healthz"))
+                .timeout(std::time::Duration::from_millis(250))
+                .send()
+                .is_ok_and(|response| response.status().as_u16() == 200);
+        if serving {
+            assert!(
+                child.try_wait().expect("check the serving child").is_none(),
+                "the child exited while its serving readiness was being observed"
+            );
+            break true;
         }
         if std::time::Instant::now() >= deadline {
             break false;
@@ -508,14 +549,12 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     let _ = child.wait();
     assert!(
         booted,
-        "a real busbar boot with the file-dropped sqlite plugin must create the configured \
-         db_path within 15s"
+        "a real busbar boot with the file-dropped sqlite plugin must commit the expected \
+         schema, version and empty revision state and serve GET /healthz within 15s"
     );
 
-    // PROOF the real on-disk file was actually initialized by the REAL busbar process, through the
-    // REAL file-drop path: an independent `SqliteStore::open` (bypassing the plugin/ABI/loader
-    // entirely) confirms the schema now exists -- the real boot's own plugin-open call ran
-    // SqliteStore::open, which runs migrate().
+    // The read-only witness above proves the child initialized the file. Reopen the provider
+    // only after that proof, for independent persistence checks.
     let direct = SqliteStore::open(db_path.to_str().unwrap(), 5000)
         .expect("open the real file directly with the plain SqliteStore, bypassing the plugin");
     assert!(
@@ -559,16 +598,11 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     assert_eq!((t.tier(UNIT_INPUT), t.tier(UNIT_OUTPUT)), (20, 8));
 }
 
-/// Bind an ephemeral loopback port and immediately drop the listener, handing the bare port number
-/// back for a spawned child process's config. Small bind-then-drop TOCTOU race, same pattern this
-/// monorepo's own plugin e2e suites already use for picking a free port ahead of a subprocess spawn
-/// (e.g. `auth-oidc-plugin/tests/e2e.rs`'s `spawn_https_fixture`), acceptable for a test harness.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+/// Reserve an ephemeral loopback address until its child configuration is ready. A boot's data
+/// and admin listeners are reserved together so their ports differ. Releasing them before spawn
+/// still permits another process to bind the addresses; readiness observes the real child.
+fn reserve_port() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral loopback port")
 }
 
 /// Pack the built sqlite plugin cdylib into a real signed-shape tarball (same `busbar-plugin-pack`
@@ -622,6 +656,7 @@ fn wait_for_admin_ready(
     loop {
         if let Ok(resp) = client
             .get(format!("http://{admin_addr}/api/v1/admin/info"))
+            .timeout(std::time::Duration::from_millis(250))
             .header("x-admin-token", token)
             .send()
         {
@@ -703,24 +738,18 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
 
     // ── BOOT 1: store: memory, just to reach a live admin listener to install against. ──
     let config1 = work.join("config1.yaml");
+    let listeners1 = [reserve_port(), reserve_port()];
+    let [data_addr1, admin_addr1] = listeners1
+        .each_ref()
+        .map(|listener| listener.local_addr().expect("reserved boot 1 address"));
     write_config(
         &config1,
-        free_port(),
-        free_port(),
+        data_addr1.port(),
+        admin_addr1.port(),
         "store:\n  module: memory\n",
     );
-    let admin_addr1 = {
-        // Re-read the port we just picked back out of the file we wrote (avoids a second TOCTOU
-        // window between picking the port and writing it).
-        let text = std::fs::read_to_string(&config1).unwrap();
-        text.lines()
-            .find(|l| l.starts_with("admin_listen:"))
-            .unwrap()
-            .trim_start_matches("admin_listen: \"127.0.0.1:")
-            .trim_end_matches('"')
-            .to_string()
-    };
-    let admin_addr1 = format!("127.0.0.1:{admin_addr1}");
+    let admin_addr1 = admin_addr1.to_string();
+    drop(listeners1);
 
     let child1 = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config1)
@@ -792,25 +821,21 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     // is restart-to-apply, so a fresh process picking up the freshly-installed tarball is the real
     // mechanism an operator uses (edit config, restart) — not a hot in-process swap. ──
     let config2 = work.join("config2.yaml");
+    let listeners2 = [reserve_port(), reserve_port()];
+    let [data_addr2, admin_addr2] = listeners2
+        .each_ref()
+        .map(|listener| listener.local_addr().expect("reserved boot 2 address"));
     write_config(
         &config2,
-        free_port(),
-        free_port(),
+        data_addr2.port(),
+        admin_addr2.port(),
         &format!(
             "store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n",
             db_path.display()
         ),
     );
-    let admin_addr2 = {
-        let text = std::fs::read_to_string(&config2).unwrap();
-        text.lines()
-            .find(|l| l.starts_with("admin_listen:"))
-            .unwrap()
-            .trim_start_matches("admin_listen: \"127.0.0.1:")
-            .trim_end_matches('"')
-            .to_string()
-    };
-    let admin_addr2 = format!("127.0.0.1:{admin_addr2}");
+    let admin_addr2 = admin_addr2.to_string();
+    drop(listeners2);
 
     let child2 = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config2)

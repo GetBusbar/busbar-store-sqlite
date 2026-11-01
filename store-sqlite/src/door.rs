@@ -23,6 +23,8 @@ const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
 // place (a 1.5.5 `db_path: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
+    (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
+    (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
 ]);
 
 /// The most ops the host may have in flight against this store at once. Every slot answers Ready

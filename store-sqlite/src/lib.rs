@@ -35,8 +35,11 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
     }
 }
 
+/// Reserved kernel ticket records carry their absolute expiry in ts (governance::tickets).
+const TICKET_RECORD_KIND: &str = "ticket";
+
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-/// release ever wrote one. v6 -> v14 upgrades in place:
+/// release ever wrote one. v6 -> v17 upgrades in place:
 /// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
 ///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
 ///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
@@ -44,15 +47,27 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
 /// - v14: `credentials` is rebuilt so a revoked row may hold no secret (revoke destroys it); a row
 ///   revoked under an older build loses the secret it kept.
+/// - v15: credential expiry compares the unsigned timestamps preserved by the INTEGER bit codec.
+///   A legacy row whose expiry precedes creation in that order refuses the entire migration.
+/// - v16: the same unsigned expiry order applies to keys, preserving their full-width codec.
+///   An incompatible legacy key refuses the entire migration.
 ///
+/// v17 keys metering cells and their units by the recorded group and price version.
 /// A file stamped by a later build is refused.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 17;
+
+macro_rules! unsigned_expiry_order {
+    () => {
+        "expires_at IS NULL OR (created_at >= 0 AND expires_at < 0) OR \
+         (((created_at < 0) = (expires_at < 0)) AND expires_at > created_at)"
+    };
+}
 
 /// The oldest schema any release wrote.
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 /// The `credentials` table, under `$head` (`IF NOT EXISTS credentials` in [`SCHEMA`], the scratch
-/// name in the v14 rebuild), so the two cannot drift.
+/// name in the v15 rebuild), so the two cannot drift.
 macro_rules! credentials_ddl {
     ($head:literal) => {
         concat!(
@@ -82,24 +97,21 @@ macro_rules! credentials_ddl {
     CONSTRAINT cred_revoked_bare CHECK (revoked_at IS NULL OR secret IS NULL),
     CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),
     CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),
-    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
+    CONSTRAINT cred_expiry_after CHECK (",
+            unsigned_expiry_order!(),
+            ")
 ) STRICT;"
         )
     };
 }
 
-const SCHEMA: &str = concat!("
-CREATE TABLE IF NOT EXISTS store_meta (
-    k TEXT NOT NULL PRIMARY KEY,
-    v TEXT NOT NULL
-) STRICT, WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS store_revision (
-    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    revision INTEGER NOT NULL DEFAULT 0
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS keys (
+/// The base key columns are followed by the nullable v10 columns through one shared helper.
+macro_rules! keys_ddl {
+    ($head:literal) => {
+        concat!(
+            "CREATE TABLE ",
+            $head,
+            " (
     id              TEXT NOT NULL PRIMARY KEY,
     name            TEXT NOT NULL,
     key_group       TEXT,
@@ -119,8 +131,28 @@ CREATE TABLE IF NOT EXISTS keys (
     CONSTRAINT keys_labels_json CHECK (json_valid(labels) AND json_type(labels)='object' AND length(labels)<=4096),
     -- Both tombstone flags must change in the SAME UPDATE (SQLite has no deferred CHECK).
     CONSTRAINT keys_tombstone_off CHECK (deleted_at IS NULL OR enabled = 0),
-    CONSTRAINT keys_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
+    CONSTRAINT keys_expiry_after CHECK (",
+            unsigned_expiry_order!(),
+            ")
+) STRICT;"
+        )
+    };
+}
+
+const SCHEMA: &str = concat!("
+CREATE TABLE IF NOT EXISTS store_meta (
+    k TEXT NOT NULL PRIMARY KEY,
+    v TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS store_revision (
+    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    revision INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+
+",
+    keys_ddl!("IF NOT EXISTS keys"),
+    "
 CREATE INDEX IF NOT EXISTS keys_revision_idx ON keys (revision);
 CREATE INDEX IF NOT EXISTS keys_group_live_idx ON keys (key_group) WHERE deleted_at IS NULL;
 
@@ -169,7 +201,7 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
     tokens_cache_write INTEGER NOT NULL DEFAULT 0,
     priced_from_ms     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms)
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS um_key_bucket_idx ON usage_metering (key_id, bucket);
 
@@ -190,9 +222,11 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
     provider       TEXT NOT NULL,
     model          TEXT NOT NULL,
     priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    key_group_at_use TEXT NOT NULL DEFAULT '',
+    pricing_version TEXT NOT NULL DEFAULT '',
     unit           TEXT NOT NULL,
     count          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, unit)
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -269,6 +303,26 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
   WHEN OLD.parent IS NOT NULL AND OLD.identity = OLD.parent
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ");
+
+/// Caller holds its transaction or snapshot; a failed clock cannot authorize expiry or cleanup.
+fn shared_clock(tx: &Connection) -> RecordStoreResult<i64> {
+    let read_clock = || -> RecordStoreResult<i64> {
+        tx.query_row("SELECT unixepoch()", [], |r| r.get(0)).store()
+    };
+    #[cfg(test)]
+    let now = match tests::shared_clock_override() {
+        Some(now) => now,
+        None => read_clock()?,
+    };
+    #[cfg(not(test))]
+    let now = read_clock()?;
+    if now < 0 {
+        return Err(RecordStoreError(
+            "sqlite: shared clock precedes Unix epoch".into(),
+        ));
+    }
+    Ok(now)
+}
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
 /// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
@@ -531,6 +585,44 @@ impl SqliteStore {
 
     fn migrate(&self) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
+        // Rebuilding the keys parent must not execute its credentials ON DELETE CASCADE.
+        // SQLite requires this outside the transaction. Verify it, since a PRAGMA in an active
+        // transaction can silently do nothing. This connection is not published until open ends.
+        let result = (|| {
+            conn.pragma_update(None, "foreign_keys", "OFF").store()?;
+            let disabled: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .store()?;
+            if disabled != 0 {
+                return Err(RecordStoreError(
+                    "sqlite: foreign_keys could not be disabled for the schema migration".into(),
+                ));
+            }
+            Self::migrate_transaction(&mut conn)
+        })();
+        // The transaction has committed or dropped (rolled back) before enforcement is restored.
+        // Attempt restoration even when migration refused; no failed connection reaches callers.
+        let restored = conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .store()
+            .and_then(|()| {
+                let enabled: i64 = conn
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                    .store()?;
+                if enabled == 1 {
+                    Ok(())
+                } else {
+                    Err(RecordStoreError(
+                        "sqlite: foreign_keys could not be restored after the schema migration"
+                            .into(),
+                    ))
+                }
+            });
+        result?;
+        restored
+    }
+
+    fn migrate_transaction(conn: &mut Connection) -> RecordStoreResult<()> {
         // One transaction over the upgrade and the version stamp. The version is read
         // INSIDE it: every one-time step below is gated on it, and a value read before the lock is
         // stale the moment another process opening the file commits its own migration.
@@ -559,10 +651,17 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
-        // v14: `credentials` gains the revoked-row CHECKs, which SQLite cannot add in place. Run
-        // BEFORE `SCHEMA` so its `IF NOT EXISTS` finds the rebuilt table.
-        if version != 0 && version < 14 && table_exists(&tx, "credentials")? {
-            rebuild_credentials_for_v14(&tx)?;
+        if version < 17 && table_exists(&tx, "usage_metering")? {
+            rebuild_metering_for_v17(&tx)?;
+        }
+        // The final credentials table includes both the v14 revoked-row rules and v15 unsigned
+        // expiry order. Older files go directly to it, without an intermediate signed CHECK.
+        if version != 0 && version < 15 && table_exists(&tx, "credentials")? {
+            rebuild_credentials_for_v15(&tx)?;
+        }
+        if version < 16 && table_exists(&tx, "keys")? {
+            add_v10_key_columns(&tx)?;
+            rebuild_keys_for_v16(&tx)?;
         }
         // The chain trigger's condition narrowed to appended records (upsert-by-id): a file opened
         // by an older build holds the old one, and `SCHEMA` creates it only if it is absent.
@@ -575,6 +674,13 @@ impl SqliteStore {
         )
         .store()?;
         add_v10_key_columns(&tx)?;
+        let broken_fk: Option<String> =
+            query_one(&tx, "PRAGMA foreign_key_check", [], |row| row.get(0))?;
+        if let Some(table) = broken_fk {
+            return Err(RecordStoreError(format!(
+                "sqlite: schema migration left a foreign key violation in '{table}'; refusing to open"
+            )));
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
         tx.commit().store()?;
@@ -678,15 +784,32 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
     .store()
 }
 
-/// Rebuild a pre-v14 `credentials` with the v14 CHECKs, copying every row; a row revoked under an
-/// older build keeps its metadata and loses the secret it held. The trigger naming `credentials`
+/// Rebuild a pre-v15 `credentials` with unsigned expiry order, copying every row; a row revoked
+/// before v14 keeps its metadata and loses the secret it held. The trigger naming `credentials`
 /// is dropped first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates
 /// it and the indexes right after.
-fn rebuild_credentials_for_v14(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+    let invalid: Option<(String, i64, i64)> = query_one(
+        tx,
+        concat!(
+            "SELECT id, created_at, expires_at FROM credentials WHERE NOT (",
+            unsigned_expiry_order!(),
+            ") LIMIT 1"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if let Some((id, created, expires)) = invalid {
+        return Err(RecordStoreError(format!(
+            "sqlite: credential '{id}' expires_at={} is not after created_at={} in unsigned \
+             timestamp order; refusing schema v15 migration",
+            expires as u64, created as u64
+        )));
+    }
     tx.execute_batch(concat!(
         "DROP TRIGGER IF EXISTS keys_cascade_credentials;",
-        credentials_ddl!("credentials_v14"),
-        "INSERT INTO credentials_v14 (id, key_id, kind, slot, public_id, secret, secret_form,
+        credentials_ddl!("credentials_v15"),
+        "INSERT INTO credentials_v15 (id, key_id, kind, slot, public_id, secret, secret_form,
              created_at, updated_at, expires_at, revoked_at, revoke_reason, revision)
            SELECT id, key_id, kind, slot, public_id,
              CASE WHEN revoked_at IS NULL THEN secret END,
@@ -694,14 +817,66 @@ fn rebuild_credentials_for_v14(tx: &rusqlite::Connection) -> RecordStoreResult<(
              created_at, updated_at, expires_at, revoked_at, revoke_reason, revision
            FROM credentials;
          DROP TABLE credentials;
-         ALTER TABLE credentials_v14 RENAME TO credentials;"
+         ALTER TABLE credentials_v15 RENAME TO credentials;"
     ))
     .store()
+}
+
+/// Replace the parent without renaming the old table: credential FK references stay `keys`.
+/// The caller disabled FK actions before BEGIN and checks all FK links before COMMIT.
+fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+    let invalid: Option<(String, i64, i64)> = query_one(
+        tx,
+        concat!(
+            "SELECT id, created_at, expires_at FROM keys WHERE NOT (",
+            unsigned_expiry_order!(),
+            ") LIMIT 1"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if let Some((id, created, expires)) = invalid {
+        return Err(RecordStoreError(format!(
+            "sqlite: key '{id}' expires_at={} is not after created_at={} in unsigned \
+             timestamp order; refusing schema v16 migration",
+            expires as u64, created as u64
+        )));
+    }
+    // DROP TABLE removes owned indexes/triggers. Preserve their SQL, including an operator's
+    // additional guards. Autoindexes come from the unchanged PRIMARY KEY in the new DDL.
+    let objects: Vec<String> = query_all(
+        tx,
+        "SELECT sql FROM sqlite_master WHERE tbl_name='keys' AND type IN ('index','trigger')
+         AND sql IS NOT NULL ORDER BY type,name",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute_batch(keys_ddl!("keys_v16")).store()?;
+    add_v10_key_columns_to(tx, "keys_v16")?;
+    tx.execute_batch(
+        "INSERT INTO keys_v16 (id,name,key_group,allowed_pools,labels,enabled,generation_hash,
+             created_at,updated_at,expires_at,deleted_at,revision,scope_grants,idp_subject,
+             binding_mode,minted_by,idp_provider)
+         SELECT id,name,key_group,allowed_pools,labels,enabled,generation_hash,
+             created_at,updated_at,expires_at,deleted_at,revision,scope_grants,idp_subject,
+             binding_mode,minted_by,idp_provider FROM keys;
+         DROP TABLE keys;
+         ALTER TABLE keys_v16 RENAME TO keys;",
+    )
+    .store()?;
+    for sql in objects {
+        tx.execute_batch(&sql).store()?;
+    }
+    Ok(())
 }
 
 /// The v10 `keys` columns: nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as before
 /// (no non-pool scope grant, `None` for the attribution fields).
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
+    add_v10_key_columns_to(tx, "keys")
+}
+
+fn add_v10_key_columns_to(tx: &rusqlite::Connection, table: &str) -> RecordStoreResult<()> {
     const COLUMNS: [(&str, &str); 5] = [
         (
             "scope_grants",
@@ -714,8 +889,9 @@ fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
         ("idp_provider", "TEXT"),
     ];
     for (name, decl) in COLUMNS {
-        if !column_exists(tx, "keys", name)? {
-            tx.execute_batch(&format!("ALTER TABLE keys ADD COLUMN {name} {decl}"))
+        if !column_exists(tx, table, name)? {
+            // Both callers supply fixed internal table names, never an operator identifier.
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))
                 .store()?;
         }
     }
@@ -731,7 +907,13 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         enabled: r.get::<_, i64>(4)? != 0,
         created_at: r.get::<_, i64>(5)? as u64,
         group: r.get(6)?,
-        labels: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+        labels: serde_json::from_str(&r.get::<_, String>(7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
         expires_at: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         deleted_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         revision: column::read_u64(r.get(10)?),
@@ -940,7 +1122,7 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
         concat!("INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
              tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-         ON CONFLICT(bucket, key_id, provider, model, priced_from_ms) DO UPDATE SET
+         ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version) DO UPDATE SET
              tokens_input       = ", sat_add!("tokens_input", "excluded.tokens_input"), ",
              tokens_output      = ", sat_add!("tokens_output", "excluded.tokens_output"), ",
              tokens_cache_read  = ", sat_add!("tokens_cache_read", "excluded.tokens_cache_read"), ",
@@ -966,9 +1148,9 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     for (unit, count) in &d.usage_units {
         exec(
             tx,
-            concat!("INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, unit) DO UPDATE SET
+            concat!("INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit) DO UPDATE SET
                  count = ", sat_add!("count", "excluded.count")),
             params![
                 d.bucket as i64,
@@ -976,6 +1158,8 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
                 d.provider,
                 d.model,
                 priced_from,
+                d.key_group_at_use,
+                d.pricing_version,
                 unit,
                 column::clamp(*count),
             ],
@@ -1088,7 +1272,12 @@ impl RecordStore for SqliteStore {
             key_cols!(),
             " FROM keys WHERE revision > ?1 OR revision = 0 ORDER BY revision, id"
         );
-        query_all(&self.lock_reader(), sql, params![since as i64], row_to_key)
+        query_all(
+            &self.lock_reader(),
+            sql,
+            params![column::clamp(since)],
+            row_to_key,
+        )
     }
 
     fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
@@ -1128,6 +1317,56 @@ impl RecordStore for SqliteStore {
     fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             put_credential_inner(tx, secret, Self::bump_revision, "put_credential")
+        })
+    }
+
+    fn rewrap_credential(
+        &self,
+        expected: &CredentialSecret,
+        replacement: &str,
+    ) -> RecordStoreResult<bool> {
+        self.write(true, |tx| {
+            if expected.meta.revoked_at.is_some()
+                || expected.meta.secret_form != SecretForm::Recoverable
+                || expected.secret == replacement
+            {
+                return Ok(false);
+            }
+            let owner_live: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM keys WHERE id=?1 AND deleted_at IS NULL)",
+                    params![expected.meta.key_id],
+                    |row| row.get(0),
+                )
+                .store()?;
+            if !owner_live {
+                return Ok(false);
+            }
+            let mut current = query_one(
+                tx,
+                &format!("SELECT {CRED_SECRET_COLS} FROM credentials WHERE id=?1"),
+                params![expected.meta.id],
+                row_to_cred_secret,
+            )?;
+            let matches = current.as_ref() == Some(expected);
+            if let Some(current) = &mut current {
+                zeroize::Zeroize::zeroize(&mut current.secret);
+            }
+            if !matches {
+                return Ok(false);
+            }
+            let revision = Self::bump_revision(tx)?;
+            let changed = exec(
+                tx,
+                "UPDATE credentials SET secret=?2, revision=?3 WHERE id=?1",
+                params![expected.meta.id, replacement, revision],
+            )?;
+            if changed != 1 {
+                return Err(RecordStoreError(
+                    "credential rewrap lost its locked row".into(),
+                ));
+            }
+            Ok(true)
         })
     }
 
@@ -1218,7 +1457,7 @@ impl RecordStore for SqliteStore {
         query_all(
             &self.lock_reader(),
             &sql,
-            params![since as i64],
+            params![column::clamp(since)],
             row_to_cred_secret,
         )
     }
@@ -1393,7 +1632,7 @@ impl RecordStore for SqliteStore {
         )?;
         let units = query_all(
             &conn,
-            "SELECT key_id, provider, model, priced_from_ms, unit, count
+            "SELECT key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count
              FROM usage_metering_units WHERE bucket = ?1",
             params![(bucket as i64).to_string()],
             |r| {
@@ -1403,12 +1642,16 @@ impl RecordStore for SqliteStore {
                     r.get::<_, String>(2)?,
                     u(r.get(3)?),
                     r.get::<_, String>(4)?,
-                    u(r.get(5)?),
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    u(r.get(7)?),
                 ))
             },
         )?;
-        let mut index: std::collections::HashMap<(String, String, String, u64), usize> =
-            std::collections::HashMap::with_capacity(rows.len());
+        let mut index: std::collections::HashMap<
+            (String, String, String, u64, String, String),
+            usize,
+        > = std::collections::HashMap::with_capacity(rows.len());
         for (i, m) in rows.iter().enumerate() {
             index
                 .entry((
@@ -1416,11 +1659,14 @@ impl RecordStore for SqliteStore {
                     m.provider.clone(),
                     m.model.clone(),
                     m.priced_from_ms,
+                    m.key_group_at_use.clone(),
+                    m.pricing_version.clone(),
                 ))
                 .or_insert(i);
         }
-        for (key_id, provider, model, priced_from_ms, unit, count) in units {
-            if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms)) {
+        for (key_id, provider, model, priced_from_ms, group, version, unit, count) in units {
+            if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms, group, version))
+            {
                 rows[i].usage_units.insert(unit, count);
             }
         }
@@ -1565,10 +1811,15 @@ impl RecordStore for SqliteStore {
         before: u64,
         retention: Retention,
     ) -> RecordStoreResult<u64> {
-        let above_max = before > i64::MAX as u64;
-        let before = column::clamp(before);
         let terminal_only = retention == Retention::TerminalOnly;
         self.write(false, |tx| {
+            let before = if kind == TICKET_RECORD_KIND {
+                before.min(shared_clock(tx)? as u64)
+            } else {
+                before
+            };
+            let above_max = before > i64::MAX as u64;
+            let before = column::clamp(before);
             let predicate = if terminal_only {
                 "kind=?1 AND (?3 OR ts < ?2) AND disposition='terminal'"
             } else {
@@ -1619,25 +1870,24 @@ impl RecordStore for SqliteStore {
         kind: &str,
         token: &str,
         expires_at: u64,
-        now: u64,
+        _now: u64,
     ) -> RecordStoreResult<bool> {
-        // `now` is REFUSED, not clamped: clamped to `i64::MAX` it would sweep the entire ledger and
-        // report the insert as a first redemption, reopening every spent grant. `expires_at` alone
-        // saturates: minting claims pass `u64::MAX` for "never expires", and the column is only
-        // compared against `now` by the sweep, so `i64::MAX` is the same answer.
-        let expires = column::clamp(expires_at);
-        let now_i = column::storable_i64("redeem_plane_token", "now", now)?;
-        // One transaction over the sweep and the test-and-set: two redemptions of one grant, from two
-        // threads or two nodes on one file, serialise instead of both being told they were first.
+        // SQLite shares the host clock across connections to this local file. Read it after
+        // acquiring BEGIN IMMEDIATE, so the sweep and admission use one serialized instant.
         self.write(true, |tx| {
-            // STRICTLY less-than, so an entry expiring exactly at `now` is kept (fail closed).
+            let now_i = shared_clock(tx)?;
+            let store_now = now_i as u64;
+            if expires_at < store_now {
+                return Ok(false);
+            }
+            // The existing storage policy clamps never-expiring grants to i64::MAX.
+            let expires = column::clamp(expires_at);
             tx.execute("DELETE FROM plane_tokens WHERE expires_at < ?1", [now_i])
                 .store()?;
-            // 1 row inserted means this call recorded the redemption, read off what the database did.
             let inserted = tx
                 .execute(
                     "INSERT INTO plane_tokens (kind, token, expires_at) VALUES (?1,?2,?3) \
-                     ON CONFLICT(kind, token) DO NOTHING",
+                 ON CONFLICT(kind, token) DO NOTHING",
                     params![kind, token, expires],
                 )
                 .store()?;
@@ -1646,7 +1896,8 @@ impl RecordStore for SqliteStore {
     }
 
     /// Multi-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record, live while
-    /// present, still `active`, and `now` not past `expires_at`. Fail closed on every uncertain answer.
+    /// present, still `active`, and `now` not past `expires_at`. Reserved tickets instead require
+    /// their terminal record and exact deadline under the shared clock. Uncertain answers fail closed.
     fn plane_token_live(
         &self,
         kind: &str,
@@ -1654,6 +1905,19 @@ impl RecordStore for SqliteStore {
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
+        if kind == TICKET_RECORD_KIND {
+            let conn = self.lock_reader();
+            let _snapshot = conn.unchecked_transaction().store()?;
+            let row: Option<(i64, String)> = query_one(&conn,
+                "SELECT ts, disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
+                params![kind, token, UPSERT_SEQ], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let store_now = shared_clock(&conn)? as u64;
+            return Ok(store_now <= expires_at
+                && row.is_some_and(|(ts, disposition)| {
+                    u64::try_from(ts).ok() == Some(expires_at)
+                        && disposition == DISPOSITION_TERMINAL
+                }));
+        }
         if now > expires_at {
             return Ok(false);
         }
@@ -1850,6 +2114,77 @@ fn now_secs() -> i64 {
 /// The settings parser and the store v3 table over [`SqliteStore`] (`door::door`).
 pub mod door;
 mod v3;
+
+/// Preserve each old cell's recorded attribution; already-collapsed history cannot be recovered.
+fn rebuild_metering_for_v17(tx: &Connection) -> RecordStoreResult<()> {
+    let has_units = table_exists(tx, "usage_metering_units")?;
+    if has_units {
+        let orphan: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_metering_units u WHERE NOT EXISTS (
+                SELECT 1 FROM usage_metering m WHERE m.bucket=u.bucket AND m.key_id=u.key_id
+                AND m.provider=u.provider AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms))",
+            [], |r| r.get(0)).store()?;
+        if orphan {
+            return Err(RecordStoreError(
+                "sqlite: metering unit has no attribution parent; refusing migration".into(),
+            ));
+        }
+    }
+    tx.execute_batch(r#"
+        DROP TRIGGER IF EXISTS keys_guard_hard_delete;
+CREATE TABLE usage_metering_v17 (
+    bucket             TEXT NOT NULL,
+    key_id             TEXT NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    key_group_at_use   TEXT NOT NULL DEFAULT '',
+    pricing_version    TEXT NOT NULL DEFAULT '',
+    requests           INTEGER NOT NULL DEFAULT 0,
+    billable_requests  INTEGER NOT NULL DEFAULT 0,
+    tokens_input       INTEGER NOT NULL DEFAULT 0,
+    tokens_output      INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE usage_metering_units_v17 (
+    bucket         TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    key_group_at_use TEXT NOT NULL DEFAULT '',
+    pricing_version TEXT NOT NULL DEFAULT '',
+    unit           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)
+) STRICT, WITHOUT ROWID;
+
+
+        INSERT INTO usage_metering_v17 (bucket,key_id,provider,model,key_group_at_use,pricing_version,
+            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms)
+        SELECT bucket,key_id,provider,model,key_group_at_use,pricing_version,
+            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms
+        FROM usage_metering;
+    "#).store()?;
+    if has_units {
+        tx.execute_batch("INSERT INTO usage_metering_units_v17
+            (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,unit,count)
+            SELECT u.bucket,u.key_id,u.provider,u.model,u.priced_from_ms,m.key_group_at_use,m.pricing_version,u.unit,u.count
+            FROM usage_metering_units u JOIN usage_metering m
+            ON m.bucket=u.bucket AND m.key_id=u.key_id AND m.provider=u.provider
+            AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms;
+            DROP TABLE usage_metering_units;").store()?;
+    }
+    tx.execute_batch(
+        "DROP TABLE usage_metering;
+        ALTER TABLE usage_metering_v17 RENAME TO usage_metering;
+        ALTER TABLE usage_metering_units_v17 RENAME TO usage_metering_units;",
+    )
+    .store()?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests;

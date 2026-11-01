@@ -13,6 +13,7 @@
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
+use busbar_contract::abi::sdk::store::conditional::{Decision, Expected, Mutation, Request};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -70,13 +71,28 @@ fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStor
             params![retention_cutoff(now)],
         )?;
     }
-    exec(
+    let changed = exec(
         tx,
         "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES (?1, ?2, '\"Done\"', ?3) \
          ON CONFLICT(op_id) DO UPDATE SET body=excluded.body, recorded_at=excluded.recorded_at",
         params![op.0.as_slice(), body, now],
-    )
-    .map(drop)
+    )?;
+    let receipt: Option<(String, String, i64)> = query_one(
+        tx,
+        "SELECT body, answer, recorded_at FROM store_ops WHERE op_id=?1",
+        params![op.0.as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if changed != 1
+        || receipt
+            .as_ref()
+            .is_none_or(|(saved, answer, at)| saved != body || answer != "\"Done\"" || *at != now)
+    {
+        return Err(RecordStoreError(
+            "sqlite: applied operation receipt was not recorded".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl SqliteStore {
@@ -111,6 +127,82 @@ impl SqliteStore {
     }
 }
 
+/// An opaque record's exact optional BLOB value, read on the transaction's snapshot.
+fn record_value(
+    conn: &rusqlite::Connection,
+    schema: &str,
+    key: &[u8],
+) -> RecordStoreResult<Option<Vec<u8>>> {
+    query_one(
+        conn,
+        "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
+        params![schema, key],
+        |row| row.get(0),
+    )
+}
+
+/// The legacy record PUT spelling: an empty value deletes; a nonempty value upserts.
+fn put_record_in(
+    tx: &Transaction<'_>,
+    schema: &str,
+    key: &[u8],
+    value: &[u8],
+) -> RecordStoreResult<()> {
+    (if value.is_empty() {
+        exec(
+            tx,
+            "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
+            params![schema, key],
+        )
+    } else {
+        exec(
+            tx,
+            "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
+            params![schema, key, value],
+        )
+    })
+    .map(drop)
+}
+
+/// A raw BLOB-prefix selector with an exact byte length. SQLite lengths are nonnegative i64:
+/// a larger checked platform length cannot match any row and is a legal empty range.
+fn record_range(
+    tx: &Transaction<'_>,
+    schema: &str,
+    prefix: &[u8],
+    exact_key_length: u64,
+    delete: bool,
+) -> RecordStoreResult<bool> {
+    let Ok(length) = i64::try_from(exact_key_length) else {
+        return Ok(false);
+    };
+    let end = prefix_end(prefix);
+    let upper = if end.is_some() {
+        " AND record_key < ?4"
+    } else {
+        ""
+    };
+    let predicate = format!("schema=?1 AND length(record_key)=?2 AND record_key >= ?3{upper}");
+    let sql = if delete {
+        format!("DELETE FROM schema_records WHERE {predicate}")
+    } else {
+        format!("SELECT EXISTS(SELECT 1 FROM schema_records WHERE {predicate})")
+    };
+    let run = |values: &[&dyn rusqlite::ToSql]| {
+        if delete {
+            exec(tx, &sql, values).map(|changed| changed != 0)
+        } else {
+            query_one(tx, &sql, values, |row| row.get::<_, bool>(0))
+                .map(|found| found.unwrap_or(false))
+        }
+    };
+    match end {
+        Some(end) => run(params![schema, length, prefix, end]),
+        None => run(params![schema, length, prefix]),
+    }
+}
+
 /// The slots' own bodies, answered Ready: the store is local-disk-bound and never pends.
 impl SqliteStore {
     pub(crate) fn v3_append_plane_record_op(
@@ -133,24 +225,8 @@ impl SqliteStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
-        self.write(false, |tx| {
-            (if value.is_empty() {
-                exec(
-                    tx,
-                    "DELETE FROM schema_records WHERE schema=?1 AND record_key=?2",
-                    params![schema, key],
-                )
-            } else {
-                exec(
-                    tx,
-                    "INSERT INTO schema_records (schema, record_key, value) VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(schema, record_key) DO UPDATE SET value=excluded.value",
-                    params![schema, key, value],
-                )
-            })
-            .map(drop)
-        })
-        .map_err(|e| e.0)
+        self.write(false, |tx| put_record_in(tx, schema, key, value))
+            .map_err(|e| e.0)
     }
 
     pub(crate) fn v3_record_get(
@@ -158,14 +234,75 @@ impl SqliteStore {
         schema: &str,
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
-        let value: Option<Vec<u8>> = query_one(
-            &self.lock_reader(),
-            "SELECT value FROM schema_records WHERE schema=?1 AND record_key=?2",
-            params![schema, key],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.0)?;
+        let value = record_value(&self.lock_reader(), schema, key).map_err(|e| e.0)?;
         value.map(record_bytes).transpose()
+    }
+
+    /// Compare the complete pre-state, then commit every effect and the applied-only receipt in
+    /// the existing FULL-sync BEGIN IMMEDIATE operation. A predicate miss forces rollback, but is
+    /// a definitive decision rather than an operation-id body conflict. SQL/commit errors retain
+    /// their ambiguous failure semantics: callers must replay this exact id and body.
+    pub(crate) fn v3_record_transaction(&self, request: &Request) -> OpResult<Decision> {
+        request
+            .validate()
+            .map_err(|reason| OpRefused::Refused(reason.into()))?;
+        let mut condition_conflict = false;
+        let result = self.op(request.op_id, Dedupe::record_transaction(request), |tx| {
+            for predicate in &request.predicates {
+                let actual = record_value(tx, &predicate.schema, &predicate.key)?;
+                let matches = match &predicate.expected {
+                    Expected::Absent => actual.is_none(),
+                    Expected::Bytes(expected) => actual.as_ref() == Some(expected),
+                };
+                if !matches {
+                    condition_conflict = true;
+                    // `op` rolls back every closure error and writes no receipt. Only this local
+                    // marker is translated into a condition decision; SQL errors stay failures.
+                    return Err(RecordStoreError(
+                        "record transaction predicate conflict".into(),
+                    ));
+                }
+            }
+            for mutation in &request.mutations {
+                match mutation {
+                    Mutation::Put { schema, key, value } => put_record_in(tx, schema, key, value)?,
+                    Mutation::Delete { schema, key } => put_record_in(tx, schema, key, &[])?,
+                    Mutation::DeleteRange {
+                        schema,
+                        prefix,
+                        exact_key_length,
+                    } => {
+                        record_range(tx, schema, prefix, *exact_key_length, true)?;
+                    }
+                }
+            }
+            // A trigger may silently suppress a write. Never record Applied unless every intended
+            // value (including absence) is present in the same transaction before its receipt.
+            for mutation in &request.mutations {
+                let applied = match mutation {
+                    Mutation::Put { schema, key, value } => {
+                        record_value(tx, schema, key)?.as_ref() == Some(value)
+                    }
+                    Mutation::Delete { schema, key } => record_value(tx, schema, key)?.is_none(),
+                    Mutation::DeleteRange {
+                        schema,
+                        prefix,
+                        exact_key_length,
+                    } => !record_range(tx, schema, prefix, *exact_key_length, false)?,
+                };
+                if !applied {
+                    return Err(RecordStoreError(
+                        "record transaction mutation was not applied".into(),
+                    ));
+                }
+            }
+            Ok(())
+        });
+        if condition_conflict {
+            Ok(Decision::ConditionConflict)
+        } else {
+            result.map(|()| Decision::Applied)
+        }
     }
 
     pub(crate) fn v3_record_scan(
@@ -267,6 +404,8 @@ macro_rules! ready {
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
 /// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
+    const RECORD_TRANSACTION: bool = true;
+
     const TAIL: Tail = Tail {
         ephemeral: false,
         durable_plane: true,
@@ -282,6 +421,7 @@ impl StoreSlots for SqliteStore {
     }
 
     ready! {
+        record_transaction => Self::v3_record_transaction(request: &Request) -> OpResult<Decision>;
         append_plane_record_op => Self::v3_append_plane_record_op(op: OpId, record: PlaneRecordRef<'_>) -> OpResult<()>;
         record_put => Self::v3_record_put(schema: &str, key: &[u8], value: &[u8]) -> Result<(), String>;
         record_get => Self::v3_record_get(schema: &str, key: &[u8]) -> Result<Option<RecordBytes>, String>;
@@ -298,6 +438,7 @@ impl StoreSlots for SqliteStore {
         purge_usage_before => Self::v3_purge_usage_before(before: u64) -> RecordStoreResult<u64>;
         list_metering => RecordStore::list_metering(bucket: u64) -> RecordStoreResult<Vec<MeteringRow>>;
         put_credential => RecordStore::put_credential(secret: &CredentialSecret) -> RecordStoreResult<()>;
+        rewrap_credential => RecordStore::rewrap_credential(expected: &CredentialSecret, replacement: &str) -> RecordStoreResult<bool>;
         put_key_with_credential => RecordStore::put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> RecordStoreResult<()>;
         list_credentials => RecordStore::list_credentials(key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>>;
         revoke_credential => RecordStore::revoke_credential(id: &str, reason: &str) -> RecordStoreResult<()>;
@@ -332,3 +473,7 @@ fn record_bytes(v: Vec<u8>) -> Result<RecordBytes, String> {
 #[cfg(test)]
 #[path = "tests/v3_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/conditional_records.rs"]
+mod conditional_tests;

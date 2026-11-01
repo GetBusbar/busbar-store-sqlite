@@ -44,6 +44,9 @@ use busbar_plugin_loader::dispatch::{
 use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_store_sqlite::door::MACRO_DOOR;
 
+#[path = "support/credential_rewrap.rs"]
+mod credential_rewrap;
+
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
 // the built cdylib, each through the one loader, driven by the store kind's script over
 // `conformance.json`; exact crossing counts, the two folds equal, its RED arms. Each fold opens its

@@ -995,14 +995,20 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
         // Commit a change underneath the store's write only once it is waiting on the lock.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !MET_LOCK.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the store's write never met the held lock"
-            );
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        holder.execute_batch("COMMIT").unwrap();
-        writer.join().unwrap()
+        let met_lock = MET_LOCK.load(std::sync::atomic::Ordering::SeqCst);
+        let committed = holder.execute_batch("COMMIT");
+        // Release even a failed COMMIT before joining or asserting: the writer's busy handler
+        // otherwise retries forever while the scope tries to join it during panic unwinding.
+        drop(holder);
+        let result = writer.join();
+        assert!(met_lock, "the store's write never met the held lock");
+        committed.unwrap();
+        result.unwrap()
     });
     result.expect(
         "a store write must wait for the lock and then succeed; failing here means its transaction \
@@ -1012,6 +1018,9 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "tests/key_timestamps.rs"]
+mod key_timestamps;
 
 /// HARDEST INVARIANT #5: `foreign_keys` verification actually fails startup if the pragma readback
 /// shows it didn't take. Simulated by calling `apply_pragmas` and confirming it error-checks the
@@ -1507,10 +1516,11 @@ fn unique_suffix() -> u64 {
 /// longer reaches this backend on a dependency bump, it has to be written in here by hand.
 mod store_conformance;
 
+#[path = "tests/credential_rewrap.rs"]
+mod credential_rewrap;
+
 #[path = "tests/credential_timestamps.rs"]
 mod credential_timestamps;
-#[path = "tests/key_timestamps.rs"]
-mod key_timestamps;
 
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
 /// carries, including the 1.6.0 credential-ownership, atomic-mint and plane-record rulings.
@@ -2741,6 +2751,21 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
     );
 }
 
+/// A caller reaching its claimed expiry boundary cannot force store cleanup early.
+
+#[test]
+fn caller_expiry_boundary_does_not_evict_a_live_receipt() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let now = token_test_now();
+    let expires = now + 10;
+    assert!(s.redeem_plane_token("ask", "edge", expires, now).unwrap());
+    assert!(
+        !s.redeem_plane_token("ask", "edge", expires, expires)
+            .unwrap(),
+        "a caller claiming the expiry boundary must not evict a store-clock live receipt"
+    );
+}
+
 /// Permanent grant storage and unrelated recorded-at refusal retain their existing semantics.
 /// A caller-supplied unsigned maximum is not an expiry authority.
 
@@ -2758,7 +2783,7 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
         "a never-expiring grant is spent by its first redemption"
     );
     assert!(
-        !s.redeem_plane_token("ask", "n", u64::MAX, FAST_CALLER)
+        !s.redeem_plane_token("ask", "n", u64::MAX, u64::MAX)
             .unwrap(),
         "a fast caller cannot sweep a still-live receipt"
     );
@@ -4411,19 +4436,154 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
     }
 }
 
-/// A caller reaching its claimed expiry boundary cannot force store cleanup early.
+#[test]
+fn v16_metering_migration_retains_parent_attribution_and_open_units() {
+    let dir = tempdir();
+    let path = dir.join("v16-attribution.db");
+    let path = path.to_str().unwrap();
+    {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch(r#"CREATE TABLE IF NOT EXISTS usage_metering (
+    bucket             TEXT NOT NULL,
+    key_id             TEXT NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    key_group_at_use   TEXT NOT NULL DEFAULT '',
+    pricing_version    TEXT NOT NULL DEFAULT '',
+    requests           INTEGER NOT NULL DEFAULT 0,
+    billable_requests  INTEGER NOT NULL DEFAULT 0,
+    tokens_input       INTEGER NOT NULL DEFAULT 0,
+    tokens_output      INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage_metering_units (
+    bucket         TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    unit           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, unit)
+) STRICT, WITHOUT ROWID;
+
+
+        PRAGMA user_version=16;
+        INSERT INTO usage_metering (bucket,key_id,provider,model,key_group_at_use,pricing_version,requests,tokens_input,priced_from_ms)
+          VALUES ('-1','history','p','m','old|group','old%version',1,7,9007199254740993),
+                 ('-1','unknown','p','m','','',1,3,0);
+        INSERT INTO usage_metering_units (bucket,key_id,provider,model,priced_from_ms,unit,count)
+          VALUES ('-1','history','p','m',9007199254740993,'tool_calls',11),
+                 ('-1','unknown','p','m',0,'tool_calls',5);
+        "#).unwrap();
+    }
+    for _ in 0..2 {
+        let s = SqliteStore::open(path, 5000).unwrap();
+        let rows = s.list_metering(u64::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|r| r.key_id == "history").unwrap();
+        assert_eq!(
+            (&*old.key_group_at_use, &*old.pricing_version),
+            ("old|group", "old%version")
+        );
+        assert_eq!(
+            (old.tokens_input, old.priced_from_ms),
+            (7, 9007199254740993)
+        );
+        assert_eq!(old.usage_units.get("tool_calls"), Some(&11));
+        let unknown = rows.iter().find(|r| r.key_id == "unknown").unwrap();
+        assert_eq!(
+            (&*unknown.key_group_at_use, &*unknown.pricing_version),
+            ("", "")
+        );
+        assert_eq!(unknown.usage_units.get("tool_calls"), Some(&5));
+    }
+    let s = SqliteStore::open(path, 5000).unwrap();
+    let d = MeteringDelta {
+        key_id: "history".into(),
+        bucket: u64::MAX,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 2,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "new".into(),
+        pricing_version: "old%version".into(),
+        priced_from_ms: 9007199254740993,
+        usage_units: [("tool_calls".into(), 13)].into_iter().collect(),
+    };
+    s.add_metering(&d).unwrap();
+    let rows = s.list_metering(u64::MAX).unwrap();
+    assert_eq!(rows.len(), 3);
+    let old = rows
+        .iter()
+        .find(|r| r.key_group_at_use == "old|group")
+        .unwrap();
+    assert_eq!(old.tokens_input, 7);
+    assert_eq!(old.usage_units.get("tool_calls"), Some(&11));
+}
 
 #[test]
-fn caller_expiry_boundary_does_not_evict_a_live_receipt() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let now = token_test_now();
-    let expires = now + 10;
-    assert!(s.redeem_plane_token("ask", "edge", expires, now).unwrap());
-    assert!(
-        !s.redeem_plane_token("ask", "edge", expires, expires)
-            .unwrap(),
-        "a caller claiming the expiry boundary must not evict a store-clock live receipt"
-    );
+fn v16_metering_orphan_units_refuse_without_rewriting_the_database() {
+    let dir = tempdir();
+    let path = dir.join("v16-orphan.db");
+    let path = path.to_str().unwrap();
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS usage_metering (
+    bucket             TEXT NOT NULL,
+    key_id             TEXT NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    key_group_at_use   TEXT NOT NULL DEFAULT '',
+    pricing_version    TEXT NOT NULL DEFAULT '',
+    requests           INTEGER NOT NULL DEFAULT 0,
+    billable_requests  INTEGER NOT NULL DEFAULT 0,
+    tokens_input       INTEGER NOT NULL DEFAULT 0,
+    tokens_output      INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage_metering_units (
+    bucket         TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    unit           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, unit)
+) STRICT, WITHOUT ROWID;
+
+
+
+        PRAGMA user_version=16;
+        INSERT INTO usage_metering_units (bucket,key_id,provider,model,priced_from_ms,unit,count)
+          VALUES ('-1','orphan','p','m',0,'tool_calls',9007199254740993);
+    "#,
+    )
+    .unwrap();
+    drop(c);
+    assert!(SqliteStore::open(path, 5000).is_err());
+    let c = rusqlite::Connection::open(path).unwrap();
+    let v: i64 = c
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 16);
+    let n: i64 = c
+        .query_row("SELECT count FROM usage_metering_units", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 9007199254740993);
+    let columns:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('usage_metering_units') WHERE name='key_group_at_use'",[],|r|r.get(0)).unwrap();
+    assert_eq!(columns, 0, "refusal leaves old units schema intact");
 }
 
 #[test]
@@ -4440,7 +4600,7 @@ fn shared_clock_ignores_caller_skew_and_refuses_expired_grants_without_mutation(
         .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, PAST_EPOCH)
         .unwrap());
     assert!(!store
-        .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, FAST_CALLER)
+        .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, u64::MAX)
         .unwrap());
     assert!(!store
         .redeem_plane_token(TOKEN_KIND, EXPIRED_TOKEN, PAST_EPOCH, 0)
@@ -4478,7 +4638,7 @@ fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows(
         tx.execute("INSERT INTO plane_tokens(kind,token,expires_at) VALUES (?1,'future',?2),(?1,'lapsed',0)",params![TOKEN_KIND,EXACT_EXPIRY]).store()?;Ok(())
     }).unwrap();
     assert!(!store
-        .redeem_plane_token(TOKEN_KIND, "future", u64::MAX, FAST_CALLER)
+        .redeem_plane_token(TOKEN_KIND, "future", u64::MAX, u64::MAX)
         .unwrap());
     assert!(store
         .redeem_plane_token(TOKEN_KIND, "lapsed", u64::MAX, 0)
@@ -4580,7 +4740,7 @@ fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without
     store
         .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
         .unwrap();
-    for caller in [FAST_CALLER, 0, FAST_CALLER] {
+    for caller in [u64::MAX, 0, u64::MAX] {
         assert!(
             store
                 .plane_token_live(TICKET_KIND, &token, expires, caller)
@@ -4631,6 +4791,114 @@ fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without
     assert_eq!(receipts, 0, "preflight is non-consuming");
 }
 
-// The public SQLite redemption API accepts caller timestamps through i64::MAX.
-// Keep regression skew within that precondition so failures expose expiry policy.
-const FAST_CALLER: u64 = i64::MAX as u64;
+std::thread_local! {
+    static SHARED_CLOCK_OVERRIDE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn shared_clock_override() -> Option<i64> {
+    SHARED_CLOCK_OVERRIDE.get()
+}
+
+fn with_shared_clock<T>(now: i64, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHARED_CLOCK_OVERRIDE.set(self.0);
+        }
+    }
+    let _restore = Restore(SHARED_CLOCK_OVERRIDE.replace(Some(now)));
+    run()
+}
+
+#[test]
+fn shared_clock_equality_admits_once_retains_ticket_and_fails_closed_on_clock_error() {
+    const EXACT_NOW: i64 = (1_i64 << 53) + 1;
+    const TOKEN_KIND: &str = "clock-boundary";
+    const TOKEN: &str = "at-boundary";
+    let store = SqliteStore::open_in_memory().unwrap();
+    let expires = EXACT_NOW as u64;
+    store
+        .upsert_plane_record(
+            PlaneRecord {
+                kind: TICKET_RECORD_KIND.into(),
+                id: TOKEN.into(),
+                parent: None,
+                seq: 0,
+                ts: expires,
+                disposition: PlaneDisposition::Terminal,
+                body: b"boundary-ticket".to_vec(),
+            }
+            .view(),
+        )
+        .unwrap();
+    with_shared_clock(EXACT_NOW, || {
+        assert!(store
+            .redeem_plane_token(TOKEN_KIND, TOKEN, expires, u64::MAX)
+            .unwrap());
+        assert!(!store
+            .redeem_plane_token(TOKEN_KIND, TOKEN, expires, 0)
+            .unwrap());
+        assert!(store
+            .plane_token_live(TICKET_RECORD_KIND, TOKEN, expires, u64::MAX)
+            .unwrap());
+        assert!(store
+            .plane_token_live(TICKET_RECORD_KIND, TOKEN, expires, 0)
+            .unwrap());
+        assert_eq!(
+            store
+                .purge_plane_records(TICKET_RECORD_KIND, u64::MAX, Retention::Age)
+                .unwrap(),
+            0
+        );
+        assert!(!store
+            .redeem_plane_token(TOKEN_KIND, "already-expired", expires - 1, 0)
+            .unwrap());
+    });
+    let before: i64 = store
+        .lock_reader()
+        .query_row(
+            "SELECT expires_at FROM plane_tokens WHERE kind=?1 AND token=?2",
+            params![TOKEN_KIND, TOKEN],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, EXACT_NOW);
+    with_shared_clock(EXACT_NOW + 1, || {
+        assert!(!store
+            .plane_token_live(TICKET_RECORD_KIND, TOKEN, expires, 0)
+            .unwrap());
+        assert!(!store
+            .redeem_plane_token(TOKEN_KIND, TOKEN, expires, 0)
+            .unwrap());
+        assert!(store
+            .redeem_plane_token(TOKEN_KIND, TOKEN, u64::MAX, 0)
+            .unwrap());
+        assert_eq!(
+            store
+                .purge_plane_records(TICKET_RECORD_KIND, u64::MAX, Retention::Age)
+                .unwrap(),
+            1
+        );
+    });
+    const INVALID_CLOCK: i64 = -1;
+    with_shared_clock(INVALID_CLOCK, || {
+        assert!(store
+            .redeem_plane_token(TOKEN_KIND, "clock-error", u64::MAX, 0)
+            .is_err());
+        assert!(store
+            .plane_token_live(TICKET_RECORD_KIND, TOKEN, expires, 0)
+            .is_err());
+        assert!(store
+            .purge_plane_records(TICKET_RECORD_KIND, u64::MAX, Retention::Age)
+            .is_err());
+    });
+    let after: i64 = store
+        .lock_reader()
+        .query_row(
+            "SELECT expires_at FROM plane_tokens WHERE kind=?1 AND token=?2",
+            params![TOKEN_KIND, TOKEN],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, i64::MAX, "clock failure cannot overwrite the winner");
+}

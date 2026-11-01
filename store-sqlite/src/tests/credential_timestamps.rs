@@ -103,6 +103,45 @@ fn unsigned_expiry_refusals_leave_no_credential_key_or_revision_behind() {
     }
 }
 
+#[test]
+fn crossing_the_sign_boundary_does_not_alias_a_cas_snapshot() {
+    let dir = tempdir();
+    let path = dir.join("cas-timestamps.db");
+    let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    store.put_key(&sample_key("owner", "hash")).unwrap();
+    let mut offered = sample_credential("owner", "public", 0);
+    offered.meta.created_at = SIGNED_MAX;
+    offered.meta.updated_at = u64::MAX;
+    offered.meta.expires_at = Some(SIGNED_MAX + 1);
+    store.put_credential(&offered).unwrap();
+    let expected = credential(&store, "public");
+    let before = store_revision(&store);
+    let mut wrong = expected.clone();
+    wrong.meta.updated_at = SIGNED_MAX;
+    assert!(!store
+        .rewrap_credential(&wrong, "v1:test:replacement")
+        .unwrap());
+    assert!(credential(&store, "public") == expected);
+    assert_eq!(store_revision(&store), before);
+    assert!(store
+        .rewrap_credential(&expected, "v1:test:replacement")
+        .unwrap());
+    let mut wanted = expected;
+    wanted.secret = "v1:test:replacement".into();
+    wanted.meta.revision += 1;
+    assert!(credential(&store, "public") == wanted);
+    assert_eq!(store_revision(&store), before + 1);
+    let mut ordinary = wanted.clone();
+    ordinary.secret = "v1:test:ordinary-put".into();
+    assert!(store.put_credential(&ordinary).is_err());
+    assert!(credential(&store, "public") == wanted);
+    assert_eq!(store_revision(&store), before + 1);
+    drop(store);
+    let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert!(credential(&reopened, "public") == wanted);
+    assert_eq!(store_revision(&reopened), before + 1);
+}
+
 // The released v14 signed-expiry table, retained as a migration input rather than borrowed from
 // the current DDL. The surrounding database is made by the real provider.
 const V14_CREDENTIALS: &str = "CREATE TABLE credentials_legacy (
