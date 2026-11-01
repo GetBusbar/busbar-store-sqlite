@@ -2590,7 +2590,7 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
     let dir = tempdir();
     let file = dir.join("askstate.db");
     let path = file.to_str().unwrap().to_string();
-    let now = 1_700_000_000u64;
+    let now = token_test_now();
     let expires = now + 900;
 
     {
@@ -2640,7 +2640,7 @@ fn a_second_handle_on_the_same_file_cannot_redeem_what_the_first_spent() {
     let path = file.to_str().unwrap().to_string();
     let node_a = SqliteStore::open(&path, 5000).unwrap();
     let node_b = SqliteStore::open(&path, 5000).unwrap();
-    let now = 1_700_000_000u64;
+    let now = token_test_now();
 
     assert!(node_a
         .redeem_plane_token("ask", "nonce-fleet", now + 900, now)
@@ -2662,14 +2662,18 @@ fn exactly_one_of_many_racing_redemptions_wins() {
     let dir = tempdir();
     let file = dir.join("race.db");
     let path = file.to_str().unwrap().to_string();
-    let now = 1_700_000_000u64;
-    let store = std::sync::Arc::new(SqliteStore::open(&path, 5000).unwrap());
+    let now = token_test_now();
+    // Each contender owns a separate connection, as independent processes sharing the file do.
+    // Opening before the barrier keeps schema initialization outside the redemption race.
+    let stores: Vec<_> = (0..8)
+        .map(|_| SqliteStore::open(&path, 5000).unwrap())
+        .collect();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
 
     let winners: usize = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let store = std::sync::Arc::clone(&store);
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 scope.spawn(move || {
                     barrier.wait();
@@ -2687,31 +2691,45 @@ fn exactly_one_of_many_racing_redemptions_wins() {
         "exactly one redemption of one approval may be the first; {winners} threads were each told \
          they were, which is a test-and-set that is really a read followed by a write"
     );
+    let reopened = SqliteStore::open(&path, 5000).unwrap();
+    assert!(
+        !reopened
+            .redeem_plane_token("ask", "nonce-race", now + 900, now)
+            .unwrap(),
+        "the winning redemption remains spent after all racing connections closed"
+    );
+    assert!(
+        reopened
+            .redeem_plane_token("ask", "different-nonce", now + 900, now)
+            .unwrap(),
+        "another token remains redeemable after contention"
+    );
+    drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE LEDGER IS BOUNDED BY ONE VALIDITY WINDOW. `now` is handed to every redemption so the backend
-/// can drop what has lapsed as part of the same call — an entry recording a grant that can no longer
-/// be presented protects nothing, and a table that only grows is its own outage.
+/// The store clock determines which receipts have lapsed before a new redemption.
+/// A seeded past receipt can be swept; live receipts must remain protected.
+
 #[test]
 fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
-    let dir = tempdir();
-    let file = dir.join("evict.db");
-    let path = file.to_str().unwrap().to_string();
-    let now = 1_700_000_000u64;
-
-    let s = SqliteStore::open(&path, 5000).unwrap();
+    const TOKEN_KIND: &str = "expiry-sweep";
+    let s = SqliteStore::open_in_memory().unwrap();
+    let now = token_test_now();
+    s.write(true, |tx| {
+        tx.execute(
+            "INSERT INTO plane_tokens(kind,token,expires_at) VALUES (?1,'short-lived',?2)",
+            params![TOKEN_KIND, (now - 1) as i64],
+        )
+        .store()?;
+        Ok(())
+    })
+    .unwrap();
     assert!(s
-        .redeem_plane_token("ask", "short-lived", now + 10, now)
+        .redeem_plane_token(TOKEN_KIND, "long-lived", u64::MAX, now)
         .unwrap());
     assert!(s
-        .redeem_plane_token("ask", "long-lived", now + 10_000, now)
-        .unwrap());
-
-    // A redemption well past the first entry's expiry: the sweep runs inside the same call.
-    let later = now + 11;
-    assert!(s
-        .redeem_plane_token("ask", "another", later + 900, later)
+        .redeem_plane_token(TOKEN_KIND, "another", u64::MAX, 0)
         .unwrap());
     let rows: i64 = s
         .lock_reader()
@@ -2719,32 +2737,13 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
         .unwrap();
     assert_eq!(
         rows, 2,
-        "the lapsed entry must be evicted by the sweep the redemption carries, leaving only the \
-         grants still presentable"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// THE EVICTION BOUNDARY IS FAIL-CLOSED. An entry whose grant expires exactly at `now` can still be
-/// presented at `now`, so the sweep must keep it (strictly less-than): evicting it first would tell
-/// that replay it is the first redemption.
-#[test]
-fn an_entry_expiring_exactly_now_is_kept_and_its_replay_refused() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let now = 1_700_000_000u64;
-    let expires = now + 10;
-    assert!(s.redeem_plane_token("ask", "edge", expires, now).unwrap());
-    assert!(
-        !s.redeem_plane_token("ask", "edge", expires, expires)
-            .unwrap(),
-        "a replay at now == expires_at was told it was first: the sweep evicted an entry whose \
-         grant is still presentable"
+        "the expired fixture was swept; both live receipts remain"
     );
 }
 
-/// REFUSED RATHER THAN MANGLED, and here the reason is sharper than it is for a chain position: `as
-/// i64` wraps a `u64` past `i64::MAX` negative, and a wrapped `now` sweeps the whole ledger before
-/// inserting — which answers "first redemption" to a replay. The failure has to be an error.
+/// Permanent grant storage and unrelated recorded-at refusal retain their existing semantics.
+/// A caller-supplied unsigned maximum is not an expiry authority.
+
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2759,10 +2758,9 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
         "a never-expiring grant is spent by its first redemption"
     );
     assert!(
-        s.redeem_plane_token("ask", "n", 1_700_000_900, u64::MAX)
-            .is_err(),
-        "an unstorable now must be an error: clamped to i64::MAX it would evict the entire ledger \
-         and then report every replay as a first redemption"
+        !s.redeem_plane_token("ask", "n", u64::MAX, FAST_CALLER)
+            .unwrap(),
+        "a fast caller cannot sweep a still-live receipt"
     );
     assert!(
         s.upsert_plane_record(demotion_record(&demotion("srv", "tool-drift", u64::MAX)).view())
@@ -4246,3 +4244,393 @@ fn plane_purge_preserves_strict_cutoffs_above_the_signed_timestamp_boundary() {
     assert_eq!(s.purge_plane_records_before("opaque", max + 1).unwrap(), 1);
     assert_eq!(s.purge_plane_records_before("opaque", u64::MAX).unwrap(), 0);
 }
+
+#[test]
+fn unsigned_revision_cursors_never_wrap_and_unstamped_rows_remain_visible() {
+    let dir = tempdir();
+    let path = dir.join("unsigned-cursor.db");
+    {
+        let s = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        for id in ["stamped", "unstamped"] {
+            s.put_key(&sample_key(id, "g")).unwrap();
+            s.put_credential(&sample_credential(id, id, 0)).unwrap();
+        }
+        let writer = s.lock_writer();
+        writer
+            .execute("UPDATE keys SET revision=0 WHERE id='unstamped'", [])
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE credentials SET revision=0 WHERE key_id='unstamped'",
+                [],
+            )
+            .unwrap();
+    }
+    for since in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let s = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        assert_eq!(
+            s.list_keys_since(since)
+                .unwrap()
+                .into_iter()
+                .map(|k| k.id)
+                .collect::<Vec<_>>(),
+            ["unstamped"]
+        );
+        assert_eq!(
+            s.list_credentials_since(since)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.meta.key_id)
+                .collect::<Vec<_>>(),
+            ["unstamped"]
+        );
+        assert_eq!(s.list_keys_since(0).unwrap().len(), 2);
+        assert_eq!(s.list_credentials_since(0).unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn invalid_stored_label_values_are_reported_without_losing_the_stored_map() {
+    let dir = tempdir();
+    let path = dir.join("labels.db");
+    {
+        let s = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        s.put_key(&sample_key("key", "g")).unwrap();
+        s.lock_writer()
+            .execute(
+                "UPDATE keys SET labels=?1 WHERE id='key'",
+                [r#"{"team":42}"#],
+            )
+            .unwrap();
+    }
+    {
+        let s = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        assert!(s.get_key("key").is_err());
+        assert!(s.list_keys().is_err());
+        assert!(s.list_keys_since(0).is_err());
+        let raw: String = s
+            .lock_reader()
+            .query_row("SELECT labels FROM keys WHERE id='key'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, r#"{"team":42}"#);
+        s.lock_writer()
+            .execute(
+                "UPDATE keys SET labels=?1 WHERE id='key'",
+                [r#"{"team":"ops"}"#],
+            )
+            .unwrap();
+    }
+    let s = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(
+        s.get_key("key")
+            .unwrap()
+            .unwrap()
+            .labels
+            .get("team")
+            .map(String::as_str),
+        Some("ops")
+    );
+}
+
+#[test]
+fn historical_metering_attribution_survives_batch_replay_and_reopen() {
+    let dir = tempdir();
+    let path = dir.join("attribution.db");
+    let path = path.to_str().unwrap();
+    let s = SqliteStore::open(path, 5000).unwrap();
+    let bucket = u64::MAX;
+
+    let make = |group: &str, version: &str, n| MeteringDelta {
+        key_id: "history|key%".into(),
+        bucket,
+        model: "m|%".into(),
+        provider: "p".into(),
+        tokens_input: n,
+        tokens_output: n + 1,
+        tokens_cache_read: n + 2,
+        tokens_cache_write: n + 3,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: group.into(),
+        pricing_version: version.into(),
+        priced_from_ms: 17,
+        usage_units: [("tool_calls".into(), n + 4)].into_iter().collect(),
+    };
+    let cells = [
+        make("", "", 1),
+        make("a|%", "v", 10),
+        make("a", "|%v", 100),
+        make("a|%", "V", 1000),
+        make("a|%", "v", 10),
+    ];
+
+    let op = busbar_contract::abi::store::OpId::from_parts(81, 1);
+    s.v3_add_metering_batch(op, &cells).unwrap();
+    s.v3_add_metering_batch(op, &cells).unwrap();
+    let mut changed = cells.clone();
+    changed[0].pricing_version = "changed".into();
+    assert!(s.v3_add_metering_batch(op, &changed).is_err());
+    drop(s);
+    let s = SqliteStore::open(path, 5000).unwrap();
+
+    let mut rows = s.list_metering(bucket).unwrap();
+    rows.sort_by(|a, b| {
+        (&a.key_group_at_use, &a.pricing_version).cmp(&(&b.key_group_at_use, &b.pricing_version))
+    });
+    assert_eq!(
+        rows.len(),
+        4,
+        "each historical attribution owns its counts: {rows:?}"
+    );
+    for (group, version, n, repeats) in [
+        ("", "", 1, 1),
+        ("a", "|%v", 100, 1),
+        ("a|%", "V", 1000, 1),
+        ("a|%", "v", 10, 2),
+    ] {
+        let r = rows
+            .iter()
+            .find(|r| r.key_group_at_use == group && r.pricing_version == version)
+            .unwrap();
+        assert_eq!(
+            (
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_write
+            ),
+            (
+                n * repeats,
+                (n + 1) * repeats,
+                (n + 2) * repeats,
+                (n + 3) * repeats
+            )
+        );
+        assert_eq!((r.requests, r.billable_requests), (repeats, repeats));
+        assert_eq!(r.usage_units.get("tool_calls"), Some(&((n + 4) * repeats)));
+    }
+}
+
+/// A caller reaching its claimed expiry boundary cannot force store cleanup early.
+
+#[test]
+fn caller_expiry_boundary_does_not_evict_a_live_receipt() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let now = token_test_now();
+    let expires = now + 10;
+    assert!(s.redeem_plane_token("ask", "edge", expires, now).unwrap());
+    assert!(
+        !s.redeem_plane_token("ask", "edge", expires, expires)
+            .unwrap(),
+        "a caller claiming the expiry boundary must not evict a store-clock live receipt"
+    );
+}
+
+#[test]
+fn shared_clock_ignores_caller_skew_and_refuses_expired_grants_without_mutation() {
+    const TOKEN_KIND: &str = "shared-clock-regression";
+    const LIVE_TOKEN: &str = "live-winner";
+    const EXPIRED_TOKEN: &str = "expired-candidate";
+    const PAST_EPOCH: u64 = 1;
+    let dir = tempdir();
+    let file = dir.join("token-clock.db");
+    let path = file.to_str().unwrap();
+    let store = SqliteStore::open(path, 5000).unwrap();
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, PAST_EPOCH)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, FAST_CALLER)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, EXPIRED_TOKEN, PAST_EPOCH, 0)
+        .unwrap());
+    let row: Option<i64> = query_one(
+        &store.lock_reader(),
+        "SELECT expires_at FROM plane_tokens WHERE kind=?1 AND token=?2",
+        params![TOKEN_KIND, EXPIRED_TOKEN],
+        |r| r.get(0),
+    )
+    .unwrap();
+    assert_eq!(row, None, "expired input records no redemption");
+    drop(store);
+    let store = SqliteStore::open(path, 5000).unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, LIVE_TOKEN, u64::MAX, 0)
+        .unwrap());
+    let stored: i64 = store
+        .lock_reader()
+        .query_row(
+            "SELECT expires_at FROM plane_tokens WHERE kind=?1 AND token=?2",
+            params![TOKEN_KIND, LIVE_TOKEN],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, i64::MAX, "losing calls preserve the winning expiry");
+}
+
+#[test]
+fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows() {
+    const TOKEN_KIND: &str = "shared-clock-seeded";
+    const EXACT_EXPIRY: i64 = (1_i64 << 53) + 1;
+    let store = SqliteStore::open_in_memory().unwrap();
+    store.write(true,|tx| {
+        tx.execute("INSERT INTO plane_tokens(kind,token,expires_at) VALUES (?1,'future',?2),(?1,'lapsed',0)",params![TOKEN_KIND,EXACT_EXPIRY]).store()?;Ok(())
+    }).unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, "future", u64::MAX, FAST_CALLER)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, "lapsed", u64::MAX, 0)
+        .unwrap());
+    let expiry: i64 = store
+        .lock_reader()
+        .query_row(
+            "SELECT expires_at FROM plane_tokens WHERE kind=?1 AND token='future'",
+            [TOKEN_KIND],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(expiry, EXACT_EXPIRY);
+}
+
+/// Read the same local SQLite clock as redemption; fixture caller clocks may differ deliberately.
+fn token_test_now() -> u64 {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn ticket_expiry_records_survive_a_fast_purge_caller() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let now = token_test_now();
+    let live = "live-ticket".to_string();
+    let expired = "expired-ticket".to_string();
+
+    const TICKET_KIND: &str = "ticket";
+    const OTHER_KIND: &str = "ordinary-retention-regression";
+    const FUTURE_OFFSET: u64 = 900;
+    let future = now + FUTURE_OFFSET;
+    let row = |kind: &str, id: &str, ts| PlaneRecord {
+        kind: kind.into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition: if kind == TICKET_KIND {
+            PlaneDisposition::Terminal
+        } else {
+            PlaneDisposition::Active
+        },
+        body: id.as_bytes().to_vec(),
+    };
+    for (kind, id, ts) in [
+        (TICKET_KIND, live.as_str(), future),
+        (TICKET_KIND, expired.as_str(), 0),
+        (OTHER_KIND, live.as_str(), future),
+    ] {
+        store.upsert_plane_record(row(kind, id, ts).view()).unwrap();
+    }
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, 0, Retention::Age)
+            .unwrap(),
+        0,
+        "an exact cutoff retains equality"
+    );
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_plane_record(TICKET_KIND, &live).unwrap(),
+        Some(live.as_bytes().to_vec())
+    );
+    assert_eq!(store.get_plane_record(TICKET_KIND, &expired).unwrap(), None);
+    assert_eq!(
+        store
+            .purge_plane_records(OTHER_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1,
+        "ordinary record age policy is unchanged"
+    );
+    store.delete_plane_record(TICKET_KIND, &live).unwrap();
+}
+
+#[test]
+fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without_spending() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let now = token_test_now();
+    let token = "preflight-ticket".to_string();
+
+    const TICKET_KIND: &str = "ticket";
+    const LIVE_LIFE: u64 = 900;
+    let expires = now + LIVE_LIFE;
+    let record = |ts, disposition| PlaneRecord {
+        kind: TICKET_KIND.into(),
+        id: token.clone(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition,
+        body: b"ticket-preflight".to_vec(),
+    };
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    for caller in [FAST_CALLER, 0, FAST_CALLER] {
+        assert!(
+            store
+                .plane_token_live(TICKET_KIND, &token, expires, caller)
+                .unwrap(),
+            "shared clock validates a live terminal ticket"
+        );
+    }
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires + 1, 0)
+            .unwrap(),
+        "a different signed deadline must not match"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Active).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires, 0)
+            .unwrap(),
+        "ticket records are terminal"
+    );
+    let expired = now - 1;
+    store
+        .upsert_plane_record(record(expired, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expired, 0)
+            .unwrap(),
+        "slow callers cannot keep expired tickets live"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+    store.delete_plane_record(TICKET_KIND, &token).unwrap();
+    assert!(!store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+
+    let receipts: i64 = store
+        .lock_reader()
+        .query_row("SELECT COUNT(*) FROM plane_tokens", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(receipts, 0, "preflight is non-consuming");
+}
+
+// The public SQLite redemption API accepts caller timestamps through i64::MAX.
+// Keep regression skew within that precondition so failures expose expiry policy.
+const FAST_CALLER: u64 = i64::MAX as u64;

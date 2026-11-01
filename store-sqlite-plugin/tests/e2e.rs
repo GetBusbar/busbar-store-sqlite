@@ -1223,7 +1223,10 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         disposition,
         body: body(serde_json::json!({ "url": "https://example.test/cb" })),
     };
-    let now = 1_700_000_000u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
     {
         // BOOT 1 — a real dlopen; every call below crosses the C ABI.
