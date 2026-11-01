@@ -25,6 +25,7 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
+    (busbar_contract::abi::sdk::store::correction::CAPABILITY, busbar_contract::abi::sdk::store::correction::CAPABILITY_VALUE),
 ]);
 
 /// The most ops the host may have in flight against this store at once. Every slot answers Ready

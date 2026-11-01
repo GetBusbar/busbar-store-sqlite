@@ -39,7 +39,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-/// release ever wrote one. v6 -> v17 upgrades in place:
+/// release ever wrote one. v6 -> v18 upgrades in place:
 /// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
 ///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
 ///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
@@ -54,7 +54,9 @@ const TICKET_RECORD_KIND: &str = "ticket";
 ///
 /// v17 keys metering cells and their units by the recorded group and price version.
 /// A file stamped by a later build is refused.
-const SCHEMA_VERSION: i64 = 17;
+// v18 retains whole exact u64 raw rows beside the legacy signed-column mirror.
+// An older binary refuses the newer schema before reading a truncated mirror.
+const SCHEMA_VERSION: i64 = 18;
 
 macro_rules! unsigned_expiry_order {
     () => {
@@ -204,6 +206,15 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS um_key_bucket_idx ON usage_metering (key_id, bucket);
+
+-- Whole exact raw rows. The legacy INTEGER tables remain the low-count mirror; every writer
+-- replaces or updates this authority in the same transaction. No derived money is stored.
+CREATE TABLE IF NOT EXISTS usage_window_exact (
+    window_start INTEGER NOT NULL,
+    bucket_id TEXT NOT NULL,
+    ledger BLOB NOT NULL,
+    PRIMARY KEY (window_start, bucket_id)
+) STRICT, WITHOUT ROWID;
 
 -- The open usage units (every one the four reserved token columns do not hold), one row per unit
 -- so an accrual is an atomic `count = count + delta`.
@@ -1041,6 +1052,294 @@ fn put_key_inner(
 
 const CRED_SECRET_COLS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision,secret";
 
+fn refuse_reserved_usage(bucket: &str) -> RecordStoreResult<()> {
+    if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket) {
+        return Err(RecordStoreError(
+            "sqlite: reserved adjustment rows require atomic usage correction".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One raw row read under the caller's snapshot or writer transaction.
+fn usage_in(
+    conn: &Connection,
+    bucket_id: &str,
+    window_start: u64,
+) -> RecordStoreResult<UsageLedger> {
+    if let Some(bytes) = query_one(
+        conn,
+        "SELECT ledger FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
+        params![window_start as i64, bucket_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )? {
+        return serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()));
+    }
+    usage_columns_in(conn, bucket_id, window_start)
+}
+
+fn usage_columns_in(
+    conn: &Connection,
+    bucket_id: &str,
+    window_start: u64,
+) -> RecordStoreResult<UsageLedger> {
+    // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
+    // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
+    let (requests, billable_requests): (i64, i64) = query_one(
+            conn,
+            "SELECT requests, billable_requests FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model=''",
+            params![window_start as i64, bucket_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .unwrap_or((0, 0));
+    let ws = window_start as i64;
+    let at = params![ws, bucket_id];
+    let mut models = query_all(
+        conn,
+        "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+             FROM usage_windows WHERE window_start=?1 AND bucket_id=?2
+             AND (model != '' OR tokens_input != 0 OR tokens_output != 0
+                  OR tokens_cache_read != 0 OR tokens_cache_write != 0) ORDER BY model",
+        at,
+        |r| {
+            let mut units = BTreeMap::new();
+            for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
+                let v = column::read_u64(r.get(i + 1)?);
+                // A zero reads as absent, as `ModelTokens` itself reads an absent key.
+                if v != 0 {
+                    units.insert(unit.to_string(), v);
+                }
+            }
+            Ok(ModelTokens {
+                model: r.get(0)?,
+                usage_units: units,
+            })
+        },
+    )?;
+    let opens = query_all(
+        conn,
+        "SELECT model, unit, count FROM usage_window_units
+             WHERE window_start=?1 AND bucket_id=?2 ORDER BY model, unit",
+        at,
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                column::read_u64(r.get(2)?),
+            ))
+        },
+    )?;
+    for (model, unit, count) in opens {
+        // Sparse, as the reserved units are: a zero count reads as absent.
+        if count == 0 {
+            continue;
+        }
+        // An open-unit row is written beside its model's row, so the model is already listed;
+        // the fallback only keeps an out-of-band edit readable.
+        let at = match models.iter().position(|m| m.model == model) {
+            Some(at) => at,
+            None => {
+                models.push(ModelTokens {
+                    model,
+                    ..Default::default()
+                });
+                models.len() - 1
+            }
+        };
+        models[at].usage_units.insert(unit, count);
+    }
+    Ok(UsageLedger {
+        requests: column::read_u64(requests),
+        billable_requests: column::read_u64(billable_requests),
+        models,
+    })
+}
+
+fn insert_usage_in(
+    tx: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> RecordStoreResult<()> {
+    if exec(tx, sql, params)? != 1 {
+        return Err(RecordStoreError(
+            "sqlite: raw usage row was not inserted".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Replace both the signed-column mirror and the exact raw ledger under one writer authority.
+fn put_usage_in(
+    tx: &Connection,
+    bucket_id: &str,
+    window_start: u64,
+    ledger: &UsageLedger,
+) -> RecordStoreResult<()> {
+    for table in ["usage_windows", "usage_window_units", "usage_window_exact"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE window_start=?1 AND bucket_id=?2"),
+            params![window_start as i64, bucket_id],
+        )
+        .store()?;
+    }
+    // The counts ALWAYS live on the `model=''` sentinel row; per-model rows carry tokens only.
+    insert_usage_in(tx,
+                "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
+                params![
+                    window_start as i64,
+                    bucket_id,
+                    column::clamp(ledger.requests),
+                    column::clamp(ledger.billable_requests)
+                ],
+            )?;
+    for m in ledger.models.iter().filter(|model| !model.model.is_empty()) {
+        insert_usage_in(tx,
+                    "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
+                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                     VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
+                    params![
+                        window_start as i64, bucket_id, m.model,
+                        column::clamp(m.tier(UNIT_INPUT)),
+                        column::clamp(m.tier(UNIT_OUTPUT)),
+                        column::clamp(m.tier(UNIT_CACHE_READ)),
+                        column::clamp(m.tier(UNIT_CACHE_WRITE)),
+                    ],
+                )?;
+        for (unit, count) in open_units(&m.usage_units) {
+            insert_usage_in(
+                tx,
+                "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
+                         VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    window_start as i64,
+                    bucket_id,
+                    m.model,
+                    unit,
+                    column::clamp(*count)
+                ],
+            )?;
+        }
+    }
+    let bytes = serde_json::to_vec(ledger).map_err(|error| RecordStoreError(error.to_string()))?;
+    let changed = exec(
+        tx,
+        "INSERT INTO usage_window_exact(window_start,bucket_id,ledger) VALUES (?1,?2,?3)",
+        params![window_start as i64, bucket_id, bytes],
+    )?;
+    if changed != 1 {
+        return Err(RecordStoreError(
+            "sqlite: exact raw usage row was not inserted".into(),
+        ));
+    }
+    verify_usage_in(tx, bucket_id, window_start, ledger)
+}
+
+/// Verify again after every row has been replaced: later SQL triggers may affect earlier rows.
+fn verify_usage_in(
+    tx: &Connection,
+    bucket_id: &str,
+    window_start: u64,
+    ledger: &UsageLedger,
+) -> RecordStoreResult<()> {
+    let expected =
+        serde_json::to_vec(ledger).map_err(|error| RecordStoreError(error.to_string()))?;
+    let exact: Option<Vec<u8>> = query_one(
+        tx,
+        "SELECT ledger FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
+        params![window_start as i64, bucket_id],
+        |row| row.get(0),
+    )?;
+    let mut mirror = ledger.clone();
+    mirror.requests = column::clamp(mirror.requests) as u64;
+    mirror.billable_requests = column::clamp(mirror.billable_requests) as u64;
+    mirror.models.retain(|model| !model.model.is_empty());
+    mirror
+        .models
+        .sort_by(|left, right| left.model.cmp(&right.model));
+    for model in &mut mirror.models {
+        for count in model.usage_units.values_mut() {
+            *count = column::clamp(*count) as u64;
+        }
+        model.usage_units.retain(|_, count| *count != 0);
+    }
+    if exact.as_ref() != Some(&expected) || usage_columns_in(tx, bucket_id, window_start)? != mirror
+    {
+        return Err(RecordStoreError(
+            "sqlite: exact raw usage replacement was not applied".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Complete day selection read under the caller's snapshot, including every C4 attribution field.
+fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
+    let u = column::read_u64;
+    let mut rows = query_all(
+        conn,
+        "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read,
+                tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version,
+                priced_from_ms
+             FROM usage_metering WHERE bucket = ?1",
+        // Match the legacy writer's signed bit-pattern key, including existing high-u64 rows.
+        params![(bucket as i64).to_string()],
+        |r| {
+            Ok(MeteringRow {
+                key_id: r.get(0)?,
+                model: r.get(1)?,
+                provider: r.get(2)?,
+                tokens_input: u(r.get(3)?),
+                tokens_output: u(r.get(4)?),
+                tokens_cache_read: u(r.get(5)?),
+                tokens_cache_write: u(r.get(6)?),
+                requests: u(r.get(7)?),
+                billable_requests: u(r.get(8)?),
+                key_group_at_use: r.get(9)?,
+                pricing_version: r.get(10)?,
+                priced_from_ms: u(r.get(11)?),
+                usage_units: Default::default(),
+            })
+        },
+    )?;
+    let units = query_all(
+            conn,
+            "SELECT key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count
+             FROM usage_metering_units WHERE bucket = ?1",
+            params![(bucket as i64).to_string()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    u(r.get(3)?),
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    u(r.get(7)?),
+                ))
+            },
+        )?;
+    let mut index: std::collections::HashMap<(String, String, String, u64, String, String), usize> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (i, m) in rows.iter().enumerate() {
+        index
+            .entry((
+                m.key_id.clone(),
+                m.provider.clone(),
+                m.model.clone(),
+                m.priced_from_ms,
+                m.key_group_at_use.clone(),
+                m.pricing_version.clone(),
+            ))
+            .or_insert(i);
+    }
+    for (key_id, provider, model, priced_from_ms, group, version, unit, count) in units {
+        if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms, group, version)) {
+            rows[i].usage_units.insert(unit, count);
+        }
+    }
+    Ok(rows)
+}
+
 /// [`RecordStore::add_usage`]'s writes, inside the caller's transaction (the trait method's own, or
 /// a store v3 slot's, where the `op_id` record shares it).
 fn add_usage_in(
@@ -1049,6 +1348,52 @@ fn add_usage_in(
     window_start: u64,
     delta: &UsageDelta,
 ) -> RecordStoreResult<()> {
+    refuse_reserved_usage(bucket_id)?;
+    let exact: Option<bool> = query_one(
+        tx,
+        "SELECT EXISTS(SELECT 1 FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2)",
+        params![window_start as i64, bucket_id],
+        |row| row.get(0),
+    )?;
+    // An empty model is opaque data. The legacy columns reserve its row for request totals;
+    // the exact whole row keeps both meanings without aliasing its unit counts to that sentinel.
+    if exact == Some(true) || delta.models.iter().any(|model| model.model.is_empty()) {
+        let mut ledger = usage_in(tx, bucket_id, window_start)?;
+        ledger.requests = ledger.requests.saturating_add_signed(delta.requests);
+        ledger.billable_requests = ledger
+            .billable_requests
+            .saturating_add_signed(delta.billable_requests);
+        for change in &delta.models {
+            let index = match ledger
+                .models
+                .iter()
+                .position(|model| model.model == change.model)
+            {
+                Some(index) => index,
+                None => {
+                    ledger.models.push(ModelTokens {
+                        model: change.model.clone(),
+                        ..Default::default()
+                    });
+                    ledger.models.len() - 1
+                }
+            };
+            for (unit, amount) in &change.usage_units {
+                let count = ledger.models[index]
+                    .usage_units
+                    .entry(unit.clone())
+                    .or_default();
+                *count = count.saturating_add_signed(*amount);
+            }
+            ledger.models[index]
+                .usage_units
+                .retain(|_, count| *count != 0);
+        }
+        ledger
+            .models
+            .sort_by(|left, right| left.model.cmp(&right.model));
+        return put_usage_in(tx, bucket_id, window_start, &ledger);
+    }
     // `requests` / `billable_requests` accumulate unconditionally on the `model=''` sentinel row,
     // whether or not the delta reached any model (a rejected request adds to `requests` alone).
     // `prepare_cached`: this fires once per admitted request, the hottest write path in the crate.
@@ -1246,6 +1591,23 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
 }
 
 impl RecordStore for SqliteStore {
+    fn apply_usage_correction(
+        &self,
+        request: &busbar_contract::abi::sdk::store::correction::Request,
+    ) -> RecordStoreResult<busbar_contract::abi::sdk::store::correction::Decision> {
+        self.v3_apply_usage_correction(request).map_err(|error| {
+            use busbar_contract::abi::sdk::store::OpRefused;
+            RecordStoreError(match error {
+                OpRefused::Conflict => "usage correction operation id conflict".into(),
+                OpRefused::Refused(reason) | OpRefused::Failed(reason) => reason,
+            })
+        })
+    }
+
+    fn supports_usage_correction(&self) -> bool {
+        true
+    }
+
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
@@ -1464,76 +1826,8 @@ impl RecordStore for SqliteStore {
 
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let conn = self.lock_reader();
-        // One deferred read transaction: every SELECT sees the same WAL snapshot (rolled back on drop).
         let _snapshot = conn.unchecked_transaction().store()?;
-        // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
-        // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
-        let (requests, billable_requests): (i64, i64) = query_one(
-            &conn,
-            "SELECT requests, billable_requests FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model=''",
-            params![window_start as i64, bucket_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?
-        .unwrap_or((0, 0));
-        let ws = window_start as i64;
-        let at = params![ws, bucket_id];
-        let mut models = query_all(
-            &conn,
-            "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
-             FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model != '' ORDER BY model",
-            at,
-            |r| {
-                let mut units = BTreeMap::new();
-                for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                    let v = column::read_u64(r.get(i + 1)?);
-                    // A zero reads as absent, as `ModelTokens` itself reads an absent key.
-                    if v != 0 {
-                        units.insert(unit.to_string(), v);
-                    }
-                }
-                Ok(ModelTokens {
-                    model: r.get(0)?,
-                    usage_units: units,
-                })
-            },
-        )?;
-        let opens = query_all(
-            &conn,
-            "SELECT model, unit, count FROM usage_window_units
-             WHERE window_start=?1 AND bucket_id=?2 ORDER BY model, unit",
-            at,
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    column::read_u64(r.get(2)?),
-                ))
-            },
-        )?;
-        for (model, unit, count) in opens {
-            // Sparse, as the reserved units are: a zero count reads as absent.
-            if count == 0 {
-                continue;
-            }
-            // An open-unit row is written beside its model's row, so the model is already listed;
-            // the fallback only keeps an out-of-band edit readable.
-            let at = match models.iter().position(|m| m.model == model) {
-                Some(at) => at,
-                None => {
-                    models.push(ModelTokens {
-                        model,
-                        ..Default::default()
-                    });
-                    models.len() - 1
-                }
-            };
-            models[at].usage_units.insert(unit, count);
-        }
-        Ok(UsageLedger {
-            requests: column::read_u64(requests),
-            billable_requests: column::read_u64(billable_requests),
-            models,
-        })
+        usage_in(&conn, bucket_id, window_start)
     }
 
     fn put_usage(
@@ -1542,48 +1836,9 @@ impl RecordStore for SqliteStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
+        refuse_reserved_usage(bucket_id)?;
         self.write(false, |tx| {
-            for table in ["usage_windows", "usage_window_units"] {
-                tx.execute(
-                    &format!("DELETE FROM {table} WHERE window_start=?1 AND bucket_id=?2"),
-                    params![window_start as i64, bucket_id],
-                )
-                .store()?;
-            }
-            // The counts ALWAYS live on the `model=''` sentinel row; per-model rows carry tokens only.
-            tx.execute(
-                "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
-                params![
-                    window_start as i64,
-                    bucket_id,
-                    column::clamp(ledger.requests),
-                    column::clamp(ledger.billable_requests)
-                ],
-            )
-            .store()?;
-            for m in &ledger.models {
-                tx.execute(
-                    "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
-                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                     VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
-                    params![
-                        window_start as i64, bucket_id, m.model,
-                        column::clamp(m.tier(UNIT_INPUT)),
-                        column::clamp(m.tier(UNIT_OUTPUT)),
-                        column::clamp(m.tier(UNIT_CACHE_READ)),
-                        column::clamp(m.tier(UNIT_CACHE_WRITE)),
-                    ],
-                ).store()?;
-                for (unit, count) in open_units(&m.usage_units) {
-                    tx.execute(
-                        "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
-                         VALUES (?1,?2,?3,?4,?5)",
-                        params![window_start as i64, bucket_id, m.model, unit, column::clamp(*count)],
-                    )
-                    .store()?;
-                }
-            }
-            Ok(())
+            put_usage_in(tx, bucket_id, window_start, ledger)
         })
     }
 
@@ -1603,74 +1858,7 @@ impl RecordStore for SqliteStore {
     fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let conn = self.lock_reader();
         let _snapshot = conn.unchecked_transaction().store()?;
-        let u = column::read_u64;
-        let mut rows = query_all(
-            &conn,
-            "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read,
-                tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version,
-                priced_from_ms
-             FROM usage_metering WHERE bucket = ?1",
-            // Match the legacy writer's signed bit-pattern key, including existing high-u64 rows.
-            params![(bucket as i64).to_string()],
-            |r| {
-                Ok(MeteringRow {
-                    key_id: r.get(0)?,
-                    model: r.get(1)?,
-                    provider: r.get(2)?,
-                    tokens_input: u(r.get(3)?),
-                    tokens_output: u(r.get(4)?),
-                    tokens_cache_read: u(r.get(5)?),
-                    tokens_cache_write: u(r.get(6)?),
-                    requests: u(r.get(7)?),
-                    billable_requests: u(r.get(8)?),
-                    key_group_at_use: r.get(9)?,
-                    pricing_version: r.get(10)?,
-                    priced_from_ms: u(r.get(11)?),
-                    usage_units: Default::default(),
-                })
-            },
-        )?;
-        let units = query_all(
-            &conn,
-            "SELECT key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count
-             FROM usage_metering_units WHERE bucket = ?1",
-            params![(bucket as i64).to_string()],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    u(r.get(3)?),
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    u(r.get(7)?),
-                ))
-            },
-        )?;
-        let mut index: std::collections::HashMap<
-            (String, String, String, u64, String, String),
-            usize,
-        > = std::collections::HashMap::with_capacity(rows.len());
-        for (i, m) in rows.iter().enumerate() {
-            index
-                .entry((
-                    m.key_id.clone(),
-                    m.provider.clone(),
-                    m.model.clone(),
-                    m.priced_from_ms,
-                    m.key_group_at_use.clone(),
-                    m.pricing_version.clone(),
-                ))
-                .or_insert(i);
-        }
-        for (key_id, provider, model, priced_from_ms, group, version, unit, count) in units {
-            if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms, group, version))
-            {
-                rows[i].usage_units.insert(unit, count);
-            }
-        }
-        Ok(rows)
+        metering_in(&conn, bucket)
     }
 
     /// FULL sync: a hard crash must lose ~0 entries, which `synchronous=NORMAL` does not give under WAL.

@@ -14,6 +14,7 @@
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::conditional::{Decision, Expected, Mutation, Request};
+use busbar_contract::abi::sdk::store::correction;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -27,8 +28,8 @@ use rusqlite::{params, Transaction};
 use std::sync::atomic::Ordering;
 
 use crate::{
-    add_metering_in, add_usage_in, append_plane_record_in, exec, now_secs, query_all, query_one,
-    SqliteStore,
+    add_metering_in, add_usage_in, append_plane_record_in, exec, metering_in, now_secs,
+    put_usage_in, query_all, query_one, usage_in, verify_usage_in, SqliteStore,
 };
 
 fn failed(e: RecordStoreError) -> OpRefused {
@@ -353,13 +354,14 @@ impl SqliteStore {
             let count: Option<i64> = query_one(
                 tx,
                 &format!(
-                    "SELECT count(*) FROM (SELECT DISTINCT window_start, bucket_id \
-                    FROM usage_windows WHERE {OLD})"
+                    "SELECT count(*) FROM (SELECT window_start, bucket_id \
+                    FROM usage_windows WHERE {OLD} UNION SELECT window_start, bucket_id \
+                    FROM usage_window_exact WHERE {OLD})"
                 ),
                 params![before as i64],
                 |r| r.get(0),
             )?;
-            for table in ["usage_windows", "usage_window_units"] {
+            for table in ["usage_windows", "usage_window_units", "usage_window_exact"] {
                 exec(
                     tx,
                     &format!("DELETE FROM {table} WHERE {OLD}"),
@@ -375,11 +377,89 @@ impl SqliteStore {
         op: OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> OpResult<()> {
-        self.op(op, Dedupe::usage(cells), |tx| {
+        let mut reserved = false;
+        let result = self.op(op, Dedupe::usage(cells), |tx| {
+            // Receipt replay runs first; a previously applied legacy adjustment remains replayable.
+            if cells
+                .iter()
+                .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
+            {
+                reserved = true;
+                return Err(RecordStoreError(
+                    "reserved adjustment rows require atomic usage correction".into(),
+                ));
+            }
             cells
                 .iter()
                 .try_for_each(|(bucket, window, delta)| add_usage_in(tx, bucket, *window, delta))
-        })
+        });
+        if reserved {
+            Err(OpRefused::Refused(
+                "reserved adjustment rows require atomic usage correction".into(),
+            ))
+        } else {
+            result
+        }
+    }
+
+    /// One serialized pre-state and one FULL-sync commit for all rows and the applied receipt.
+    /// A lost commit answer is Failed: retain the immutable request and replay its id/body.
+    pub(crate) fn v3_apply_usage_correction(
+        &self,
+        request: &correction::Request,
+    ) -> OpResult<correction::Decision> {
+        request
+            .validate()
+            .map_err(|reason| OpRefused::Refused(reason.into()))?;
+        let mut conflict = false;
+        let result = self.op(request.op_id, Dedupe::usage_correction(request), |tx| {
+            let live = query_one(
+                tx,
+                "SELECT EXISTS(SELECT 1 FROM keys WHERE id=?1 AND deleted_at IS NULL)",
+                params![request.key_id],
+                |row| row.get::<_, bool>(0),
+            )?
+            .unwrap_or(false);
+            let mut metering = metering_in(tx, request.day_start)?;
+            metering.retain(|row| row.key_id == request.key_id);
+            correction::canonical_metering(&mut metering);
+            let mut matches = live && metering == request.metering;
+            for change in &request.usage {
+                let mut actual =
+                    usage_in(tx, &change.address.bucket_id, change.address.window_start)?;
+                correction::canonical_ledger(&mut actual)
+                    .map_err(|reason| RecordStoreError(reason.into()))?;
+                matches &= actual == change.expected;
+            }
+            if !matches {
+                conflict = true;
+                return Err(RecordStoreError(
+                    "usage correction condition conflict".into(),
+                ));
+            }
+            for change in &request.usage {
+                put_usage_in(
+                    tx,
+                    &change.address.bucket_id,
+                    change.address.window_start,
+                    &change.replacement,
+                )?;
+            }
+            for change in &request.usage {
+                verify_usage_in(
+                    tx,
+                    &change.address.bucket_id,
+                    change.address.window_start,
+                    &change.replacement,
+                )?;
+            }
+            Ok(())
+        });
+        if conflict {
+            Ok(correction::Decision::ConditionConflict)
+        } else {
+            result.map(|()| correction::Decision::Applied)
+        }
     }
 
     pub(crate) fn v3_add_metering_batch(&self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
@@ -405,6 +485,7 @@ macro_rules! ready {
 /// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const RECORD_TRANSACTION: bool = true;
+    const USAGE_CORRECTION: bool = true;
 
     const TAIL: Tail = Tail {
         ephemeral: false,
@@ -421,6 +502,7 @@ impl StoreSlots for SqliteStore {
     }
 
     ready! {
+        apply_usage_correction => Self::v3_apply_usage_correction(request: &correction::Request) -> OpResult<correction::Decision>;
         record_transaction => Self::v3_record_transaction(request: &Request) -> OpResult<Decision>;
         append_plane_record_op => Self::v3_append_plane_record_op(op: OpId, record: PlaneRecordRef<'_>) -> OpResult<()>;
         record_put => Self::v3_record_put(schema: &str, key: &[u8], value: &[u8]) -> Result<(), String>;
@@ -477,3 +559,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/conditional_records.rs"]
 mod conditional_tests;
+
+#[cfg(test)]
+#[path = "tests/usage_correction.rs"]
+mod correction_tests;
