@@ -1507,6 +1507,11 @@ fn unique_suffix() -> u64 {
 /// longer reaches this backend on a dependency bump, it has to be written in here by hand.
 mod store_conformance;
 
+#[path = "tests/credential_timestamps.rs"]
+mod credential_timestamps;
+#[path = "tests/key_timestamps.rs"]
+mod key_timestamps;
+
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
 /// carries, including the 1.6.0 credential-ownership, atomic-mint and plane-record rulings.
 mod conformance {
@@ -3972,7 +3977,7 @@ fn a_v13_database_upgrades_its_credentials_table_losslessly() {
         .lock_writer()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 14);
+    assert_eq!(v, SCHEMA_VERSION);
     assert_schema_matches_a_fresh_one(&s, &[]);
     s.revoke_credential("cred_AKIA_A0", "rotated").unwrap();
     let a0 = s
