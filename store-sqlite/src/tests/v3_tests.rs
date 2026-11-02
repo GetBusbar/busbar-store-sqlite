@@ -66,7 +66,7 @@ fn a_replayed_usage_batch_applies_once() {
 fn direct_provided_id_batch_replays_a_lost_answer_after_reopen_and_conflicts_without_effects() {
     let (store, path, _dir) = on_file("direct-provided-id-batch");
     let cells = [("k", 60, delta(7, 11))];
-    let _lost_answer = RecordStore::add_usage_batch_deduped(&store, op(1), &cells).unwrap();
+    RecordStore::add_usage_batch_deduped(&store, op(1), &cells).unwrap();
     let committed = RecordStore::get_usage(&store, "k", 60).unwrap();
     assert_eq!(
         (
