@@ -445,6 +445,11 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     // FILE-DROP: the real boot-time discovery mechanism extracts/reads whatever is in plugins.dir --
     // dropping the packed tarball here, uninstalled via any admin call, is the documented mechanism.
     std::fs::copy(&tarball, plugins_dir.join("store-sqlite.tar.gz")).unwrap();
+    // The operator's base config must authorize the exact native archive before its Store is
+    // available. The matching retained file is cached, so this pin does not require a download.
+    let archive_pin = busbar_contract::redacted::sha256_hex(
+        &std::fs::read(plugins_dir.join("store-sqlite.tar.gz")).unwrap(),
+    );
 
     let config = work.join("config.yaml");
     let providers = work.join("providers.yaml");
@@ -462,7 +467,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
     let config_text = format!(
         "listen: \"{data_addr}\"\n\
          store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n\
-         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         plugins:\n  enabled: true\n  dir: {}\n  fetch:\n    - url: \"https://plugins.example/store-sqlite.tar.gz\"\n      sha256: \"{archive_pin}\"\n  trust:\n    allow_unsigned: true\n\
          auth:\n  chain: []\n\
          providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
          models:\n  test-model:\n    provider: mock\n",
@@ -712,18 +717,25 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     )
     .unwrap();
 
-    // Shared config skeleton for both boots: only `store:` differs between the two.
+    // Boot 1 uses linked memory and must not fetch the not-yet-installed archive. Boot 2 adds
+    // its operator base pin only after the real admin install's exact bytes have been witnessed.
     let write_config = |path: &std::path::Path,
                         data_port: u16,
                         admin_port: u16,
-                        store_yaml: &str| {
+                        store_yaml: &str,
+                        archive: Option<(&str, &str)>| {
+        let fetch_yaml = archive.map_or_else(String::new, |(file, pin)| {
+            format!(
+                "  fetch:\n    - url: \"https://plugins.example/{file}\"\n      sha256: \"{pin}\"\n"
+            )
+        });
         std::fs::write(
             path,
             format!(
                 "listen: \"127.0.0.1:{data_port}\"\n\
                  admin_listen: \"127.0.0.1:{admin_port}\"\n\
                  {store_yaml}\n\
-                 plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+                 plugins:\n  enabled: true\n  dir: {}\n{fetch_yaml}  trust:\n    allow_unsigned: true\n\
                  identity-providers:\n  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
                  auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
              credentials:\n  at_rest:\n    key: {{ env: BUSBAR_SIGNING_KEY }}\n\
@@ -748,6 +760,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         data_addr1.port(),
         admin_addr1.port(),
         "store:\n  module: memory\n",
+        None,
     );
     let admin_addr1 = admin_addr1.to_string();
     drop(listeners1);
@@ -796,6 +809,12 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
         plugins_dir.join(file).exists(),
         "the admin API install must have written the tarball to the real plugins dir"
     );
+    let retained = std::fs::read(plugins_dir.join(file)).expect("read the admin-installed archive");
+    assert_eq!(
+        retained, tarball,
+        "the admin install must retain the exact uploaded archive bytes"
+    );
+    let archive_pin = busbar_contract::redacted::sha256_hex(&retained);
 
     // Confirm the catalog reports it too (not just the install response).
     let catalog: serde_json::Value = client
@@ -834,6 +853,7 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
             "store:\n  module: sqlite\n  settings: {{ db_path: \"{}\" }}\n",
             db_path.display()
         ),
+        Some((file, &archive_pin)),
     );
     let admin_addr2 = admin_addr2.to_string();
     drop(listeners2);
