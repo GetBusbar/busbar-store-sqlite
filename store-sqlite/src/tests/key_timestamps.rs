@@ -256,7 +256,7 @@ fn legacy_unsigned_keys_preserve_every_row_revision_and_external_guard() {
         let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
         assert_eq!(
             snapshot(&path).0,
-            16,
+            SCHEMA_VERSION,
             "v15 readers must refuse the repaired schema"
         );
         assert_eq!(
