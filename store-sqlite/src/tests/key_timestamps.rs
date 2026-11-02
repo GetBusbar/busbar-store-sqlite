@@ -106,17 +106,29 @@ const LEGACY_KEYS: &str = "CREATE TABLE keys_legacy (
  expires_at INTEGER,
  deleted_at INTEGER,
  revision INTEGER NOT NULL DEFAULT 0,
- CONSTRAINT keys_enabled_bool CHECK (enabled IN (0,1)),
- CONSTRAINT keys_pools_json CHECK (allowed_pools IS NULL OR (json_valid(allowed_pools) AND json_type(allowed_pools)='array')),
- CONSTRAINT keys_labels_json CHECK (json_valid(labels) AND json_type(labels)='object' AND length(labels)<=4096),
- CONSTRAINT keys_tombstone_off CHECK (deleted_at IS NULL OR enabled=0),
- CONSTRAINT keys_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at),
  scope_grants TEXT CONSTRAINT keys_scope_grants_json CHECK (scope_grants IS NULL OR (json_valid(scope_grants) AND json_type(scope_grants)='object')),
  idp_subject TEXT,
  binding_mode TEXT,
  minted_by TEXT,
- idp_provider TEXT
+ idp_provider TEXT,
+ CONSTRAINT keys_enabled_bool CHECK (enabled IN (0,1)),
+ CONSTRAINT keys_pools_json CHECK (allowed_pools IS NULL OR (json_valid(allowed_pools) AND json_type(allowed_pools)='array')),
+ CONSTRAINT keys_labels_json CHECK (json_valid(labels) AND json_type(labels)='object' AND length(labels)<=4096),
+ CONSTRAINT keys_tombstone_off CHECK (deleted_at IS NULL OR enabled=0),
+ CONSTRAINT keys_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)
 ) STRICT;";
+
+fn disable_fixture_foreign_keys(conn: &Connection) {
+    assert!(
+        conn.is_autocommit(),
+        "fixture FK policy must be set before a transaction"
+    );
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    let enabled: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(enabled, 0, "the legacy fixture must not execute FK actions");
+}
 
 fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
     let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
@@ -149,6 +161,13 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
         .unwrap();
     drop(store);
     let conn = Connection::open(path).unwrap();
+    // The bundled SQLite enables FKs by default. This fixture replaces the parent table to
+    // reconstruct released DDL; it must retain the children that the real migration will judge.
+    disable_fixture_foreign_keys(&conn);
+    let credentials_before: i64 = conn
+        .query_row("SELECT count(*) FROM credentials", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(credentials_before as usize, times.len());
     conn.execute_batch(LEGACY_KEYS).unwrap();
     conn.execute_batch(
         "INSERT INTO keys_legacy SELECT * FROM keys;
@@ -156,6 +175,13 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
          ALTER TABLE keys_legacy RENAME TO keys;",
     )
     .unwrap();
+    let credentials_after: i64 = conn
+        .query_row("SELECT count(*) FROM credentials", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        credentials_after, credentials_before,
+        "legacy fixture setup must preserve every child credential"
+    );
     // Both unsigned-valid cross-sign imports and the old CHECK's signed-only valid rows are
     // deliberate migration inputs. No production admission rule is disabled by this fixture.
     conn.pragma_update(None, "ignore_check_constraints", true)
@@ -368,8 +394,14 @@ fn an_orphan_legacy_credential_refuses_parent_rebuild_atomically() {
     let path = dir.join("orphan.db");
     legacy_file(&path, 15, &[(0, None)]);
     let conn = Connection::open(&path).unwrap();
-    conn.execute("UPDATE credentials SET key_id='missing-owner'", [])
-        .unwrap();
+    // Deliberately corrupt a real legacy child so startup's foreign_key_check must refuse it.
+    disable_fixture_foreign_keys(&conn);
+    assert_eq!(
+        conn.execute("UPDATE credentials SET key_id='missing-owner'", [])
+            .unwrap(),
+        1,
+        "the orphan fixture must corrupt one existing credential"
+    );
     drop(conn);
     let before = snapshot(&path);
     let error = match SqliteStore::open(path.to_str().unwrap(), 5000) {
