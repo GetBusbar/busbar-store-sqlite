@@ -28,13 +28,6 @@ use busbar_store_sqlite::door::MACRO_DOOR;
 #[path = "support/credential_rewrap.rs"]
 mod credential_rewrap;
 
-busbar_test_kit::conformance_suite! {
-    door: busbar_store_sqlite::door::MACRO_DOOR,
-    cdylib: "busbar_store_sqlite_plugin",
-    inputs: include_str!("conformance.json"),
-    newer_schema: stamp_newer_schema,
-}
-
 fn stamp_newer_schema(_: &str, settings: &[u8]) {
     let settings: serde_json::Value = serde_json::from_slice(settings).unwrap();
     let path = settings["db_path"].as_str().expect("SQLite file path");
@@ -42,20 +35,29 @@ fn stamp_newer_schema(_: &str, settings: &[u8]) {
     conn.pragma_update(None, "user_version", i32::MAX).unwrap();
 }
 
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
+/// CI builds this exact package immediately before running these tests. An explicit artifact
+/// path supports isolated build lanes; absence is always a hard failure.
 fn cdylib() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
+    if let Some(path) = std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+        assert!(path.is_file(), "missing SQLite cdylib: {}", path.display());
+        return path;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
     let profile = exe
         .parent()
         .and_then(|d| d.parent())
-        .expect("target/<profile>");
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
-    [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-store-sqlite-plugin cdylib ({file}) is not built"))
+        .expect("target/profile");
+    let path = profile.join(busbar_plugin_loader::plugin_library_filename(
+        "busbar_store_sqlite_plugin",
+    ));
+    assert!(
+        path.is_file(),
+        "build busbar-store-sqlite-plugin --lib before testing: {}",
+        path.display()
+    );
+    path
 }
 
 /// Which door a handle came in by.
@@ -684,4 +686,81 @@ fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
         close(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[test]
+fn a_store_refuses_a_schema_newer_than_its_build() {
+    for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
+        let dir = scratch(&format!("newer-schema-{tag}"));
+        let cfg = serde_json::json!({"db_path": dir.join("store.db")}).to_string();
+        close(open(by, &cfg).expect("own schema opens"));
+        stamp_newer_schema("", cfg.as_bytes());
+        match open(by, &cfg) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(e) => assert!(!e.is_empty(), "the refusal states why"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[path = "support/store_behavior.rs"]
+mod store_behavior;
+
+#[test]
+fn every_store_operation_has_the_same_product_behavior_through_both_doors() {
+    assert_eq!(
+        store_behavior::behavior(Door::Linked, "all-operations-linked"),
+        store_behavior::behavior(Door::Dropped, "all-operations-dropped")
+    );
+}
+
+#[path = "support/loader_refusals.rs"]
+mod loader_refusals;
+
+#[test]
+fn the_declared_needs_are_the_statements() {
+    let rendering = rendering_of_macro(MACRO_DOOR).unwrap();
+    let statement = busbar_contract::abi::mechanism::rendering::read(&rendering).unwrap();
+    let declares: serde_json::Value =
+        serde_json::from_str(include_str!("../../store-sqlite/declares.json")).unwrap();
+    let mut declared: Vec<String> = match declares.get("needs") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .expect("needs is an array")
+            .iter()
+            .map(|v| v.as_str().expect("scheme is string").to_string())
+            .collect(),
+    };
+    let mut actual: Vec<_> = statement
+        .needs
+        .iter()
+        .filter(|n| !n.transport.is_empty())
+        .map(|n| n.transport.clone())
+        .collect();
+    declared.sort();
+    declared.dedup();
+    actual.sort();
+    actual.dedup();
+    assert_eq!(declared, actual);
+}
+
+#[test]
+fn the_suite_runs_in_the_profile_it_was_asked_to() {
+    assert!(
+        !(cfg!(debug_assertions) && std::env::var_os("BUSBAR_EXPECT_RELEASE").is_some()),
+        "BUSBAR_EXPECT_RELEASE is set: run conformance with --release"
+    );
+}
+
+#[test]
+fn the_dropped_store_has_a_distinct_door_and_operation_table() {
+    let (door, ops) = busbar_plugin_loader::dispatch::load::door_addresses_of_library(&cdylib())
+        .expect("the image loads")
+        .expect("exports a door");
+    let linked = busbar_store_sqlite::door::door();
+    // SAFETY: this macro-produced static door owns its complete immutable table.
+    let parts = unsafe { busbar_contract::abi::mechanism::door::Door::read_parts(linked) };
+    assert_ne!(door, linked as *const _ as usize);
+    assert_ne!(ops, parts.ops as usize);
 }

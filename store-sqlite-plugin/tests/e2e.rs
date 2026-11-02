@@ -154,63 +154,39 @@ fn newest_source_mtime() -> std::time::SystemTime {
     newest
 }
 
-/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
-///
-/// This looks in `target/<profile>/deps/`, NOT `target/<profile>/`, and that distinction is the
-/// whole point of this function.
-///
-/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
-/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
-/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml — so `deps/libbusbar_store_sqlite_plugin.dylib`
-/// is by construction up to date with the source tree being tested). It only *uplifts* a copy to
-/// `target/<profile>/` for `cargo build`, NEVER for `cargo test`. So the old lookup in
-/// `target/<profile>/` read an artifact that nothing in the test's dependency graph ever refreshes:
-/// whatever some earlier `cargo build` happened to leave there, from any commit, or nothing at all.
-///
-/// Both failure modes of that are lies about durability, and the second is the dangerous one:
-///   * NOTHING there  -> the test used to `return` with a "skip:" line and report GREEN, which is
-///     how `cargo test --workspace` on a fresh clone reported success with ZERO over-the-ABI
-///     coverage of the ten task/call-log methods.
-///   * STALE artifact -> a cdylib older than the ABI relay answers every write `Ok(())` and every
-///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl RecordStore` overrode 24 methods, none
-///     of them task methods, so `put_task` took the accept-and-keep-nothing trait default). RED on
-///     a stale artifact is indistinguishable from RED on the real bug; and an artifact that happens
-///     to be NEWER than a regression reports GREEN while the shipped ABI is broken.
-///
-/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
-/// `busbar-store-example-plugin`: put the cdylib in the graph so the test cannot judge a stale one.
-/// Here the plugin's lib IS this package, so the graph edge already exists — what was missing was
-/// looking at the artifact that edge produces.
-///
-/// Panics rather than skipping. A missing cdylib under `cargo test` means the build graph changed
-/// shape, and the only honest report is a failure, not a silent pass.
+/// The freshly built actual package artifact supplied by CI, or the exact profile library
+/// produced by an explicit `cargo build -p busbar-store-sqlite-plugin --lib`. Missing and stale
+/// artifacts are failures; this never scans hashed dependency artifacts or substitutes a linked door.
 fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
-    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
-    let fresh = deps_dir.join(&name);
+    let fresh = match std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+            path
+        }
+        None => {
+            let exe = std::env::current_exe().expect("current_exe");
+            let profile = exe
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("target/profile");
+            profile.join(busbar_plugin_loader::plugin_library_filename(
+                "busbar_store_sqlite_plugin",
+            ))
+        }
+    };
     assert!(
-        fresh.exists(),
-        "the store-sqlite-plugin cdylib is not at {}, where cargo emits it for the same build that \
-         produced this test binary. Refusing to fall back to target/<profile>/ (an artifact only \
-         `cargo build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed \
-         plugin ABI reads as green.",
+        fresh.is_file(),
+        "build the actual SQLite plugin before testing: {}",
         fresh.display()
     );
-
     let built = std::fs::metadata(&fresh)
         .and_then(|m| m.modified())
         .expect("cdylib mtime");
-    let newest_src = newest_source_mtime();
     assert!(
-        built >= newest_src,
-        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
-         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
-         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
-         `cargo test`, which rebuilds it) and re-run.",
-        fresh.display(),
-        "busbar-store-sqlite-plugin"
+        built >= newest_source_mtime(),
+        "stale SQLite plugin artifact: {}",
+        fresh.display()
     );
     fresh
 }
@@ -291,6 +267,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         &[
             "build",
             "--release",
+            "--locked",
             "--manifest-path",
             "dist/default/Cargo.toml",
             "--bin",
@@ -299,6 +276,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         &[
             "build",
             "--release",
+            "--locked",
             "-p",
             "busbar-plugin-loader",
             "--features",
@@ -308,6 +286,10 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         ][..],
     ] {
         let status = Command::new("cargo")
+            .env(
+                "RUSTUP_TOOLCHAIN",
+                std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "1.98".into()),
+            )
             .args(args)
             .arg("--target-dir")
             .arg(&target)
