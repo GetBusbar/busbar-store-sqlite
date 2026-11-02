@@ -9,13 +9,112 @@ use busbar_contract::abi::sdk::store::rewrap;
 use busbar_contract::abi::store::{records::BlobIn, slot};
 use busbar_contract::records::{CredentialMeta, CredentialSecret, SecretForm};
 
+const RAW_SQLITE_TEST: &str =
+    "credential_rewrap::linked_rewrap_reconciles_a_cancelled_commit_reply_once";
+const RAW_SQLITE_OPERATION: &str = "BUSBAR_SQLITE_REWRAP_RAW_OPERATION";
+const RAW_SQLITE_PATH: &str = "BUSBAR_SQLITE_REWRAP_RAW_PATH";
+const RAW_SQLITE_RESULT: &str = "BUSBAR_SQLITE_REWRAP_RAW_RESULT:";
+const IGNORE_REWRAP_TRIGGER: &str =
+    "CREATE TRIGGER ignore_rewrap BEFORE UPDATE OF secret ON credentials
+     WHEN NEW.revision = OLD.revision + 1
+       AND (SELECT revision FROM store_revision WHERE id=0) = NEW.revision
+     BEGIN SELECT RAISE(IGNORE); END;";
+
+/// The executable and cdylib each bundle SQLite. Their process-local VFS lock tables are
+/// independent, while POSIX locks belong to the process. Keep raw observers in another process
+/// so closing one engine's connection cannot interfere with the live dropped provider's WAL.
+/// The parent keeps its Store open: this still witnesses the commit immediately after READY.
+fn raw_sqlite(path: &std::path::Path, operation: &str) -> Option<i64> {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", RAW_SQLITE_TEST, "--nocapture", "--color=never"])
+        .env(RAW_SQLITE_OPERATION, operation)
+        .env(RAW_SQLITE_PATH, path)
+        .output()
+        .expect("run the Rust SQLite witness process");
+    let stdout = String::from_utf8(output.stdout).expect("the witness prints UTF-8 JSON");
+    assert!(
+        output.status.success(),
+        "raw SQLite witness failed: status={} stdout={} stderr={}",
+        output.status,
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed;"),
+        "the exact existing fixture test must execute once: {stdout}"
+    );
+    let results: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(RAW_SQLITE_RESULT))
+        .map(|json| serde_json::from_str(json).expect("the witness returns structured JSON"))
+        .collect();
+    assert_eq!(results.len(), 1, "one SQLite witness result: {stdout}");
+    assert_eq!(results[0]["test"], RAW_SQLITE_TEST);
+    assert_eq!(results[0]["operation"], operation);
+    let revision = results[0]
+        .get("revision")
+        .expect("the witness result contains its revision field");
+    if revision.is_null() {
+        None
+    } else {
+        Some(
+            revision
+                .as_i64()
+                .expect("the witness revision is an exact i64"),
+        )
+    }
+}
+
+/// Entered only by raw_sqlite's scoped child environment, before either scenario opens a Store.
+/// No new ignored test or external SQL interpreter is needed; SQL failures fail the child test.
+fn raw_sqlite_helper_mode() -> bool {
+    let Some(operation) = std::env::var_os(RAW_SQLITE_OPERATION) else {
+        return false;
+    };
+    let operation = operation.to_str().expect("the witness operation is UTF-8");
+    let path = std::env::var_os(RAW_SQLITE_PATH).expect("the witness names its database");
+    let path = std::path::PathBuf::from(path);
+    let revision = match operation {
+        "revision" => {
+            let conn = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("open the committed database read-only");
+            Some(
+                conn.query_row(
+                    "SELECT revision FROM store_revision WHERE id=0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read the committed global revision"),
+            )
+        }
+        "create-ignore-trigger" => {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(IGNORE_REWRAP_TRIGGER)
+                .expect("create the real ignored-update trigger");
+            None
+        }
+        "drop-ignore-trigger" => {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch("DROP TRIGGER ignore_rewrap")
+                .expect("drop the real ignored-update trigger");
+            None
+        }
+        other => panic!("unknown raw SQLite witness operation: {other}"),
+    };
+    println!(
+        "\n{RAW_SQLITE_RESULT}{}",
+        serde_json::json!({"test": RAW_SQLITE_TEST, "operation": operation, "revision": revision})
+    );
+    true
+}
+
 fn revision(path: &std::path::Path) -> i64 {
-    rusqlite::Connection::open(path)
-        .unwrap()
-        .query_row("SELECT revision FROM store_revision WHERE id=0", [], |r| {
-            r.get(0)
-        })
-        .unwrap()
+    raw_sqlite(path, "revision").expect("the revision witness returns the exact global counter")
 }
 
 fn row(store: &LoadedStore) -> CredentialSecret {
@@ -28,6 +127,9 @@ fn row(store: &LoadedStore) -> CredentialSecret {
 }
 
 fn scenario(by: Door, tag: &str) {
+    if raw_sqlite_helper_mode() {
+        return;
+    }
     let dir = scratch(tag);
     let path = dir.join("rewrap.db");
     let cfg = serde_json::json!({"db_path": path}).to_string();
@@ -161,6 +263,9 @@ fn dropped_rewrap_reconciles_a_cancelled_commit_reply_once() {
 }
 
 fn ignored_update_rolls_back(by: Door, tag: &str) {
+    if raw_sqlite_helper_mode() {
+        return;
+    }
     let dir = scratch(tag);
     let path = dir.join("rewrap.db");
     let cfg = serde_json::json!({"db_path": path}).to_string();
@@ -191,15 +296,7 @@ fn ignored_update_rolls_back(by: Door, tag: &str) {
     let before = revision(&path);
     // Suppress the actual credential UPDATE only after the same transaction allocated its next
     // revision. SQLite reports zero changed rows without raising a SQL error.
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER ignore_rewrap BEFORE UPDATE OF secret ON credentials
-             WHEN NEW.revision = OLD.revision + 1
-               AND (SELECT revision FROM store_revision WHERE id=0) = NEW.revision
-             BEGIN SELECT RAISE(IGNORE); END;",
-        )
-        .unwrap();
+    assert!(raw_sqlite(&path, "create-ignore-trigger").is_none());
     let error = store
         .rewrap_credential(&expected, "v1:test:replacement")
         .expect_err("a suppressed update must refuse rather than commit its allocated revision");
@@ -216,10 +313,7 @@ fn ignored_update_rolls_back(by: Door, tag: &str) {
     );
     assert!(store.get_key("owner").unwrap().unwrap() == owner);
     assert_eq!(revision(&path), before);
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch("DROP TRIGGER ignore_rewrap")
-        .unwrap();
+    assert!(raw_sqlite(&path, "drop-ignore-trigger").is_none());
     assert!(store
         .rewrap_credential(&expected, "v1:test:replacement")
         .unwrap());
