@@ -20,14 +20,6 @@ fn malformed_json_is_rejected() {
 }
 
 /// A negative `busy_timeout_ms` passes the existing type check (`n.is_i64()` is true for a negative
-/// integer) but is nonsensical as a duration and can only be a config mistake -- unlike `0`, which
-/// is a legal, deliberate "never retry" setting, a negative number names nothing SQLite or an
-/// operator could sensibly mean. That's the same silent-footgun class the type-strict parsing above
-/// already guards against for the wrong JSON type; a negative number must be rejected the same way,
-/// not passed straight through to `SqliteStore::open`. `db_path` is pinned to `:memory:` to keep
-/// the test hermetic: an implementation that fails to reject the negative value would otherwise
-/// reach a real `SqliteStore::open` against the default relative `busbar-governance.db` path and
-/// create a real file in the test's cwd.
 #[test]
 fn negative_busy_timeout_ms_is_rejected() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "busy_timeout_ms": -1}"#));
@@ -38,17 +30,12 @@ fn negative_busy_timeout_ms_is_rejected() {
 }
 
 /// RAII guard that switches the process cwd to a fresh scratch temp directory and restores the
-/// original cwd (then removes the scratch directory) on drop — including on an early return via
-/// panic/`?`, so a failing assertion can never strand files in the repo root. `set_current_dir` is
-/// process-global, so only ONE test may use this guard at a time; see the caller for how that's
-/// enforced against cargo's parallel test runner.
 struct ScratchCwd {
     original: std::path::PathBuf,
     scratch: std::path::PathBuf,
 }
 
 /// Serialises every test that switches the process cwd (`ScratchCwd`), since cargo runs tests in
-/// parallel and the cwd is process-global.
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl ScratchCwd {
@@ -66,9 +53,6 @@ impl ScratchCwd {
 
 impl Drop for ScratchCwd {
     fn drop(&mut self) {
-        // Best-effort: restore the real cwd first (so the process is never left pinned inside a
-        // directory we're about to delete), then clean up the scratch directory and whatever
-        // `busbar-governance.db`/`-wal`/`-shm` sidecars `open()` created inside it.
         let _ = std::env::set_current_dir(&self.original);
         let _ = std::fs::remove_dir_all(&self.scratch);
     }
@@ -76,16 +60,6 @@ impl Drop for ScratchCwd {
 
 #[test]
 fn empty_and_bare_object_configs_use_defaults_and_succeed() {
-    // Empty config is NOT an error for this plugin (unlike oidc, sqlite has usable defaults for
-    // every field) — both `""` and `"{}"` fall back to the default relative `db_path`. Proving that
-    // fallback actually happens means calling `open` with the key genuinely ABSENT, which resolves
-    // to the CWD-relative `busbar-governance.db` — so this test runs `open` from a scratch temp cwd
-    // (via `ScratchCwd`, restored/cleaned up on drop even if an assertion below panics) rather than
-    // the repo root, keeping the suite hermetic: never the repo's actual cwd, never a stray file
-    // left behind. Both configs are exercised SEQUENTIALLY in one test (rather than as separate
-    // `#[test]`s) because `set_current_dir` is process-global — two tests changing it concurrently
-    // under cargo's parallel runner would race each other, and both would otherwise try to open the
-    // same default-named file concurrently and contend on SQLite's file lock.
     let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let cwd = ScratchCwd::enter("empty-and-bare");
 
@@ -107,8 +81,6 @@ fn empty_and_bare_object_configs_use_defaults_and_succeed() {
 
 #[test]
 fn explicit_in_memory_db_path_is_honored() {
-    // `db_path` is read, not ignored for the default: nothing is created in the cwd, and two opens
-    // of `:memory:` do not share data, which a file would.
     let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let cwd = ScratchCwd::enter("explicit-memory");
     let store = open(r#"{"db_path": ":memory:"}"#).expect("in-memory db_path must open");
@@ -180,18 +152,6 @@ fn nonexistent_parent_directory_is_a_clean_error_not_a_panic() {
 
 #[test]
 fn busy_timeout_ms_is_actually_applied() {
-    // The audit's own concern: `busy_timeout_ms` is threaded from the JSON config all the way
-    // through to `SqliteStore::open`'s `pragma_update(None, "busy_timeout", ...)`, and nothing tested
-    // that wiring — a regression that dropped the value on the floor (e.g. always using the 5000ms
-    // default) would pass unnoticed. `SqliteStore` doesn't expose its inner connection, and
-    // `busy_timeout` is a per-connection runtime setting with no on-disk trace, so we can't just read
-    // it back after the fact. Instead we observe it BEHAVIORALLY: hold an exclusive write lock on the
-    // file from a second, independent connection, then call `open()` through the plugin with a small
-    // non-default `busy_timeout_ms` against that same locked file. `SqliteStore::open` runs its own
-    // write transaction during `migrate()`, so it must block on the lock and then fail with
-    // `SQLITE_BUSY` once ITS configured timeout elapses. Asserting the elapsed time lands near the
-    // CONFIGURED value (and well under the 5000ms default) proves the value was actually threaded
-    // through, not silently defaulted.
     let dir = std::env::temp_dir().join(format!(
         "busbar-sqlite-plugin-busy-timeout-{}",
         std::process::id()
@@ -200,15 +160,10 @@ fn busy_timeout_ms_is_actually_applied() {
     let path = dir.join("busy_timeout.db");
     let path_str = path.to_str().unwrap().to_string();
 
-    // Pre-create the file with a normal open/migrate so the plugin's later `open()` under lock
-    // contention only has to run `migrate()`'s idempotent (but still write-locking) schema pass.
     let store = open(&serde_json::json!({ "db_path": path_str }).to_string())
         .expect("initial open to create the schema");
     drop(store);
 
-    // Grab and hold an exclusive write lock from an independent connection with NO busy_timeout of
-    // its own (so it never yields the lock voluntarily) — this is what the plugin's `open()` below
-    // will contend against.
     let locker = rusqlite::Connection::open(&path).expect("open locker connection");
     locker
         .execute_batch("BEGIN IMMEDIATE;")
@@ -225,7 +180,6 @@ fn busy_timeout_ms_is_actually_applied() {
     let result = open(&cfg);
     let elapsed = start.elapsed().as_millis();
 
-    // Release the lock immediately so a failure below doesn't strand the test process.
     drop(locker);
 
     assert!(
@@ -248,8 +202,6 @@ fn busy_timeout_ms_is_actually_applied() {
 }
 
 /// An explicit JSON `null` for either key is read as ABSENT and falls back to the default, the
-/// semantics this plugin shipped with in busbar 1.5.5. Pinned so a change to them is a decision,
-/// not an accident: `db_path: null` opens the default relative file, exactly as `{}` does.
 #[test]
 fn null_db_path_and_busy_timeout_read_as_absent() {
     let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -271,7 +223,6 @@ fn null_db_path_and_busy_timeout_read_as_absent() {
 }
 
 /// `0` is a legal, deliberate "never retry" setting (only a negative value is refused), so it must
-/// open.
 #[test]
 fn zero_busy_timeout_ms_is_accepted() {
     open(r#"{"db_path": ":memory:", "busy_timeout_ms": 0}"#)
@@ -279,7 +230,6 @@ fn zero_busy_timeout_ms_is_accepted() {
 }
 
 /// An unsigned value past `i64::MAX` passes the integer type check (`is_u64`) but cannot be a
-/// SQLite busy timeout; it must be refused as out of range, never wrapped or clamped.
 #[test]
 fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
     let err = expect_err(open(
@@ -292,7 +242,6 @@ fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
 }
 
 /// SQLite parses `PRAGMA busy_timeout` as a 32-bit int; a larger value reads back as 0 and silently
-/// disables the busy handler, so anything above `i32::MAX` is refused (and `i32::MAX` itself is fine).
 #[test]
 fn busy_timeout_ms_above_i32_max_is_refused() {
     use super::Settings;
@@ -309,7 +258,6 @@ fn busy_timeout_ms_above_i32_max_is_refused() {
 }
 
 /// An unknown top-level key is refused (a typo such as `dbpath` would otherwise silently open the
-/// default relative path), naming the accepted keys.
 #[test]
 fn an_unknown_setting_is_refused() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
@@ -368,7 +316,6 @@ fn license_key_is_accepted_and_ignored() {
 }
 
 /// A wrongly typed setting is refused naming the expected and the given JSON type, never the value
-/// (a template can put a secret where a path was expected).
 #[test]
 fn a_wrongly_typed_setting_names_types_never_the_value() {
     use super::Settings;

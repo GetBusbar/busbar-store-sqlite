@@ -142,8 +142,6 @@ fn crossing_the_sign_boundary_does_not_alias_a_cas_snapshot() {
     assert_eq!(store_revision(&reopened), before + 1);
 }
 
-// The released v14 signed-expiry table, retained as a migration input rather than borrowed from
-// the current DDL. The surrounding database is made by the real provider.
 const V14_CREDENTIALS: &str = "CREATE TABLE credentials_legacy (
  id TEXT NOT NULL PRIMARY KEY,
  key_id TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,
@@ -195,8 +193,6 @@ fn legacy_file(path: &Path, version: i64, rows: &[(u64, Option<u64>)], imported_
     )
     .unwrap();
     if imported_cross_sign {
-        // Imported unsigned-valid rows can predate this CHECK repair. They must not be copied
-        // through another intermediate signed-expiry table on the way to the final schema.
         conn.pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
     }

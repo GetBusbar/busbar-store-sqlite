@@ -2,14 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
-//! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. All
-//! DURABLE: the state lives in the tables `SCHEMA` creates. It holds no money (counts x the rate
-//! card, derived in busbar's core).
-//!
-//! DEDUPE (`abi::store` S1-S4, [`Dedupe`]): an `op_id` that APPLIED is recorded in `store_ops` with
-//! the op's body, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect: two racing calls
-//! with one `op_id` apply once, and a replay after a restart answers done. A refusal rolls back and
-//! records nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
@@ -61,8 +53,6 @@ fn retention_cutoff(now: i64) -> i64 {
 const SWEEP_EVERY: u64 = 256;
 
 /// Remember an APPLIED op's body ([`Dedupe::body_hex`]: the column is TEXT); every [`SWEEP_EVERY`]th one also
-/// forgets the ops past their retention (`recorded` already ignores them, so the sweep only
-/// reclaims space). `answer` is written as the one answer older builds read back (`"Done"`).
 fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStoreResult<()> {
     let now = now_secs();
     if sweep {
@@ -98,7 +88,6 @@ fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStor
 
 impl SqliteStore {
     /// Run one `op_id`-carrying write deduped ([`Dedupe::run`]) in ONE `BEGIN IMMEDIATE`
-    /// transaction at FULL sync. A refusal rolls the transaction back.
     fn op(
         &self,
         op: OpId,
@@ -167,7 +156,6 @@ fn put_record_in(
 }
 
 /// A raw BLOB-prefix selector with an exact byte length. SQLite lengths are nonnegative i64:
-/// a larger checked platform length cannot match any row and is a legal empty range.
 fn record_range(
     tx: &Transaction<'_>,
     schema: &str,
@@ -219,7 +207,6 @@ impl SqliteStore {
     }
 
     /// An upsert on `(schema, key)`; an EMPTY value removes the row (the host's strike), and
-    /// removing a row that is not there is `Ok`.
     pub(crate) fn v3_record_put(
         &self,
         schema: &str,
@@ -240,9 +227,6 @@ impl SqliteStore {
     }
 
     /// Compare the complete pre-state, then commit every effect and the applied-only receipt in
-    /// the existing FULL-sync BEGIN IMMEDIATE operation. A predicate miss forces rollback, but is
-    /// a definitive decision rather than an operation-id body conflict. SQL/commit errors retain
-    /// their ambiguous failure semantics: callers must replay this exact id and body.
     pub(crate) fn v3_record_transaction(&self, request: &Request) -> OpResult<Decision> {
         request
             .validate()
@@ -257,8 +241,7 @@ impl SqliteStore {
                 };
                 if !matches {
                     condition_conflict = true;
-                    // `op` rolls back every closure error and writes no receipt. Only this local
-                    // marker is translated into a condition decision; SQL errors stay failures.
+
                     return Err(RecordStoreError(
                         "record transaction predicate conflict".into(),
                     ));
@@ -277,8 +260,7 @@ impl SqliteStore {
                     }
                 }
             }
-            // A trigger may silently suppress a write. Never record Applied unless every intended
-            // value (including absence) is present in the same transaction before its receipt.
+
             for mutation in &request.mutations {
                 let applied = match mutation {
                     Mutation::Put { schema, key, value } => {
@@ -315,9 +297,7 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // A BLOB compares as memcmp, so a prefix is the key range [prefix, successor); no successor
-        // (every byte `0xff`, or empty) is unbounded above. Two statements, so the bounded one stops
-        // at the end of the range instead of filtering every row past it.
+
         let conn = self.lock_reader();
         let row = |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?));
         let rows: Vec<(Vec<u8>, Vec<u8>)> = match prefix_end(prefix) {
@@ -346,8 +326,7 @@ impl SqliteStore {
         if before == 0 {
             return Ok(0);
         }
-        // Existing usage timestamps preserve all u64 bits in SQLite's signed INTEGER.
-        // Positive values precede the wrapped negative half; zero is the all-time window.
+
         const OLD: &str = "(window_start > 0 AND (?1 < 0 OR window_start < ?1)) \
             OR (window_start < 0 AND ?1 < 0 AND window_start < ?1)";
         self.write(true, |tx| {
@@ -379,7 +358,6 @@ impl SqliteStore {
     ) -> OpResult<()> {
         let mut reserved = false;
         let result = self.op(op, Dedupe::usage(cells), |tx| {
-            // Receipt replay runs first; a previously applied legacy adjustment remains replayable.
             if cells
                 .iter()
                 .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
@@ -403,7 +381,6 @@ impl SqliteStore {
     }
 
     /// One serialized pre-state and one FULL-sync commit for all rows and the applied receipt.
-    /// A lost commit answer is Failed: retain the immutable request and replay its id/body.
     pub(crate) fn v3_apply_usage_correction(
         &self,
         request: &correction::Request,
@@ -482,7 +459,6 @@ macro_rules! ready {
 }
 
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
-/// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const RECORD_TRANSACTION: bool = true;
     const USAGE_CORRECTION: bool = true;

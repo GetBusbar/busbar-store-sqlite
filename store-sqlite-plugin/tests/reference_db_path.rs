@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE `db_path` IS REFERENCE-CAPABLE, NOT SECRET (busbar lead ruling item 7a, as for the network
-//! stores' `url`): a 1.5.5 config that writes `db_path` as `{env: VAR}` keeps booting (the reference
-//! resolves in place, as the kernel resolves it), and a literal path passes as written (never
-//! refused as a secret literal). The linked door is loaded the way the host binds it.
+//! `db_path` is reference-capable rather than a declared secret field; literal database paths remain accepted.
 
 use std::sync::Arc;
 

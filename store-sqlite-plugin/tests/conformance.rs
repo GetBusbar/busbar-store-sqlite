@@ -2,24 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE SQLITE STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
-//! store kind's memory ABI (THE DESIGN §11, store v3), run against the busbar rev this repo pins
-//! (`.busbar-ref`).
-//!
-//! The store is held two ways at once: LINKED (the logic crate's `door::door`, through the loader's
-//! `load_linked`, the row a busbar build that compiles it in registers) and DROPPED IN (this crate's
-//! built cdylib, `dlopen`ed by the loader's `load_dropped` against the Statement rendering the door
-//! states, which is what `busbar-plugin-pack` signs into the manifest). Each is bound to a real
-//! dispatcher and opened as the host opens a store (`LoadedStore`), and driven through ONE scenario
-//! against its own real database file: the config refusals, a key, a usage window, plane records of
-//! an upsert and an append-only kind, the v3 slots (a count batch and its replay and conflict, and
-//! schema records), a SECOND live handle on the same file (the
-//! cross-handle view), and a RESTART — every handle closed, the file reopened, everything read back
-//! and every `op_id` replayed. The two arms must agree on the whole transcript.
-//!
-//! The RED arms are their own tests (plugin-gates `bothways` needs a RED arm beside the both-ways test): (a) the door asked for as another kind is refused, linked and
-//! dropped in; (b) the dropped-in door opened on a file that already holds a foreign key yields a
-//! transcript that DIFFERS from the linked one — so the comparison above can see a real difference
-//! and is not vacuously equal. A missing cdylib PANICS: this test IS the dropped-in door's proof.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,8 +14,7 @@ use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageDelta, VirtualKey,
 };
-// `StoreCalls` is named by path, never imported: `LoadedStore` answers the plane-record verbs
-// through both it and `RecordStore`, and one trait in scope keeps the method calls unambiguous.
+
 use busbar_contract::store_calls as sc;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
@@ -47,10 +28,6 @@ use busbar_store_sqlite::door::MACRO_DOOR;
 #[path = "support/credential_rewrap.rs"]
 mod credential_rewrap;
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
-// the built cdylib, each through the one loader, driven by the store kind's script over
-// `conformance.json`; exact crossing counts, the two folds equal, its RED arms. Each fold opens its
-// own database file: `db_path` names `{fold}`, a namespace no other fold uses.
 busbar_test_kit::conformance_suite! {
     door: busbar_store_sqlite::door::MACRO_DOOR,
     cdylib: "busbar_store_sqlite_plugin",
@@ -66,7 +43,6 @@ fn stamp_newer_schema(_: &str, settings: &[u8]) {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip: this test IS the dropped-in door's proof.
 fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -113,7 +89,6 @@ fn load<K: busbar_plugin_loader::dispatch::Kind>(
 }
 
 /// The node's one `op_id` allocator, as the kernel hands a store handle its own: the bridge's
-/// additive writes mint from it. Its node half is one no test op id uses.
 fn mint() -> busbar_contract::abi::store::OpId {
     static N: AtomicU64 = AtomicU64::new(0);
     busbar_contract::abi::store::OpId::from_parts(0x5e1f, N.fetch_add(1, Ordering::Relaxed) + 1)
@@ -271,7 +246,6 @@ fn v3_replays(s: &LoadedStore) -> Vec<String> {
 
 /// What one door does with the store, as one comparable transcript.
 fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
-    // The config refusals, in the store's own words, through the door.
     let refusals: Vec<String> = [
         "{ not json",
         r#"{"db_path": 5}"#,
@@ -326,21 +300,19 @@ fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
         )
         .expect("append");
     }
-    // A duplicate append (same parent, same seq) with a different body is refused, in the store's
-    // words.
+
     let dup = a
         .append_plane_record(record("task_event", "e1", Some("t1"), 1, "{}").view())
         .map_err(|e| e.0);
     let writes = v3_writes(&a);
-    // A SECOND live handle on the same file sees the first handle's writes, and its own write is
-    // seen back by the first.
+
     let b = open(by, &cfg).expect("a second handle opens");
     b.put_key(&key("vk_other")).expect("second-handle put_key");
     let cross = serde_json::json!({"b_sees": contents(&b), "dup": format!("{dup:?}")});
     let live = contents(&a);
     close(b);
     close(a);
-    // THE RESTART: every handle above is closed; a fresh open's only source is the file.
+
     let c = open(by, &cfg).expect("the store reopens");
     let restarted = contents(&c);
     let replays = v3_replays(&c);
@@ -359,11 +331,8 @@ fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
 }
 
 /// The sqlite store behaves as ONE store through either door (the RED arms below show the
-/// comparison can tell a different store apart).
 #[test]
 fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
-    // What the packer signs (the library's own door, read off the built cdylib) is what the
-    // compiled-in row states.
     assert_eq!(
         rendering_of_library(&cdylib()).expect("the cdylib loads"),
         Some(rendering_of_macro(MACRO_DOOR).expect("the door renders")),
@@ -374,7 +343,6 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     let dropped_in = transcript(Door::Dropped, "dropped", None);
     assert_eq!(linked, dropped_in, "the two doors are not one store");
 
-    // The scenario did what a durable store is for.
     assert_eq!(linked["name"], "busbar-store-sqlite");
     let restarted = &linked["restarted"];
     assert_eq!(
@@ -404,9 +372,7 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
             .all(|r| r.as_str().unwrap().contains("invalid sqlite plugin config")),
         "every bad config is refused in the store's own words: {refusals:?}"
     );
-    // The count batch applied once, its replay answered the original, a reused id with another
-    // body was a conflict; after the restart the replay still answers the original (dedupe is
-    // durable) and the count is unchanged.
+
     let writes = linked["writes"].as_array().unwrap();
     let w = |i: usize| writes[i].as_str().unwrap().to_string();
     assert_eq!(w(0), "usage batch = Ok(())", "{writes:?}");
@@ -418,7 +384,7 @@ fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     assert!(r(1).contains("Conflict"), "{replays:?}");
 }
 
-/// RED (a): the store's door asked for as a secret is refused, through both doors.
+/// Loading a store door as a secret is refused through both linked and dropped-in forms.
 #[test]
 fn a_store_door_loaded_as_another_kind_is_refused() {
     let d = Dispatcher::new(DispatchConfig::default());
@@ -436,8 +402,7 @@ fn a_store_door_loaded_as_another_kind_is_refused() {
     }
 }
 
-/// RED (b): the dropped-in door on a file that already holds a foreign key is NOT the same
-/// transcript as the linked one — the equality in the both-ways test is not vacuous.
+/// A dropped-in store holding a foreign row produces a different transcript.
 #[test]
 fn a_store_holding_a_foreign_row_does_not_compare_equal() {
     let linked = transcript(Door::Linked, "linked-red", None);
@@ -449,11 +414,6 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
 }
 
 /// The store's Statement declares exactly its secret fields (`secret_refs`), never `*`: busbar
-/// resolves a secret reference only at a position the Statement declares secret and refuses one
-/// anywhere else (busbar #1699, ORACLE-SIGNOFF G14: each plugin declares its secret fields). The one
-/// secret-valued key a 1.5.5 sqlite config carried is `license_key` (busbar oracle BOOT-170: its
-/// unresolved reference refuses the boot with the 1.5.5 text); `db_path` and `busy_timeout_ms` are
-/// not secrets. The dropped-in library states the same Statement (the test above).
 #[test]
 fn the_statement_declares_exactly_its_secret_fields() {
     let stated = busbar_contract::abi::mechanism::rendering::read(
@@ -512,7 +472,7 @@ fn usage_cleanup_is_strict_and_durable_through_either_door() {
             s.put_usage(bucket, window, &value).unwrap();
         }
         let raw = rusqlite::Connection::open(&path).unwrap();
-        // A migrated window may have model rows without the request-count sentinel.
+
         raw.execute(
             "DELETE FROM usage_windows WHERE bucket_id='b' AND window_start=19 AND model=''",
             [],
@@ -630,7 +590,7 @@ fn a_failed_usage_cleanup_rolls_back_both_tables_through_either_door() {
         let ledger = cleanup_ledger();
         s.put_usage("a", 10, &ledger).unwrap();
         let raw = rusqlite::Connection::open(&path).unwrap();
-        // Whichever table is deleted second refuses, after the other deletion took effect.
+
         raw.execute_batch(
             "
             CREATE TRIGGER reject_window_without_units BEFORE DELETE ON usage_windows

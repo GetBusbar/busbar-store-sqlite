@@ -2,13 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The built-in SQLite backend for busbar's durable governance store. Implements
-//! `busbar_contract::records::RecordStore` over embedded rusqlite connections: one mutex-guarded
-//! writer, plus a small pool of `query_only` readers so a long billing report or retention sweep
-//! never blocks the hot-path usage flush (WAL readers are unaffected by an in-flight writer).
-//!
-//! [`door::door`] answers the store v3 table over [`SqliteStore`] through the contract's store SDK:
-//! the base op set is the [`RecordStore`] implementation below, the v3 additions are in `v3`. A
-//! build that links this crate registers `door`; the `busbar-store-sqlite-plugin` cdylib exports it.
 
 #![forbid(unsafe_code)]
 
@@ -25,7 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// rusqlite error -> `RecordStoreError` (the contract crate stays storage-free, so the `From` impl
-/// behind `?` cannot live there): write `<rusqlite call>.store()?`.
 trait IntoStoreResult<T> {
     fn store(self) -> RecordStoreResult<T>;
 }
@@ -39,23 +31,6 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-/// release ever wrote one. v6 -> v18 upgrades in place:
-/// - v10: kind-tagged `plane_records` / `plane_tokens`; `keys` gains `scope_grants`,
-///   `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`; `usage_metering` gains
-///   `priced_from_ms` in its key (existing rows copied at 0); open usage units get their own tables.
-///   The v6 `mcp_calls` table is left unread: its body is a digest stream no backend can rebuild.
-/// - v11-v13: the store v3 state (`store_ops`, `schema_records`).
-/// - v14: `credentials` is rebuilt so a revoked row may hold no secret (revoke destroys it); a row
-///   revoked under an older build loses the secret it kept.
-/// - v15: credential expiry compares the unsigned timestamps preserved by the INTEGER bit codec.
-///   A legacy row whose expiry precedes creation in that order refuses the entire migration.
-/// - v16: the same unsigned expiry order applies to keys, preserving their full-width codec.
-///   An incompatible legacy key refuses the entire migration.
-///
-/// v17 keys metering cells and their units by the recorded group and price version.
-/// A file stamped by a later build is refused.
-// v18 retains whole exact u64 raw rows beside the legacy signed-column mirror.
-// An older binary refuses the newer schema before reading a truncated mirror.
 const SCHEMA_VERSION: i64 = 18;
 
 macro_rules! unsigned_expiry_order {
@@ -336,9 +311,6 @@ fn shared_clock(tx: &Connection) -> RecordStoreResult<i64> {
 }
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
-/// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
-/// contains those characters elsewhere is a real file. Pragma selection and `SqliteStore::open`'s
-/// single-connection routing both use this one check.
 fn is_memory_path(path: &str) -> bool {
     if path == ":memory:" {
         return true;
@@ -352,9 +324,6 @@ fn is_memory_path(path: &str) -> bool {
 }
 
 /// Apply the fixed pragma set, `busy_timeout` FIRST (switching a file into WAL itself briefly
-/// acquires the database, so the timeout must already be set). `is_writer` gates the writer-only
-/// pragmas and `query_only` (readers only; `SQLITE_OPEN_READ_ONLY` cannot create the `-wal`/`-shm`
-/// files on a fresh database).
 fn apply_pragmas(
     conn: &Connection,
     path: &str,
@@ -391,7 +360,7 @@ fn apply_pragmas(
     conn.pragma_update(None, "temp_store", "MEMORY").store()?;
     conn.pragma_update(None, "cache_size", if is_writer { -65536 } else { -16384 })
         .store()?;
-    // No mmap on a path that looks like a network filesystem (best effort, not an fs-type probe).
+
     let mmap = if path.contains("//") && !path.starts_with(':') {
         0
     } else {
@@ -449,13 +418,9 @@ fn exec(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> RecordSt
 }
 
 /// Embedded SQLite `Store` backend. One mutex-guarded writer connection (all mutations, `BEGIN
-/// IMMEDIATE`, never `DEFERRED`: every write here is read-then-write and `DEFERRED`'s upgrade can
-/// return `SQLITE_BUSY_SNAPSHOT`, which bypasses the busy handler) plus a small round-robin pool of
-/// `query_only` reader connections.
 pub struct SqliteStore {
     writer: Mutex<Connection>,
     /// The writer's current `synchronous` mode (FULL = true), so the PRAGMA is issued only on a
-    /// change. Read and written only under the `writer` lock.
     writer_full: AtomicBool,
     /// Ops recorded since open, pacing the `store_ops` retention sweep.
     ops_recorded: AtomicU64,
@@ -465,8 +430,6 @@ pub struct SqliteStore {
 }
 
 /// Create a missing database file 0600 (it holds recoverable secrets) so SQLite, which gives the
-/// `-wal`/`-shm` files the main file's mode, never creates it with the umask. An existing file is
-/// left alone, and so is any failure to create (SQLite reports it on open).
 #[cfg(unix)]
 fn create_private(path: &str) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -484,8 +447,6 @@ fn create_private(_: &str) {}
 
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> RecordStoreResult<Self> {
-        // A `:memory:` spelling opens a NEW private database per connection, so a writer plus N
-        // readers would be N+1 mutually invisible databases: route to the single-connection path.
         if is_memory_path(path) {
             return Self::open_in_memory();
         }
@@ -526,7 +487,6 @@ impl SqliteStore {
     }
 
     /// In-memory store with one connection for both roles (a separate reader pool would see a
-    /// different empty database).
     pub fn open_in_memory() -> RecordStoreResult<Self> {
         let conn = Connection::open_in_memory().store()?;
         apply_pragmas(&conn, ":memory:", 5000, true)?;
@@ -571,16 +531,13 @@ impl SqliteStore {
     }
 
     /// Run `f` in one `BEGIN IMMEDIATE` transaction on the writer, committing when it returns `Ok`.
-    /// `full` escalates to `synchronous=FULL` for the transaction (mint, revoke, rotate, delete,
-    /// the metering flush, audit, every plane write: a power cut must not hand back the old state).
     fn write<T>(
         &self,
         full: bool,
         f: impl FnOnce(&Transaction<'_>) -> RecordStoreResult<T>,
     ) -> RecordStoreResult<T> {
         let mut conn = self.lock_writer();
-        // SQLite refuses to change `synchronous` inside a transaction, so the mode is set BEFORE
-        // the transaction opens, and only when it differs from the connection's current one.
+
         if self.writer_full.load(Ordering::Relaxed) != full {
             conn.pragma_update(None, "synchronous", if full { "FULL" } else { "NORMAL" })
                 .store()?;
@@ -596,9 +553,7 @@ impl SqliteStore {
 
     fn migrate(&self) -> RecordStoreResult<()> {
         let mut conn = self.lock_writer();
-        // Rebuilding the keys parent must not execute its credentials ON DELETE CASCADE.
-        // SQLite requires this outside the transaction. Verify it, since a PRAGMA in an active
-        // transaction can silently do nothing. This connection is not published until open ends.
+
         let result = (|| {
             conn.pragma_update(None, "foreign_keys", "OFF").store()?;
             let disabled: i64 = conn
@@ -611,8 +566,7 @@ impl SqliteStore {
             }
             Self::migrate_transaction(&mut conn)
         })();
-        // The transaction has committed or dropped (rolled back) before enforcement is restored.
-        // Attempt restoration even when migration refused; no failed connection reaches callers.
+
         let restored = conn
             .pragma_update(None, "foreign_keys", "ON")
             .store()
@@ -634,9 +588,6 @@ impl SqliteStore {
     }
 
     fn migrate_transaction(conn: &mut Connection) -> RecordStoreResult<()> {
-        // One transaction over the upgrade and the version stamp. The version is read
-        // INSIDE it: every one-time step below is gated on it, and a value read before the lock is
-        // stale the moment another process opening the file commits its own migration.
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
@@ -655,8 +606,7 @@ impl SqliteStore {
                  released schema; refusing to open"
             )));
         }
-        // v10: `usage_metering` gains `priced_from_ms` in its key. Keyed on the column's absence so
-        // a re-run is a no-op, and run BEFORE `SCHEMA` so its `IF NOT EXISTS` finds the rebuilt table.
+
         if table_exists(&tx, "usage_metering")?
             && !column_exists(&tx, "usage_metering", "priced_from_ms")?
         {
@@ -665,8 +615,7 @@ impl SqliteStore {
         if version < 17 && table_exists(&tx, "usage_metering")? {
             rebuild_metering_for_v17(&tx)?;
         }
-        // The final credentials table includes both the v14 revoked-row rules and v15 unsigned
-        // expiry order. Older files go directly to it, without an intermediate signed CHECK.
+
         if version != 0 && version < 15 && table_exists(&tx, "credentials")? {
             rebuild_credentials_for_v15(&tx)?;
         }
@@ -674,8 +623,7 @@ impl SqliteStore {
             add_v10_key_columns(&tx)?;
             rebuild_keys_for_v16(&tx)?;
         }
-        // The chain trigger's condition narrowed to appended records (upsert-by-id): a file opened
-        // by an older build holds the old one, and `SCHEMA` creates it only if it is absent.
+
         tx.execute_batch("DROP TRIGGER IF EXISTS plane_records_chain_no_update;")
             .store()?;
         tx.execute_batch(SCHEMA).store()?;
@@ -699,7 +647,6 @@ impl SqliteStore {
     }
 
     /// Bump the store-global revision counter, inside the same `BEGIN IMMEDIATE` transaction as the
-    /// mutation it stamps (`RETURNING` hands the value back in one round trip).
     fn bump_revision(tx: &rusqlite::Transaction) -> RecordStoreResult<i64> {
         query_one(
             tx,
@@ -731,7 +678,6 @@ macro_rules! sat_add {
 }
 
 /// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
-/// Every other unit name is an OPEN unit and lives in `usage_window_units`.
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
 
 /// The OPEN (non-reserved) entries of a name-keyed usage map.
@@ -769,10 +715,6 @@ fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> Record
 }
 
 /// Rebuild a pre-v10 `usage_metering` with `priced_from_ms` in its primary key, the one change SQLite
-/// cannot make in place. Every row is copied at `priced_from_ms = 0`, the opening card's instant.
-/// The column list must stay identical to [`SCHEMA`]'s (`a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly`).
-/// The trigger naming `usage_metering` is dropped first because `ALTER TABLE ... RENAME` re-parses
-/// every trigger; `SCHEMA` recreates it right after.
 fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS keys_guard_hard_delete;
@@ -805,9 +747,6 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
 }
 
 /// Rebuild a pre-v15 `credentials` with unsigned expiry order, copying every row; a row revoked
-/// before v14 keeps its metadata and loses the secret it held. The trigger naming `credentials`
-/// is dropped first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates
-/// it and the indexes right after.
 fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     let invalid: Option<(String, i64, i64)> = query_one(
         tx,
@@ -843,7 +782,6 @@ fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<(
 }
 
 /// Replace the parent without renaming the old table: credential FK references stay `keys`.
-/// The caller disabled FK actions before BEGIN and checks all FK links before COMMIT.
 fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     let invalid: Option<(String, i64, i64)> = query_one(
         tx,
@@ -862,8 +800,7 @@ fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
             expires as u64, created as u64
         )));
     }
-    // DROP TABLE removes owned indexes/triggers. Preserve their SQL, including an operator's
-    // additional guards. Autoindexes come from the unchanged PRIMARY KEY in the new DDL.
+
     let objects: Vec<String> = query_all(
         tx,
         "SELECT sql FROM sqlite_master WHERE tbl_name='keys' AND type IN ('index','trigger')
@@ -891,7 +828,6 @@ fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
 }
 
 /// The v10 `keys` columns: nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as before
-/// (no non-pool scope grant, `None` for the attribution fields).
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     add_v10_key_columns_to(tx, "keys")
 }
@@ -910,7 +846,6 @@ fn add_v10_key_columns_to(tx: &rusqlite::Connection, table: &str) -> RecordStore
     ];
     for (name, decl) in COLUMNS {
         if !column_exists(tx, table, name)? {
-            // Both callers supply fixed internal table names, never an operator identifier.
             tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))
                 .store()?;
         }
@@ -1010,12 +945,7 @@ fn put_key_inner(
             key.id
         )));
     }
-    // `?6` (created_at) seeds `updated_at` on INSERT, but the ON CONFLICT branch stamps `?12`, the
-    // mutation time, like every other mutation path here. The `WHERE` on that branch is the
-    // TOMBSTONE PRECONDITION: a live-shaped write must not overwrite a tombstoned row, which would
-    // reissue an id the contract says is never reissued. It is in the statement, not a prior SELECT,
-    // so the test and the write are atomic against a concurrent `delete_key`. A write that CARRIES
-    // a tombstone is unaffected. When the guard bites, `execute` reports 0 rows.
+
     let (allowed_pools, scope_grants) = column::scope_columns(key.allowed_scopes.as_deref());
     let affected = conn.execute(
         "INSERT INTO keys (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,updated_at,revision,
@@ -1095,8 +1025,6 @@ fn usage_columns_in(
     bucket_id: &str,
     window_start: u64,
 ) -> RecordStoreResult<UsageLedger> {
-    // `requests` / `billable_requests` live ONLY on the `model=''` sentinel row, so there is one
-    // source of truth however many put/add_usage calls interleaved. Never written reads (0, 0).
     let (requests, billable_requests): (i64, i64) = query_one(
             conn,
             "SELECT requests, billable_requests FROM usage_windows WHERE window_start=?1 AND bucket_id=?2 AND model=''",
@@ -1117,7 +1045,7 @@ fn usage_columns_in(
             let mut units = BTreeMap::new();
             for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
                 let v = column::read_u64(r.get(i + 1)?);
-                // A zero reads as absent, as `ModelTokens` itself reads an absent key.
+
                 if v != 0 {
                     units.insert(unit.to_string(), v);
                 }
@@ -1142,12 +1070,10 @@ fn usage_columns_in(
         },
     )?;
     for (model, unit, count) in opens {
-        // Sparse, as the reserved units are: a zero count reads as absent.
         if count == 0 {
             continue;
         }
-        // An open-unit row is written beside its model's row, so the model is already listed;
-        // the fallback only keeps an out-of-band edit readable.
+
         let at = match models.iter().position(|m| m.model == model) {
             Some(at) => at,
             None => {
@@ -1194,7 +1120,7 @@ fn put_usage_in(
         )
         .store()?;
     }
-    // The counts ALWAYS live on the `model=''` sentinel row; per-model rows carry tokens only.
+
     insert_usage_in(tx,
                 "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
                 params![
@@ -1296,7 +1222,6 @@ fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<Metering
                 tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version,
                 priced_from_ms
              FROM usage_metering WHERE bucket = ?1",
-        // Match the legacy writer's signed bit-pattern key, including existing high-u64 rows.
         params![(bucket as i64).to_string()],
         |r| {
             Ok(MeteringRow {
@@ -1357,7 +1282,6 @@ fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<Metering
 }
 
 /// [`RecordStore::add_usage`]'s writes, inside the caller's transaction (the trait method's own, or
-/// a store v3 slot's, where the `op_id` record shares it).
 fn add_usage_in(
     tx: &Connection,
     bucket_id: &str,
@@ -1371,8 +1295,7 @@ fn add_usage_in(
         params![window_start as i64, bucket_id],
         |row| row.get(0),
     )?;
-    // An empty model is opaque data. The legacy columns reserve its row for request totals;
-    // the exact whole row keeps both meanings without aliasing its unit counts to that sentinel.
+
     if exact == Some(true) || delta.models.iter().any(|model| model.model.is_empty()) {
         let mut ledger = usage_in(tx, bucket_id, window_start)?;
         ledger.requests = ledger.requests.saturating_add_signed(delta.requests);
@@ -1410,9 +1333,7 @@ fn add_usage_in(
             .sort_by(|left, right| left.model.cmp(&right.model));
         return put_usage_in(tx, bucket_id, window_start, &ledger);
     }
-    // `requests` / `billable_requests` accumulate unconditionally on the `model=''` sentinel row,
-    // whether or not the delta reached any model (a rejected request adds to `requests` alone).
-    // `prepare_cached`: this fires once per admitted request, the hottest write path in the crate.
+
     tx.prepare_cached(concat!(
         "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
          VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
@@ -1455,7 +1376,7 @@ fn add_usage_in(
             d(UNIT_CACHE_WRITE),
         ])
         .store()?;
-        // Every open unit accumulates the same way, floored at 0 (a refund never drives a counter negative).
+
         for (unit, d) in open_units(&m.usage_units) {
             tx.prepare_cached(concat!(
                 "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
@@ -1475,8 +1396,6 @@ fn add_usage_in(
 
 /// [`RecordStore::add_metering`]'s writes, inside the caller's transaction.
 fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> {
-    // Refused rather than clamped: `priced_from_ms` is part of the cell's KEY, so a clamped value
-    // would merge this accrual into a different card's cell.
     let priced_from = column::storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
     exec(
         tx,
@@ -1531,8 +1450,6 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
 
 /// [`RecordStore::append_audit`]'s write and fork check, inside the caller's transaction.
 fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()> {
-    // A `seq` / `ts` past `i64::MAX` would wrap negative and read back clamped to 0, so an identical
-    // retry would compare unequal and be reported as a forked chain. Rejected outright.
     let seq = column::storable_i64("append_audit", "seq", entry.seq)?;
     let ts = column::storable_i64("append_audit", "ts", entry.ts)?;
     let affected = exec(
@@ -1551,8 +1468,7 @@ fn append_audit_in(tx: &Connection, entry: &AuditRecord) -> RecordStoreResult<()
             entry.hash,
         ],
     )?;
-    // A collision is EITHER the write-through retrying (identical: Ok) or two records claiming one
-    // chain position (a forked or tampered log, the thing an audit store must report).
+
     if affected == 0 {
         let stored = query_one(
             tx,
@@ -1585,8 +1501,6 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     if let Some((id, parent, ts, disposition, body)) = existing {
-        // Identical is the write-through retrying (success); different is a forked chain (an error,
-        // as in `append_audit`). The message names the position and echoes no stored content.
         if id == record.id
             && parent.as_deref() == record.parent
             && ts == row.ts
@@ -1688,11 +1602,11 @@ impl RecordStore for SqliteStore {
             }
             let rev = Self::bump_revision(tx)?;
             let now = now_secs();
-            // Explicit DELETE, not only the FK CASCADE, which does not depend on every caller
-            // having set `PRAGMA foreign_keys`.
+
+
             tx.execute("DELETE FROM credentials WHERE key_id=?1", params![id])
                 .store()?;
-            // `enabled=0` and `deleted_at` in the SAME statement, or `keys_tombstone_off` fires.
+
             let changed = tx
                 .execute(
                     "UPDATE keys SET enabled=0, deleted_at=?2, updated_at=?2, revision=?3 WHERE id=?1",
@@ -1769,7 +1683,6 @@ impl RecordStore for SqliteStore {
     ) -> RecordStoreResult<()> {
         const OP: &str = "put_key_with_credential";
         self.write(true, |tx| {
-            // Refused before anything is written: the key is not minted, no revision is spent.
             if key.deleted_at.is_some() {
                 return Err(RecordStoreError(format!(
                     "{OP}: key '{}' is tombstoned; a credential is never minted onto it",
@@ -1810,9 +1723,6 @@ impl RecordStore for SqliteStore {
 
     fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            // Read in the same transaction as the write, or a concurrent insert could make the
-            // answer a lie. Unknown is an error and already revoked is Ok (idempotent): collapsing
-            // them would tell an operator responding to a leak that a live credential is dead.
             let revoked: Option<bool> = tx
                 .query_row(
                     "SELECT revoked_at IS NOT NULL FROM credentials WHERE id=?1",
@@ -1828,7 +1738,7 @@ impl RecordStore for SqliteStore {
                 Some(true) => Ok(()),
                 Some(false) => {
                     let rev = Self::bump_revision(tx)?;
-                    // The secret is destroyed with the revocation: it must not outlive its use.
+
                     tx.execute(
                         "UPDATE credentials SET secret=NULL, secret_form='none', revoked_at=?2,
                              revoke_reason=?3, updated_at=?2, revision=?4 WHERE id=?1",
@@ -1917,7 +1827,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// FULL sync, like every revocation path: a denial lost to a power cut makes the token valid
-    /// again on reboot with no error ever reported.
     fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             tx.execute(
@@ -1936,13 +1845,7 @@ impl RecordStore for SqliteStore {
         })
     }
 
-    // The neutral kind-tagged plane-record verbs: one table, `plane_records`, for every kind. The
-    // store never decodes a `body`; identity, ordering and retention read only the typed sidecar
-    // columns. Every write is FULL sync: a transition, a quarantine, a capability or a chain record
-    // handed back by a power cut is worse than a slow commit.
-
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        // Keyed on the record's own id, parent or not: the contract upserts by `(kind, id)`.
         let row = PlaneRow::of(record, record.id, UPSERT_SEQ, "upsert_plane_record")?;
         self.write(true, |tx| {
             tx.execute(
@@ -1959,7 +1862,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// An upserted record lives at `(kind, id, 0)`. No caller-scoping filter: authorization stays
-    /// engine-side, or an unauthorized reader bypasses it by configuring a different backend.
     fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
         query_one(
             &self.lock_reader(),
@@ -1974,7 +1876,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// Unfiltered beyond the selector, terminal rows included (boot rehydrate wants the active
-    /// rows, the retention sweep the terminal ones). Oldest-first by `seq`.
     fn list_plane_records(
         &self,
         kind: &str,
@@ -2008,7 +1909,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// The age-only entry: `task` drops only its TERMINAL rows, every other kind every older row. A
-    /// caller that carries the rule calls `purge_plane_records`.
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
         let retention = if kind == "task" {
             Retention::TerminalOnly
@@ -2019,10 +1919,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
-    /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
-    /// sits still longest), `Age` every older row; under either, a purged task takes its
-    /// `task_event` chain with it, and the count is the task rows. A cutoff past the signed
-    /// timestamp range includes every storable timestamp, including the signed maximum.
     fn purge_plane_records(
         &self,
         kind: &str,
@@ -2064,7 +1960,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// Absent is a no-op; every `seq` under the identity goes, so a chain is never left partial.
-    /// A task takes its `task_event` chain with it.
     fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             if kind == "task" {
@@ -2090,15 +1985,13 @@ impl RecordStore for SqliteStore {
         expires_at: u64,
         _now: u64,
     ) -> RecordStoreResult<bool> {
-        // SQLite shares the host clock across connections to this local file. Read it after
-        // acquiring BEGIN IMMEDIATE, so the sweep and admission use one serialized instant.
         self.write(true, |tx| {
             let now_i = shared_clock(tx)?;
             let store_now = now_i as u64;
             if expires_at < store_now {
                 return Ok(false);
             }
-            // The existing storage policy clamps never-expiring grants to i64::MAX.
+
             let expires = column::clamp(expires_at);
             tx.execute("DELETE FROM plane_tokens WHERE expires_at < ?1", [now_i])
                 .store()?;
@@ -2114,8 +2007,6 @@ impl RecordStore for SqliteStore {
     }
 
     /// Multi-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record, live while
-    /// present, still `active`, and `now` not past `expires_at`. Reserved tickets instead require
-    /// their terminal record and exact deadline under the shared clock. Uncertain answers fail closed.
     fn plane_token_live(
         &self,
         kind: &str,
@@ -2168,9 +2059,6 @@ struct PlaneRow {
 
 impl PlaneRow {
     /// Refused rather than mangled: a `u64` past `i64::MAX` would wrap negative and read back
-    /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
-    /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
-    /// upserted record's own id.
     fn of(
         record: PlaneRecordRef<'_>,
         identity: &str,
@@ -2209,9 +2097,7 @@ fn put_credential_inner(
     method: &str,
 ) -> RecordStoreResult<()> {
     let m = &secret.meta;
-    // The owning key must EXIST and be LIVE, checked in the caller's transaction: the FK covers only
-    // "no such row", a tombstone is still a row, and a caller-side check is the gap a concurrent
-    // `delete_key` lands in.
+
     let owner_live: Option<bool> = tx
         .query_row(
             "SELECT deleted_at IS NULL FROM keys WHERE id=?1",
@@ -2256,8 +2142,7 @@ fn put_credential_inner(
                 m.id
             )));
         }
-        // A live credential re-put identically (revision aside) is the retry of a write that
-        // landed: Ok, nothing written.
+
         let mut same = secret.clone();
         same.meta.revision = sm.revision;
         if same == stored {
@@ -2265,8 +2150,7 @@ fn put_credential_inner(
         }
         return Err(live_slot(&sm.kind, &sm.key_id, sm.slot));
     }
-    // A LIVE occupant of the slot must fail rather than silently destroy a working credential
-    // mid-overlap-window; a REVOKED one is replaced by the upsert below.
+
     let occupant: Option<(String, bool)> = query_one(
         tx,
         "SELECT id, revoked_at IS NULL FROM credentials WHERE key_id=?1 AND kind=?2 AND slot=?3",
@@ -2291,7 +2175,7 @@ fn put_credential_inner(
         )));
     }
     let revision = revision(tx)?;
-    // `updated_at` is its own parameter (?11), not a second use of `created_at`'s.
+
     tx.execute(
         "INSERT INTO credentials (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?11,?9,NULL,NULL,?10)

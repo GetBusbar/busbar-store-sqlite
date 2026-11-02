@@ -130,8 +130,6 @@ fn apply(store: &SqliteStore, request: &Request) -> OpResult<Decision> {
     }
 }
 
-// Include all physical raw rows and the receipt, so a conflict/rollback cannot hide partial effects
-// behind only the public row projection. Every query observes one reader snapshot.
 fn snapshot(store: &SqliteStore) -> Vec<Vec<Vec<Value>>> {
     let conn = store.lock_reader();
     let _snapshot = conn.unchecked_transaction().unwrap();
@@ -189,7 +187,7 @@ fn absent_insert_all_rows_high_u64_and_receipt_replay_survive_restart() {
         );
     }
     let committed = snapshot(&store);
-    drop(store); // The caller lost the result and retains the exact candidate across restart.
+    drop(store);
     let reopened = SqliteStore::open(&path, BUSY_TIMEOUT_MS).unwrap();
     assert_eq!(apply(&reopened, &request), Ok(Decision::Applied));
     assert_eq!(snapshot(&reopened), committed);
@@ -211,7 +209,7 @@ fn mismatched_usage_live_key_or_metering_has_no_effect_or_receipt() {
     let before = snapshot(&store);
     assert_eq!(apply(&store, &request), Ok(Decision::ConditionConflict));
     assert_eq!(snapshot(&store), before);
-    let request = candidate(&store, 1); // A refused candidate never consumes its operation identity.
+    let request = candidate(&store, 1);
     store.add_metering(&metering(KEY)).unwrap();
     let before = snapshot(&store);
     assert_eq!(apply(&store, &request), Ok(Decision::ConditionConflict));
@@ -255,7 +253,7 @@ fn every_historical_metering_identity_and_counter_participates_in_the_compare() 
     }
     store.put_key(&key(OTHER_KEY)).unwrap();
     store.add_metering(&metering(OTHER_KEY)).unwrap();
-    // A different key in the same day does not change this complete key/day selection.
+
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
 }
 
@@ -355,7 +353,7 @@ fn legacy_reserved_writes_refuse_but_an_exact_old_receipt_replays_first() {
         .add_usage(correction::ADJUST_DOWN_BUCKET, WINDOW, &delta())
         .is_err());
     assert_eq!(snapshot(&store), before);
-    // A historical durable receipt is replayed before the new legacy-write guard.
+
     let body = Dedupe::usage(&cells).body_hex();
     store
         .write(true, |tx| {
@@ -465,9 +463,9 @@ fn ordinary_metering_key_delete_and_absent_row_insert_serialize_after_acceptance
                 }
             });
             starting.recv_timeout(DEADLINE).unwrap();
-            // The correction's transaction is invisible to an independent WAL reader.
+
             let during = other.get_usage(BUCKET, WINDOW).unwrap();
-            release.send(()).unwrap(); // Release before assertions to avoid stranding a worker.
+            release.send(()).unwrap();
             assert_eq!(correction.join().unwrap(), Ok(Decision::Applied));
             ordinary.join().unwrap().unwrap();
             assert_eq!(during, UsageLedger::default());
@@ -604,7 +602,7 @@ fn empty_model_totals_and_units_roundtrip_through_put_add_and_correction() {
 #[test]
 fn legacy_sentinel_empty_model_units_survive_read_and_first_exact_add() {
     let (store, _path, _dir) = on_file();
-    // A legacy empty-model accrual shares the totals sentinel. Its tokens remain real raw counts.
+
     store.lock_writer().execute(
         "INSERT INTO usage_windows(window_start,bucket_id,model,requests,billable_requests,tokens_input) VALUES (?1,?2,'',?3,?4,?5)",
         params![WINDOW as i64, BUCKET, 41, 37, 31]).unwrap();
@@ -629,7 +627,7 @@ fn legacy_sentinel_empty_model_units_survive_read_and_first_exact_add() {
         *count += 1;
     }
     assert_eq!(store.get_usage(BUCKET, WINDOW).unwrap(), expected);
-    // Fresh ordinary empty-model deltas must also retain both request totals and all unit classes.
+
     store.add_usage(BUCKET, WINDOW + 1, &increment).unwrap();
     let mut fresh = ledger(1);
     fresh.models[0].model.clear();
@@ -660,7 +658,6 @@ fn zero_open_units_stay_sparse_in_exact_rows_and_correction_replays() {
         expected
     );
 
-    // A v18 exact row written before the sparse repair reads the same way without a rewrite.
     store
         .write(true, |tx| {
             exec(

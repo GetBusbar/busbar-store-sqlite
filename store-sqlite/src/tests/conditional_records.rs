@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The conditional-record backend's ordinary behavior. These feature tests require the negotiated
-//! SDK interface; an older SDK's missing API is not a behavioral RED for this implementation.
 
 use super::*;
 use busbar_contract::abi::sdk::store::conditional::{
@@ -217,7 +216,6 @@ fn an_empty_blob_is_present_and_differs_from_an_absent_record() {
 }
 
 /// Pause SQLite while it prepares the second, DELETE mutation, after the first INSERT executed.
-/// A separate live store observes the old pair and no receipt, then the new pair and its receipt.
 #[test]
 fn independent_readers_never_observe_a_partial_record_batch_or_receipt() {
     let (writer, path, _dir) = on_file("atomic-visibility");
@@ -257,7 +255,7 @@ fn independent_readers_never_observe_a_partial_record_batch_or_receipt() {
             .recv_timeout(Duration::from_secs(10))
             .expect("the real second mutation was reached");
         let during = observe();
-        // Release before asserting, so a failed observation cannot strand the worker.
+
         release.send(()).unwrap();
         let answer = worker.join().unwrap();
         assert_eq!(
@@ -402,7 +400,7 @@ fn noops_conflicts_and_replays_preserve_revision_and_existing_receipts() {
         vec![put(b"a", b"same"), delete(b"already-absent")],
     );
     assert_eq!(transact(&store, &request), Ok(Decision::Applied));
-    // Make an accidental receipt rewrite observable independently of the wall-clock tick.
+
     store
         .lock_writer()
         .execute(
@@ -437,7 +435,7 @@ fn a_lost_answer_replays_the_same_receipt_after_restart_before_rechecking_predic
         vec![predicate(b"a", Expected::Absent)],
         vec![put(b"a", b"committed")],
     );
-    // The caller loses the answer after the durable write. It retains this immutable candidate.
+
     let _lost_answer = transact(&store, &request).unwrap();
     let committed = snapshot(&store);
     drop(store);

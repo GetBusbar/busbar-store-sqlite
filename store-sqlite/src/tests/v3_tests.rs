@@ -2,10 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! Tests for `store-sqlite/src/v3.rs`: the store v3 slots' dedupe (S1-S4) and its DURABILITY across
-//! a reopen of the file, the count batches, the schema records, and the v13 drop of the money
-//! tables. The behavioural cases
-//! are the in-tree memory store's (`crates/store-memory/src/tests/v3_tests.rs` at the pin), held to
-//! this backend; the durability cases are this backend's own.
 
 use super::*;
 use busbar_contract::records::{ModelTokensDelta, RecordStore};
@@ -162,7 +158,7 @@ fn a_usage_batch_applies_its_cells_in_order() {
     };
     s.v3_add_usage_batch(op(1), &[("k", 60, neg), ("k", 60, pos)])
         .expect("batch");
-    // The floor at zero makes order matter: -1 then +1 is 1, not 0.
+
     assert_eq!(
         RecordStore::get_usage(&s, "k", 60)
             .expect("read")
@@ -203,7 +199,7 @@ fn an_op_id_is_forgotten_after_its_retention() {
     let s = fresh();
     s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
         .expect("a");
-    // Age op 1 past its retention, as the clock would.
+
     let old = now_secs() - OP_ID_RETENTION_SECS as i64;
     s.lock_writer()
         .execute(
@@ -211,7 +207,7 @@ fn an_op_id_is_forgotten_after_its_retention() {
             params![old, op(1).0.as_slice()],
         )
         .expect("age");
-    // The expired op_id reads as new, whether or not a sweep has run.
+
     s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
         .expect("b");
     s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
@@ -223,7 +219,6 @@ fn an_op_id_is_forgotten_after_its_retention() {
 }
 
 /// An expired row is not honoured when no sweep has run: the sweep fires on op 0 and every 256th,
-/// so after op 0 the aged row below is still in the table when its op_id returns.
 #[test]
 fn an_expired_op_id_is_not_honoured_before_any_sweep() {
     let s = fresh();
@@ -292,10 +287,7 @@ fn schema_records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     assert_eq!(keys(b"k\xff", 10), vec![b"k\xff".to_vec()]);
 }
 
-/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
-/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
-/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
-/// row that is not there is `Ok`.
+/// An empty put removes the stored row.
 #[test]
 fn an_empty_put_removes_the_row() {
     let s = fresh();
@@ -371,7 +363,6 @@ fn a_prefix_scan_returns_exactly_the_keys_the_prefix_starts() {
 }
 
 /// S4: dedupe is DURABLE. Every write below is replayed on a REOPENED file: the replays apply
-/// nothing and answer the originals, and a reused id with another body is still a conflict.
 #[test]
 fn dedupe_survives_a_reopen_of_the_file() {
     let (s, path, _dir) = on_file("durable");
@@ -436,7 +427,6 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
 }
 
 /// A body an older build recorded (`slot:{:?}`) still dedupes after the upgrade, inside the
-/// retention window: the same op replays and applies nothing, a different op conflicts.
 #[test]
 fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     let s = fresh();
@@ -515,7 +505,6 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
 }
 
 /// A value the columns cannot hold is REFUSED (the host may re-send), not Failed (replayed forever),
-/// and nothing is applied or recorded.
 #[test]
 fn values_the_columns_cannot_hold_are_refused_not_failed() {
     let s = fresh();
@@ -577,7 +566,6 @@ fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
     let s = fresh();
     s.v3_record_put("p", b"aa", b"v").expect("put");
     let steps = |s: &SqliteStore| {
-        // `:memory:` has one connection, so the scan runs on the writer holding the handler.
         s.lock_writer()
             .progress_handler(
                 1,
@@ -595,14 +583,14 @@ fn a_prefix_scan_does_no_work_for_rows_past_the_prefix() {
         assert_eq!(rows.len(), 1);
         STEPS.load(Ordering::Relaxed)
     };
-    steps(&s); // prepares and caches the statement
+    steps(&s);
     let few = steps(&s);
     for i in 0..2000u32 {
         s.v3_record_put("p", format!("z{i:05}").as_bytes(), b"v")
             .expect("put");
     }
     let many = steps(&s);
-    // A deeper b-tree costs a step or two; stepping over 2000 rows costs thousands.
+
     assert!(
         many <= few + 10,
         "rows past the prefix were stepped over: {few} vs {many}"
@@ -616,7 +604,6 @@ fn ops_recorded(s: &SqliteStore) -> i64 {
 }
 
 /// A failed op (a fork) records nothing, so the same `op_id` retried with a record that does not
-/// fork applies instead of conflicting.
 #[test]
 fn a_failed_op_records_nothing_and_its_op_id_can_be_retried() {
     let s = fresh();
@@ -679,7 +666,7 @@ fn a_usage_batch_whose_second_cell_fails_rolls_back_the_first() {
 fn the_retention_sweep_deletes_aged_rows_every_sweep_every_ops() {
     let s = fresh();
     s.v3_add_usage_batch(op(0), &[("k", 60, delta(1, 1))])
-        .unwrap(); // the first op sweeps
+        .unwrap();
     let aged = |s: &SqliteStore| -> i64 {
         s.lock_writer()
             .query_row(

@@ -8,7 +8,6 @@ use busbar_contract::records::{
 use rusqlite::TransactionBehavior;
 
 /// A credential resolved by `(kind, public_id)`, read off the store's own rows: what the tests below
-/// check a cascade or an upgrade left behind (the store table has no lookup slot).
 trait Lookup {
     fn lookup_credential_secret(
         &self,
@@ -75,10 +74,6 @@ fn sample_credential(key_id: &str, public_id: &str, slot: u8) -> CredentialSecre
 }
 
 /// `CredentialMeta::updated_at` must round-trip as its own value. Bound to `created_at`'s
-/// placeholder, the caller's value was silently discarded and every credential reported that it was
-/// last changed when it was minted. The keys table carries a dedicated regression test for exactly
-/// this shape; the credentials table had none, and the fixture's `created_at == updated_at == 0`
-/// meant no existing assertion could tell the two apart.
 #[test]
 fn credential_updated_at_round_trips_as_its_own_value() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -117,8 +112,6 @@ fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
     }
 }
 
-// ── Basic key CRUD ──────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn oversized_labels_are_refused_with_a_clear_text() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -140,7 +133,6 @@ fn oversized_labels_are_refused_with_a_clear_text() {
 }
 
 /// The CHECK counts characters (`length()` on TEXT), not bytes: multi-byte labels under 4096
-/// characters were always storable and still are.
 #[test]
 fn multibyte_labels_under_the_character_limit_are_accepted() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -163,16 +155,13 @@ fn put_get_roundtrips_a_key() {
 }
 
 /// `keys.updated_at` has no Rust-side reader (`KEY_COLS` omits it -- it exists purely for direct
-/// SQL/operator inspection), so this reads it back via raw SQL like the other CHECK/trigger tests
-/// in this file. Regression test for `put_key_inner`'s ON CONFLICT branch reusing `created_at`
-/// (bound param `?6`) for `updated_at` instead of stamping the actual mutation time.
 #[test]
 fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut k = sample_key("vk_stamp", "g1");
     k.created_at = 1_000;
     s.put_key(&k).unwrap();
-    // Mutate (rename) and put again -- this goes through the ON CONFLICT DO UPDATE branch.
+
     k.name = "renamed".to_string();
     let before = now_secs();
     s.put_key(&k).unwrap();
@@ -187,8 +176,7 @@ fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
         updated_at, k.created_at as i64,
         "updated_at must reflect the actual mutation time, not be frozen at created_at"
     );
-    // Not merely "anything but created_at": the mutation time itself, bracketed by the clock read
-    // on either side of the write (a revision, a zero or any other bound value falls outside).
+
     assert!(
         (before..=after).contains(&updated_at),
         "updated_at {updated_at} must be the mutation time, within [{before}, {after}]"
@@ -196,11 +184,6 @@ fn put_key_update_stamps_updated_at_to_mutation_time_not_created_at() {
 }
 
 /// `SqliteStore::open`'s `:memory:` routing must recognize every spelling `apply_pragmas`'s own
-/// `is_memory` check recognizes -- not just the bare `:memory:` literal. Regression test for a
-/// gap where `open()` used `path == ":memory:"` (exact match only) while `apply_pragmas` already
-/// used the broader `is_memory_path` check: a URI-form spelling like `file::memory:` would fall
-/// through to `open_with_readers`, which opens N+1 independent, mutually-invisible private
-/// in-memory databases (only the writer gets `migrate()`'s schema; every reader sees no tables).
 #[test]
 fn memory_uri_spellings_other_than_the_bare_literal_are_still_single_connection() {
     for path in ["file::memory:", "file:test?mode=memory&cache=shared"] {
@@ -212,8 +195,7 @@ fn memory_uri_spellings_other_than_the_bare_literal_are_still_single_connection(
         );
         let k = sample_key("vk_mem", "g");
         s.put_key(&k).unwrap();
-        // If a reader pool had been created against an isolated private DB, this would fail with
-        // "no such table: keys" instead of returning the row just written on the writer.
+
         assert!(
             s.get_key("vk_mem").unwrap().is_some(),
             "open({path:?}): reader path must see the row written on the writer connection"
@@ -266,7 +248,6 @@ fn list_keys_since_lists_an_unstamped_revision_zero_row() {
 }
 
 /// The credential-side half of the same revision-based hydration mechanism as
-/// `list_keys_since_only_returns_keys_past_the_watermark` — had zero coverage before this test.
 #[test]
 fn list_credentials_since_only_returns_credentials_past_the_watermark() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -279,10 +260,7 @@ fn list_credentials_since_only_returns_credentials_past_the_watermark() {
     let delta = s.list_credentials_since(watermark).unwrap();
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].meta.public_id, "AKIA_B");
-    // Must be ordered by revision (the hydration contract), not insertion/id order. Revoking
-    // slot 0 bumps that SAME physical row's revision again (revoke/remint reuse the row via the
-    // key_id+kind+slot UPSERT) rather than appending a new one, so the delta still reflects each
-    // row's latest state, ordered by its latest revision.
+
     let a_id = s.list_credentials("vk_ca").unwrap()[0].id.clone();
     s.revoke_credential(&a_id, "rotated").unwrap();
     let delta2 = s.list_credentials_since(watermark).unwrap();
@@ -303,8 +281,6 @@ fn list_credentials_since_only_returns_credentials_past_the_watermark() {
     );
 }
 
-// ── Tombstone delete: the redesign's central behavior change ──────────────────────────────────
-
 #[test]
 fn delete_key_tombstones_not_removes() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -320,8 +296,6 @@ fn delete_key_tombstones_not_removes() {
 }
 
 /// A tombstone is a MUTATION a hydrating peer must see: `delete_key` stamps a new revision, so a
-/// peer reading `list_keys_since` from its watermark receives the key with `deleted_at` set and
-/// stops honouring it. Without the stamp the revoked key stays live on every peer.
 #[test]
 fn delete_key_bumps_the_revision_so_hydration_sees_the_tombstone() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -363,7 +337,7 @@ fn delete_key_is_idempotent() {
     s.put_key(&sample_key("vk_x", "g")).unwrap();
     s.delete_key("vk_x").unwrap();
     let rev_after_first = s.get_key("vk_x").unwrap().unwrap().revision;
-    s.delete_key("vk_x").unwrap(); // must not error, must not bump revision again
+    s.delete_key("vk_x").unwrap();
     let rev_after_second = s.get_key("vk_x").unwrap().unwrap().revision;
     assert_eq!(
         rev_after_first, rev_after_second,
@@ -372,23 +346,18 @@ fn delete_key_is_idempotent() {
 }
 
 /// HARDEST INVARIANT #1: the tombstone UPDATE's atomicity. `keys_tombstone_off` (`deleted_at IS NULL
-/// OR enabled = 0`) would reject a transient `enabled=1, deleted_at=now` state — this test proves
-/// `delete_key` sets both flags in the SAME statement by attempting exactly that split, by hand,
-/// through raw SQL, and confirming the CHECK constraint rejects it (proving the constraint is real
-/// and would have caught a two-statement `delete_key` if one were ever (re)introduced).
 #[test]
 fn tombstone_flags_cannot_be_set_transiently_split() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.put_key(&sample_key("vk_split", "g")).unwrap();
     let conn = s.lock_writer();
-    // Attempt the UNSAFE two-statement form directly: set deleted_at first, leaving enabled=1 -
-    // this must be rejected by keys_tombstone_off, proving the constraint is load-bearing.
+
     let result = conn.execute("UPDATE keys SET deleted_at = 999 WHERE id='vk_split'", []);
     assert!(
         result.is_err(),
         "keys_tombstone_off must reject deleted_at set while enabled=1"
     );
-    // The real (correct) single-statement form must succeed.
+
     conn.execute(
         "UPDATE keys SET enabled=0, deleted_at=999 WHERE id='vk_split'",
         [],
@@ -397,7 +366,6 @@ fn tombstone_flags_cannot_be_set_transiently_split() {
 }
 
 /// HARDEST INVARIANT #2: `keys_guard_hard_delete` actually blocks a raw DELETE when metering rows
-/// exist for that key — the backstop against DB-level surgery bypassing the tombstone path.
 #[test]
 fn hard_delete_blocked_when_metering_rows_exist() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -425,15 +393,13 @@ fn hard_delete_blocked_when_metering_rows_exist() {
         result.is_err(),
         "keys_guard_hard_delete must block a raw DELETE when billing rows exist"
     );
-    // A key with NO metering rows must be hard-deletable directly (the trigger is scoped, not blanket).
+
     drop(conn);
     s.put_key(&sample_key("vk_unbilled", "g")).unwrap();
     let conn = s.lock_writer();
     conn.execute("DELETE FROM keys WHERE id='vk_unbilled'", [])
         .unwrap();
 }
-
-// ── Credentials: slot bounds, revoke, secret isolation ─────────────────────────────────────────
 
 #[test]
 fn credential_mint_into_occupied_live_slot_fails() {
@@ -450,8 +416,6 @@ fn credential_mint_into_occupied_live_slot_fails() {
 }
 
 /// A revocation is EVIDENCE: its reason and time must read back as recorded, and a second revoke of
-/// the same credential is an idempotent no-op that keeps the first reason and time rather than
-/// overwriting what the operator responding to a leak wrote down.
 #[test]
 fn revoke_credential_records_its_reason_and_a_second_revoke_keeps_the_first() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -496,7 +460,7 @@ fn credential_mint_into_revoked_slot_succeeds() {
         .unwrap();
     let old_id = s.list_credentials("vk_c2").unwrap()[0].id.clone();
     s.revoke_credential(&old_id, "rotated").unwrap();
-    // Slot 0 is now revoked, so re-minting into it must succeed (overlap-window rotation).
+
     s.put_credential(&sample_credential("vk_c2", "AKIA_NEW", 0))
         .unwrap();
     let live: Vec<_> = s
@@ -510,17 +474,13 @@ fn credential_mint_into_revoked_slot_succeeds() {
 }
 
 /// Overlap-window rotation: mint into the FREE slot (1) while slot 0 is still live, so both
-/// credentials for the same key_id+kind are live simultaneously — the actual scenario `slot`
-/// exists for (mint the replacement, hand it out, only THEN revoke the old one). Every other
-/// credential test in this file uses slot 0 exclusively; this is the only one that ever puts a
-/// row into slot 1 or has two live rows for one key_id+kind at once.
 #[test]
 fn credential_overlap_window_rotation_keeps_both_slots_live_simultaneously() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.put_key(&sample_key("vk_overlap", "g")).unwrap();
     s.put_credential(&sample_credential("vk_overlap", "AKIA_OLD", 0))
         .unwrap();
-    // Mint the replacement into the free slot (1) BEFORE revoking slot 0 -- both must be live.
+
     s.put_credential(&sample_credential("vk_overlap", "AKIA_NEW", 1))
         .unwrap();
     let live: std::collections::BTreeSet<_> = s
@@ -535,7 +495,7 @@ fn credential_overlap_window_rotation_keeps_both_slots_live_simultaneously() {
         std::collections::BTreeSet::from(["AKIA_OLD".to_string(), "AKIA_NEW".to_string()]),
         "both slots must resolve as live during the overlap window"
     );
-    // Only now retire the old one, leaving exactly the new credential live.
+
     let old_id = s
         .list_credentials("vk_overlap")
         .unwrap()
@@ -586,8 +546,6 @@ fn a_taken_public_id_is_refused_with_the_intended_text() {
     );
 }
 
-// ── Usage ledger ─────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn add_usage_accumulates_and_floors_at_zero() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -623,14 +581,10 @@ fn put_usage_is_an_absolute_overwrite() {
 }
 
 /// A zero-model add_usage call (e.g. a rejected request: it counts toward `requests` but never
-/// reached a model) followed by a real-model add_usage call for the SAME (window, bucket) must not
-/// let the two calls' `requests` diverge. Before the sentinel-row fix, the empty-models call wrote
-/// requests only onto the model='' row while the model call wrote its own (different!) requests onto
-/// the model row — get_usage's MIN() picked whichever was smaller, silently undercounting.
 #[test]
 fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
     let s = SqliteStore::open_in_memory().unwrap();
-    // First: a rejected request. requests=1, zero models.
+
     s.add_usage(
         "vk_mix",
         300,
@@ -641,7 +595,7 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
         },
     )
     .unwrap();
-    // Then: a real request against a model. requests=1 again (its own admission), one model.
+
     s.add_usage("vk_mix", 300, &delta(1, "gpt", 10, 5)).unwrap();
     let ledger = s.get_usage("vk_mix", 300).unwrap();
     assert_eq!(
@@ -717,8 +671,6 @@ fn add_metering_saturates_at_i64_max_instead_of_erroring() {
         assert_eq!(r.usage_units["custom"], max);
     }
 }
-
-// ── Metering ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn metering_accumulates_and_carries_group_and_pricing_attribution() {
@@ -808,13 +760,11 @@ fn metering_bucket_keys_preserve_the_full_unsigned_range_across_reopen() {
     }
 }
 
-// ── Denylist ─────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn denylist_add_and_list_and_idempotent() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.add_denylist("vk_d", "compromised").unwrap();
-    s.add_denylist("vk_d", "compromised again").unwrap(); // idempotent, a no-op
+    s.add_denylist("vk_d", "compromised again").unwrap();
     let list = s.list_denylist().unwrap();
     assert_eq!(list, vec!["vk_d".to_string()]);
 }
@@ -833,8 +783,6 @@ fn add_denylist_twice_is_a_no_op_that_keeps_the_first_reason() {
     assert_eq!(reason, "a");
 }
 
-// ── Audit log ────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn audit_log_append_and_replay_is_idempotent() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -849,7 +797,7 @@ fn audit_log_append_and_replay_is_idempotent() {
         hash: "h1".to_string(),
     };
     s.append_audit(&rec).unwrap();
-    s.append_audit(&rec).unwrap(); // replay of the same seq must not error or duplicate
+    s.append_audit(&rec).unwrap();
     assert_eq!(s.list_audit().unwrap().len(), 1);
 }
 
@@ -898,21 +846,14 @@ fn list_audit_tail_bounds_and_preserves_order() {
     assert_eq!(tail[1].seq, 5);
 }
 
-// ── Pragma / transaction-mode invariants ────────────────────────────────────────────────────────
-
 /// HARDEST INVARIANT #4: `BEGIN IMMEDIATE` vs `BEGIN DEFERRED` genuinely matters. A DEFERRED
-/// transaction that reads first, then attempts to upgrade to a write while ANOTHER connection holds
-/// the write lock, fails with `SQLITE_BUSY_SNAPSHOT` -- which bypasses the busy handler / configured
-/// `busy_timeout` entirely and fails instantly, regardless of the timeout. An IMMEDIATE transaction
-/// acquires the write lock up front, so the SAME contention correctly goes through the busy handler
-/// and (with a nonzero timeout) succeeds once the other writer releases.
 #[test]
 fn begin_immediate_succeeds_under_contention_where_deferred_fails_instantly() {
     let dir = tempdir();
     let path = dir.join("contend.db");
     let path_str = path.to_str().unwrap();
     let store = SqliteStore::open_with_readers(path_str, 2000, 0).unwrap();
-    drop(store); // just wanted migrate() to have created the schema
+    drop(store);
 
     let mut holder = Connection::open(path_str).unwrap();
     apply_pragmas(&holder, path_str, 2000, true).unwrap();
@@ -925,18 +866,17 @@ fn begin_immediate_succeeds_under_contention_where_deferred_fails_instantly() {
             [],
         )
         .unwrap();
-    // holder_tx now holds the write lock, uncommitted.
 
     let mut contender = Connection::open(path_str).unwrap();
-    apply_pragmas(&contender, path_str, 50, true).unwrap(); // short timeout: fail fast if BUSY, not BUSY_SNAPSHOT-instant
+    apply_pragmas(&contender, path_str, 50, true).unwrap();
     let deferred = contender
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .unwrap();
-    // A read first (deferred doesn't take the write lock yet)...
+
     let _: i64 = deferred
         .query_row("SELECT COUNT(*) FROM store_meta", [], |r| r.get(0))
         .unwrap();
-    // ...then attempt to write, which must upgrade the lock while `holder_tx` still holds it.
+
     let deferred_write_result =
         deferred.execute("INSERT INTO store_meta (k, v) VALUES ('x','1')", []);
     assert!(
@@ -944,12 +884,7 @@ fn begin_immediate_succeeds_under_contention_where_deferred_fails_instantly() {
         "a DEFERRED transaction's write-upgrade must fail while another writer holds the lock"
     );
 
-    // IMMEDIATE takes the write lock at BEGIN, so an attempt while holder_tx is open would also
-    // fail -- but through the busy-handler-honoring path, not the BUSY_SNAPSHOT bypass. Prove the
-    // acquisition mechanism itself works correctly once the lock is free (the actual proof of "goes
-    // through the normal locking protocol" is the code path used, verified by the pragma-order test
-    // and the type-level doc; this test's job is to show DEFERRED's failure mode specifically).
-    drop(deferred); // release contender's DEFERRED transaction before starting a new one
+    drop(deferred);
     holder_tx.rollback().unwrap();
     let immediate2 = contender
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -961,10 +896,6 @@ fn begin_immediate_succeeds_under_contention_where_deferred_fails_instantly() {
 }
 
 /// The same invariant through the STORE's own write path, not raw rusqlite: a store write that
-/// reads before it writes (`append_plane_record` reads the chain position first) runs while another
-/// connection holds the write lock and commits a change underneath it. Under `BEGIN IMMEDIATE` the
-/// store waits at BEGIN through its busy handler and then succeeds; under `DEFERRED` its read
-/// snapshot is stale by the time it writes, and it fails with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT`.
 #[test]
 fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
     let dir = tempdir();
@@ -979,7 +910,6 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
         )
         .unwrap();
 
-    // The writer's busy handler flags that the store's write really met the held lock.
     static MET_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     store
         .lock_writer()
@@ -992,7 +922,7 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
     let call = sample_call("vk_contend", 1, 100, "", "h1");
     let result = std::thread::scope(|scope| {
         let writer = scope.spawn(|| append_call(&store, &call));
-        // Commit a change underneath the store's write only once it is waiting on the lock.
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !MET_LOCK.load(std::sync::atomic::Ordering::SeqCst) {
             if std::time::Instant::now() >= deadline {
@@ -1002,8 +932,7 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
         }
         let met_lock = MET_LOCK.load(std::sync::atomic::Ordering::SeqCst);
         let committed = holder.execute_batch("COMMIT");
-        // Release even a failed COMMIT before joining or asserting: the writer's busy handler
-        // otherwise retries forever while the scope tries to join it during panic unwinding.
+
         drop(holder);
         let result = writer.join();
         assert!(met_lock, "the store's write never met the held lock");
@@ -1023,11 +952,6 @@ fn a_store_write_under_contention_waits_for_the_lock_instead_of_failing() {
 mod key_timestamps;
 
 /// HARDEST INVARIANT #5: `foreign_keys` verification actually fails startup if the pragma readback
-/// shows it didn't take. Simulated by calling `apply_pragmas` and confirming it error-checks the
-/// readback rather than trusting the `pragma_update` call blindly (the real SQLITE_OMIT_FOREIGN_KEY
-/// case can't be triggered from a normal bundled build, so this test proves the CHECK LOGIC itself
-/// is present and correct by exercising the success path and inspecting that a failure path exists
-/// in the source, i.e. this documents + locks the contract rather than fabricating a failing build).
 #[test]
 fn foreign_keys_pragma_is_verified_by_readback_not_assumed() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1042,8 +966,6 @@ fn foreign_keys_pragma_is_verified_by_readback_not_assumed() {
 }
 
 /// The refusal half of the readback: `PRAGMA foreign_keys` is a no-op inside an open transaction,
-/// so issuing `apply_pragmas` there leaves enforcement OFF, and the readback must turn that into an
-/// error rather than a store quietly running without the credentials->keys CASCADE.
 #[test]
 fn foreign_keys_that_did_not_take_refuse_the_connection() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1063,9 +985,7 @@ fn foreign_keys_cascade_is_real_not_just_the_app_level_delete() {
     let k = sample_key("vk_fk", "g");
     let cred = sample_credential("vk_fk", "AKIA_FK", 0);
     s.put_key_with_credential(&k, &cred).unwrap();
-    // Bypass delete_key entirely: a raw DELETE FROM keys (blocked by the guard trigger if metering
-    // rows exist, but this key has none) must still cascade to credentials via the real FK, not just
-    // the app-level DELETE inside delete_key.
+
     {
         let conn = s.lock_writer();
         conn.execute("DELETE FROM keys WHERE id='vk_fk'", [])
@@ -1076,8 +996,6 @@ fn foreign_keys_cascade_is_real_not_just_the_app_level_delete() {
         "ON DELETE CASCADE must have removed the credential row"
     );
 }
-
-// ── Targeted guards for individual predicates and bounds in store-sqlite/src/lib.rs ────────────
 
 #[test]
 fn is_memory_path_rejects_a_plain_file_path() {
@@ -1096,8 +1014,6 @@ fn is_memory_path_recognizes_every_documented_spelling() {
 
 #[test]
 fn is_memory_path_file_prefix_alone_is_not_enough() {
-    // `starts_with("file:")` alone must NOT be sufficient -- it must ALSO contain `:memory:`.
-    // A real on-disk `file:` URI naming an ordinary rwc-mode database must not be misrouted.
     assert!(
         !is_memory_path("file:/var/lib/busbar/governance.db?mode=rwc"),
         "a file: URI without :memory: must not be treated as an in-memory spelling"
@@ -1106,8 +1022,6 @@ fn is_memory_path_file_prefix_alone_is_not_enough() {
 
 #[test]
 fn apply_pragmas_writer_and_reader_cache_sizes_are_negative_kib_budgets() {
-    // Negative `cache_size` means "KiB budget" (not "N pages") in SQLite's own pragma semantics --
-    // the sign is load-bearing, not cosmetic. A writer gets a larger budget than a reader.
     let conn = Connection::open_in_memory().unwrap();
     apply_pragmas(&conn, ":memory:", 5000, true).unwrap();
     let writer_cache: i64 = conn
@@ -1131,11 +1045,6 @@ fn apply_pragmas_writer_and_reader_cache_sizes_are_negative_kib_budgets() {
 
 #[test]
 fn apply_pragmas_mmap_disabled_only_for_a_real_network_style_path() {
-    // A path that "looks like" a network filesystem (contains `//`, does not start with `:`, i.e.
-    // is not one of the in-memory spellings) disables mmap defensively. Uses a real temp file
-    // connection (not `:memory:`) so the WAL-enable branch actually runs, matching a real on-disk
-    // open -- the `path` string passed to `apply_pragmas` is independent of the connection's real
-    // backing file, exactly as the production `open_with_readers` call site passes it.
     let dir = tempdir();
     let file = dir.join("net.db");
     let conn = Connection::open(&file).unwrap();
@@ -1149,11 +1058,6 @@ fn apply_pragmas_mmap_disabled_only_for_a_real_network_style_path() {
 
 #[test]
 fn apply_pragmas_mmap_stays_enabled_for_a_colon_prefixed_lookalike() {
-    // A path starting with `:` (the in-memory-spelling prefix character) must NOT trip the
-    // network-path mmap-disable heuristic even if it also happens to contain `//` -- the `!`
-    // negation on `starts_with(':')` is load-bearing. `is_memory_path` also returns true for this
-    // string (it starts with `:memory:`... no -- it starts with just `:`, not `:memory:`, so route
-    // through the WAL-enabling branch on a real file to exercise the full pragma set).
     let dir = tempdir();
     let file = dir.join("colon.db");
     let conn = Connection::open(&file).unwrap();
@@ -1170,9 +1074,6 @@ fn apply_pragmas_mmap_stays_enabled_for_a_colon_prefixed_lookalike() {
 
 #[test]
 fn apply_pragmas_writer_only_pragmas_skipped_for_an_in_memory_writer() {
-    // `journal_size_limit`/`wal_autocheckpoint` are writer-only AND memory-skipped: a `:memory:`
-    // writer must never have them explicitly set (WAL doesn't apply to a private in-memory
-    // database in the first place). SQLite's own unset default for `journal_size_limit` is -1.
     let conn = Connection::open_in_memory().unwrap();
     apply_pragmas(&conn, ":memory:", 5000, true).unwrap();
     let limit: i64 = conn
@@ -1201,9 +1102,7 @@ fn lock_reader_round_robins_without_ever_indexing_out_of_bounds() {
     let dir = tempdir();
     let file = dir.join("readers.db");
     let s = SqliteStore::open_with_readers(file.to_str().unwrap(), 5000, 2).unwrap();
-    // Far more calls than the reader count (and more than reader_count^2) so an off-by-operator
-    // index (`/` instead of `%`, or unwrapped `+` growth instead of wraparound) would either pick
-    // the wrong connection forever or panic on an out-of-bounds index well before this many calls.
+
     for _ in 0..25 {
         let conn = s.lock_reader();
         let one: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
@@ -1318,12 +1217,6 @@ fn list_metering_reads_one_snapshot_while_a_writer_commits() {
 
 #[test]
 fn migrate_rerun_at_current_schema_version_does_not_wipe_data() {
-    // `migrate()`'s legacy-drop block only guards on `version < SCHEMA_VERSION`. The CURRENT
-    // schema's own table names (`keys`, `store_meta`) are ALSO named in the legacy-drop list (the
-    // list has to cover every prior schema generation), so if that guard ever admits
-    // `version == SCHEMA_VERSION` (a `<=` in place of the `<`), a second migrate() call
-    // on an already-current database would find "legacy" tables (its own current ones) and drop
-    // every table, silently wiping live data.
     let s = SqliteStore::open_in_memory().unwrap();
     s.put_key(&sample_key("vk_mig", "g")).unwrap();
     s.migrate()
@@ -1392,7 +1285,6 @@ fn durable_writes_commit_at_synchronous_full_and_ledger_writes_at_normal() {
 }
 
 /// A new database file holds recoverable secrets: created 0600, its WAL files alike; an operator's
-/// existing file keeps its mode.
 #[cfg(unix)]
 #[test]
 fn a_new_database_file_is_private_and_an_existing_one_keeps_its_mode() {
@@ -1468,8 +1360,6 @@ fn a_credential_slot_other_than_0_or_1_is_refused() {
         .unwrap();
 }
 
-// ── Test helpers ─────────────────────────────────────────────────────────────────────────────
-
 /// A scratch directory removed on drop, so a failing test leaves nothing behind.
 pub(crate) struct TempDir(std::path::PathBuf);
 
@@ -1510,10 +1400,6 @@ fn unique_suffix() -> u64 {
 }
 
 /// The `Store` contract conformance suite — THIS crate's own copy, at `src/tests/store_conformance.rs`.
-/// It used to arrive as `busbar-plugin-testkit`; the owner ruled that crate deleted on 2026-09-22 and
-/// #2/#31 forbid a shared test util between plugins, so every backend owns its copy. See that file's
-/// module doc for the full provenance and for what the shared crate was buying: a new ruling no
-/// longer reaches this backend on a dependency bump, it has to be written in here by hand.
 mod store_conformance;
 
 #[path = "tests/credential_rewrap.rs"]
@@ -1523,13 +1409,10 @@ mod credential_rewrap;
 mod credential_timestamps;
 
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
-/// carries, including the 1.6.0 credential-ownership, atomic-mint and plane-record rulings.
 mod conformance {
     use super::store_conformance as conf;
     use super::{tempdir, SqliteStore};
 
-    // Each check opens its OWN in-memory database, so it is already an isolated,
-    // empty namespace and `ns`/`seq` only have to be stable.
     fn fresh() -> SqliteStore {
         SqliteStore::open_in_memory().expect("open an empty in-memory store")
     }
@@ -1600,8 +1483,6 @@ mod conformance {
     }
 
     /// The suite's namespacing exists for a SHARED database: every check again, against ONE real
-    /// file, each under its own `ns` — the shape a fleet of nodes on one file actually has, and the
-    /// one an in-memory handle per check can never exercise.
     #[test]
     fn the_whole_suite_passes_against_one_shared_file() {
         let dir = tempdir();
@@ -1625,8 +1506,6 @@ mod conformance {
     }
 
     /// The two purge checks are the ones whose verb takes no namespace, and the suite salts them so
-    /// two runs sharing one database cannot sweep each other's survivors. Run them CONCURRENTLY on one
-    /// file to hold that — the property the salting exists for.
     #[test]
     fn the_purge_checks_hold_under_a_concurrent_sibling_run() {
         let dir = tempdir();
@@ -1652,13 +1531,6 @@ mod conformance {
 }
 
 /// An out-of-range `seq`/`ts` is refused rather than silently mangled.
-///
-/// `as i64` wraps a `u64` past `i64::MAX` negative, and `row_to_audit` clamps the negative back to 0
-/// on read, so the stored record can never equal the one written. Left unguarded, appending the
-/// IDENTICAL record twice at such a seq reports "the audit chain has forked" while naming the same
-/// action on both sides — a false alarm on the most alarming message this store can emit. Comparing
-/// the round-tripped form instead would silence that by letting two distinct seqs collapse onto one
-/// row, trading a false alarm for silent loss.
 #[test]
 fn append_audit_refuses_a_seq_it_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -1689,26 +1561,12 @@ fn append_audit_refuses_a_seq_it_cannot_store_faithfully() {
         err.0
     );
 
-    // The boundary itself is storable, and an identical retry there is still the benign Ok path.
     rec.ts = 1_700_000_000;
     rec.seq = i64::MAX as u64;
     s.append_audit(&rec).expect("i64::MAX is in range");
     s.append_audit(&rec)
         .expect("an identical retry at the boundary must not read as a forked chain");
 }
-
-// ── THE NEUTRAL PLANE-RECORD VERBS (1.6.0) ───────────────────────────────────────────────────
-//
-// busbar 1.6.0 replaced the fourteen protocol-named durable methods (`put_task`, `append_mcp_call`,
-// `put_mcp_demotion`, `redeem_ask_state`, …) with eight kind-tagged verbs over an opaque
-// `PlaneRecord`. Every property the typed tables were tested for is still owed — a task survives a
-// restart, a chain links, a fork is refused, retention is terminal-only for tasks, a spent approval
-// stays spent across nodes — so each of those tests is carried here onto the verbs that now carry
-// the property. The bodies are small stand-in structs with the field NAMES the planes encode
-// (this store never decodes a body; the tests do, to prove it came back verbatim).
-//
-// The property under test is never "the write returned Ok": the trait's defaults return `Ok` and
-// keep nothing. The only honest proof is to READ IT BACK, and for durability, THROUGH A RESTART.
 
 use serde::{Deserialize, Serialize};
 
@@ -1775,17 +1633,12 @@ fn list_calls(s: &SqliteStore, principal: &str) -> Vec<CallBody> {
 }
 
 /// THE TEST THAT MATTERS. A unit test against a live handle proves nothing here: it cannot
-/// distinguish a backend that wrote to disk from one that kept the rows in a HashMap behind the
-/// same trait. So this drops the store entirely — closing every SQLite connection and its WAL —
-/// reopens the same FILE, and verifies the per-principal hash chain still links from the bytes that
-/// came back off disk.
 #[test]
 fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
     let dir = tempdir();
     let file = dir.join("calls.db");
     let path = file.to_str().unwrap().to_string();
 
-    // Write a 3-long chain, then let every connection close.
     {
         let s = SqliteStore::open(&path, 5000).unwrap();
         append_call(&s, &sample_call("vk_a", 1, 100, "", "h1")).unwrap();
@@ -1794,7 +1647,6 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
         drop(s);
     }
 
-    // A genuinely new store over the same file — nothing carried over in memory.
     let reopened = SqliteStore::open(&path, 5000).unwrap();
     let got = list_calls(&reopened, "vk_a");
 
@@ -1806,7 +1658,6 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
         got.len()
     );
 
-    // The chain must LINK, read back off disk — not merely be non-empty.
     assert_eq!(
         got[0].prev_hash, "",
         "seq 1 opens the chain with an empty prev_hash"
@@ -1819,7 +1670,7 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
             w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
         );
     }
-    // Ordering is by seq, and the body must round-trip verbatim too.
+
     assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
     assert_eq!(got[2], sample_call("vk_a", 3, 300, "h2", "h3"));
     assert_eq!(got[1].tool, "srv_read_file");
@@ -1829,7 +1680,6 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reopening_the_file() {
 }
 
 /// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
-/// seen, so the store must be able to name every principal holding records — across a restart.
 #[test]
 fn mcp_call_principals_are_enumerable_after_a_restart() {
     let dir = tempdir();
@@ -1848,14 +1698,14 @@ fn mcp_call_principals_are_enumerable_after_a_restart() {
         vec!["vk_a".to_string(), "vk_b".to_string()],
         "every principal holding records must be enumerable after a restart, exactly once each"
     );
-    // A scoped read returns only its own principal's chain — the chain scope is the principal.
+
     assert_eq!(list_calls(&reopened, "vk_a").len(), 2);
     assert_eq!(list_calls(&reopened, "vk_b").len(), 1);
     assert!(
         list_calls(&reopened, "vk_nonexistent").is_empty(),
         "a principal with no records reads back empty, not an error"
     );
-    // The enumeration is per KIND: a parent of another kind is not a call principal.
+
     reopened
         .append_plane_record(
             event_record(&sample_event("t-1", 1, "task.submitted", "", "e1")).view(),
@@ -1866,8 +1716,6 @@ fn mcp_call_principals_are_enumerable_after_a_restart() {
 }
 
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
-/// not perform is worse than one that reports nothing purged. The `call` kind drops EVERY row older
-/// than the cutoff, active or not.
 #[test]
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -1876,7 +1724,6 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     append_call(&s, &sample_call("vk_a", 3, 300, "h2", "h3")).unwrap();
     append_call(&s, &sample_call("vk_b", 1, 150, "", "b1")).unwrap();
 
-    // Strictly older than `before`, across every principal. ts=300 and ts=200 stay.
     let purged = s.purge_plane_records_before("call", 200).unwrap();
     assert_eq!(
         purged, 2,
@@ -1894,23 +1741,21 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
         list_calls(&s, "vk_b").is_empty(),
         "a principal whose every row aged out reads back empty"
     );
-    // `before` is STRICTLY less-than: a row exactly at the cutoff is kept.
+
     assert_eq!(
         s.purge_plane_records_before("call", 200).unwrap(),
         0,
         "re-running the same purge removes nothing; ts=200 sits exactly at the cutoff and is kept"
     );
-    // A purge is per KIND: sweeping another kind at a cutoff past everything touches no call.
+
     assert_eq!(s.purge_plane_records_before("demotion", 1_000).unwrap(), 0);
     assert_eq!(list_calls(&s, "vk_a").len(), 2);
-    // And the count is real: purging past everything clears the rest.
+
     assert_eq!(s.purge_plane_records_before("call", 1_000).unwrap(), 2);
     assert!(list_calls(&s, "vk_a").is_empty());
 }
 
 /// A record arriving on a `(principal, seq)` that already has one is settled the way `append_audit`
-/// settles it: IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and is an
-/// error. Overwriting would destroy the second case instead of reporting it.
 #[test]
 fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -1924,7 +1769,6 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         "a replay must not duplicate the row"
     );
 
-    // Same (principal, seq), different digest — the fork case.
     let forked = sample_call("vk_a", 1, 100, "", "h2-second-writer");
     let err = append_call(&s, &forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
@@ -1938,12 +1782,11 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         "the refused fork must not have overwritten the record already on record"
     );
 
-    // A differing payload field is a fork too, not a silent accept.
     let mut tampered = sample_call("vk_a", 1, 100, "", "h1");
     tampered.tool = "srv_other_tool".to_string();
     append_call(&s, &tampered)
         .expect_err("a payload that differs under an identical digest is a fork and must error");
-    // And so is a differing SIDECAR under an identical body: the envelope is the record.
+
     let mut moved = call_record(&rec);
     moved.ts = 999;
     s.append_plane_record(moved.view())
@@ -1951,8 +1794,6 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// Every field of the envelope is part of the record at a position, not only the body and `ts`: a
-/// record at an occupied position that differs in its DISPOSITION, its ID or its PARENT is a fork,
-/// never a benign replay. A Terminal record slipping in as a "replay" changes what retention does.
 #[test]
 fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_fork() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -1963,7 +1804,7 @@ fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_f
     terminal.disposition = PlaneDisposition::Terminal;
     let mut other_id = rec.clone();
     other_id.id = "vk_other".to_string();
-    // Same position (kind, identity = "vk_a", seq): a top-level record's identity is its own id.
+
     let mut no_parent = rec.clone();
     no_parent.parent = None;
 
@@ -1990,8 +1831,6 @@ fn a_record_differing_in_disposition_id_or_parent_at_an_occupied_position_is_a_f
 }
 
 /// A persisted chain record is never REWRITTEN. Enforced by a trigger so it survives an operator
-/// opening the file with the sqlite3 CLI, not merely by the write path being careful. An upserted
-/// top-level record (no parent) is updated in place by design, so the guard must not reach it.
 #[test]
 fn a_chain_record_rejects_a_direct_update_but_allows_the_retention_delete() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2004,20 +1843,17 @@ fn a_chain_record_rejects_a_direct_update_but_allows_the_retention_delete() {
         )
         .expect_err("a direct UPDATE must be refused by the append-only trigger");
     assert!(format!("{err}").contains("never rewritten"));
-    // DELETE is deliberately NOT guarded — retention has to be able to do its job.
+
     s.lock_writer()
         .execute("DELETE FROM plane_records WHERE kind = 'call'", [])
         .expect("retention must remain possible; only rewriting is forbidden");
 
-    // The upsert path is untouched by the guard: a second write of a top-level record replaces it.
     s.upsert_plane_record(task_record(&sample_task("t-1", "working", 200)).view())
         .unwrap();
     s.upsert_plane_record(task_record(&sample_task("t-1", "completed", 300)).view())
         .expect("an upserted top-level record is updated in place, not refused as a rewrite");
     assert_eq!(get_task(&s, "t-1").unwrap().state, "completed");
 }
-
-// ── A2A tasks and their provenance chains ────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct TaskBody {
@@ -2064,7 +1900,6 @@ fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskBody {
 }
 
 /// A `task` record exactly as the A2A plane builds it: `ts` is `updated_at`, and the disposition
-/// is `Terminal` exactly when the state is final.
 fn task_record(t: &TaskBody) -> PlaneRecord {
     PlaneRecord {
         kind: "task".into(),
@@ -2103,8 +1938,7 @@ fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str
     EventBody {
         task_id: task_id.to_string(),
         seq,
-        // Saturating: the out-of-range test deliberately passes `u64::MAX` as `seq`, and a helper
-        // that panicked on its own arithmetic would hide the behaviour under test.
+
         ts: seq.saturating_add(100),
         kind: kind.to_string(),
         context_id: format!("ctx-{task_id}"),
@@ -2142,11 +1976,6 @@ fn list_events(s: &SqliteStore, task_id: &str) -> Vec<EventBody> {
 }
 
 /// THE TEST THAT MATTERS, and it is deliberately not a unit test against a live handle: a live
-/// handle cannot tell a backend that wrote to disk from one keeping a HashMap behind the same trait,
-/// and it cannot tell either of those from the trait's accept-and-keep-nothing defaults if the
-/// defaults happen to be exercised through the same handle that "wrote". So this DROPS the store —
-/// closing every SQLite connection and its WAL — reopens the same FILE, and reads the task back off
-/// disk.
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
     let dir = tempdir();
@@ -2157,8 +1986,7 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
         let s = SqliteStore::open(&path, 5000).unwrap();
         s.upsert_plane_record(task_record(&sample_task("t-1", "working", 200)).view())
             .unwrap();
-        // The write-through on a state transition REPLACES the row rather than appending a second
-        // one — an interrupted task waiting on a human is what a restart has to find.
+
         let mut interrupted = sample_task("t-1", "input-required", 300);
         interrupted.artifact_cursor = 12;
         s.upsert_plane_record(task_record(&interrupted).view())
@@ -2174,12 +2002,10 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
              which is the accept-and-keep-nothing default this backend exists to replace",
     );
 
-    // Every field a resume reads has to come back verbatim — not merely a row with the right id.
     let mut expected = sample_task("t-1", "input-required", 300);
     expected.artifact_cursor = 12;
     assert_eq!(got, expected, "the LAST write must win, byte for byte");
 
-    // UPSERT, not append: two writes for one task_id leave ONE row.
     assert_eq!(
         list_task_ids(&reopened),
         vec!["t-1", "t-2"],
@@ -2190,7 +2016,7 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
         get_task(&reopened, "t-nonexistent").is_none(),
         "an unknown task id reads back None, not an error"
     );
-    // A point read is per KIND: a record of another kind under the same id is not a task.
+
     reopened
         .upsert_plane_record(demotion_record(&demotion("t-3", "drift", 1)).view())
         .unwrap();
@@ -2200,9 +2026,6 @@ fn an_in_flight_task_survives_dropping_the_store_and_reopening_the_file() {
 }
 
 /// The kind listing is deliberately UNFILTERED. The boot rehydrate wants the active rows, the
-/// retention sweep wants the terminal ones and the scoped listing wants one principal's; a store
-/// that pre-filtered for any one of those would break the other two. Pinned across a restart because
-/// the boot rehydrate is precisely the caller that only ever sees the post-restart answer.
 #[test]
 fn list_tasks_returns_every_row_including_terminal_ones_after_a_restart() {
     let dir = tempdir();
@@ -2229,7 +2052,6 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_restart() {
 }
 
 /// The per-task provenance chain, read back off disk. Per-TASK rather than one global chain, so the
-/// scope of a read is one task and the links have to hold within it.
 #[test]
 fn a_task_event_chain_survives_a_restart_and_still_links() {
     let dir = tempdir();
@@ -2241,7 +2063,6 @@ fn a_task_event_chain_survives_a_restart_and_still_links() {
             sample_event("t-1", 1, "task.submitted", "", "e1"),
             sample_event("t-1", 2, "task.working", "e1", "e2"),
             sample_event("t-1", 3, "task.interrupted", "e2", "e3"),
-            // A second task's chain is independent — it must not leak into the first one's read.
             sample_event("t-2", 1, "task.submitted", "", "f1"),
         ] {
             s.append_plane_record(event_record(&e).view()).unwrap();
@@ -2271,13 +2092,13 @@ fn a_task_event_chain_survives_a_restart_and_still_links() {
             w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
         );
     }
-    // Every field round-trips, including the join key that is deliberately NOT chained.
+
     assert_eq!(
         got[2],
         sample_event("t-1", 3, "task.interrupted", "e2", "e3")
     );
     assert_eq!(got[1].ts, 102);
-    // The scope of a read is one task.
+
     assert_eq!(list_events(&reopened, "t-2").len(), 1);
     assert!(
         list_events(&reopened, "t-unknown").is_empty(),
@@ -2287,14 +2108,6 @@ fn a_task_event_chain_survives_a_restart_and_still_links() {
 }
 
 /// A replayed `(task_id, seq)` is IDEMPOTENT, and a DIFFERENT event at an occupied `seq` is a FORK.
-///
-/// This is a deliberate 1.6.0 change. The typed `append_task_event` was specified to UPSERT on
-/// `(task_id, seq)`, so a "corrected" event silently replaced the one on record. The 1.6.0 contract
-/// has ONE append verb for every chain kind, and busbar's own reference backends (`store-memory`,
-/// the in-tree `store-example`) settle a second record at an occupied chain position exactly as
-/// `append_audit` does: identical is the write-through retrying, different is two records claiming
-/// one position — refused, never silently applied. An upsert here is how two processes on one file
-/// would overwrite each other's provenance without anyone being told.
 #[test]
 fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2318,9 +2131,6 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
-/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
-/// sits still for a long time; compacting it is losing the work, not reclaiming space. Terminality
-/// is the envelope's `disposition` sidecar, never decoded out of the body.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2329,12 +2139,10 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         sample_task("t-old-failed", "failed", 100),
         sample_task("t-old-canceled", "canceled", 100),
         sample_task("t-old-rejected", "rejected", 100),
-        // Old, and NOT terminal — never dropped, no matter how old.
         sample_task("t-old-waiting", "input-required", 100),
         sample_task("t-old-auth", "auth-required", 100),
         sample_task("t-old-working", "working", 100),
         sample_task("t-old-submitted", "submitted", 100),
-        // Terminal but at the cutoff exactly, and terminal but newer — both kept.
         sample_task("t-at-cutoff", "completed", 200),
         sample_task("t-new-done", "completed", 300),
     ] {
@@ -2368,9 +2176,6 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 }
 
 /// Retention has to bound the EVENT rows too. Nothing else removes a task's events, so if purging a
-/// task left its provenance behind, the chains would outlive the very retention decision just made
-/// about them and grow without bound. Dropping a task therefore drops the chain that belongs to it —
-/// and drops nothing belonging to any other task.
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2425,9 +2230,6 @@ fn upsert_plane_record_ignores_seq_and_keeps_one_row() {
 }
 
 /// A `seq`/`ts` past `i64::MAX` cannot be stored faithfully — `as i64` wraps it negative and the
-/// read clamps back — so the row read back would not be the row written: a wrapped `seq` reorders a
-/// chain, a wrapped `ts` changes what retention does to it. Refused outright, exactly as
-/// `append_audit` refuses it, rather than silently mangled.
 #[test]
 fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2463,7 +2265,6 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
         .contains("storable range"));
     assert!(list_events(&s, "t-1").is_empty());
 
-    // The boundary itself is storable, and a record written there reads back and sweeps correctly.
     t.ts = i64::MAX as u64;
     s.upsert_plane_record(t.view())
         .expect("i64::MAX is in range");
@@ -2474,12 +2275,6 @@ fn the_plane_verbs_refuse_values_they_cannot_store_faithfully() {
         "an ACTIVE task is kept even by a sweep at the end of time"
     );
 }
-
-// ── The MCP demotion record and the single-use token ledger ─────────────────────────────────
-//
-// Both of these are security state, and the trait defaults them to accept-and-keep-nothing (and the
-// token check to refuse-everything), so every case below reads the state back through a REOPENED
-// file rather than through the handle that wrote it.
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct DemotionBody {
@@ -2520,9 +2315,6 @@ fn list_demotions(s: &SqliteStore) -> Vec<DemotionBody> {
 }
 
 /// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
-/// observation, so a process that has taken no observation has nothing to derive it from and serves
-/// the upstream against the digest the operator approved — which means a restart hands a quarantined
-/// upstream its approval back unless this row is on disk. Written, dropped, reopened, read back.
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
     let dir = tempdir();
@@ -2535,8 +2327,7 @@ fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
             demotion_record(&demotion("payments", "tool-drift", 1_700_000_000)).view(),
         )
         .unwrap();
-        // UPSERT by `server`: a second demotion of one upstream replaces the row rather than
-        // standing a rival one beside it, so a read cannot come back holding two answers.
+
         s.upsert_plane_record(
             demotion_record(&demotion("payments", "digest-mismatch", 1_700_000_100)).view(),
         )
@@ -2560,8 +2351,6 @@ fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
          the accept-and-keep-nothing default this backend exists to replace"
     );
 
-    // CLEARED on a later agreeing observation, and the clear is durable too — a quarantine the
-    // operator has already worked must not be re-established by the next restart.
     reopened
         .delete_plane_record("demotion", "payments")
         .unwrap();
@@ -2580,8 +2369,6 @@ fn a_demotion_survives_dropping_the_store_and_reopening_the_file() {
 }
 
 /// AN EMPTY LIST IS THE PRE-EXISTING DECLARATIVE BEHAVIOUR: a server with no row here is a server
-/// nobody has demoted, which is a different fact from one that drifted. A store that answered
-/// "demoted" for the absence would quarantine every declaratively-approved deployment at boot.
 #[test]
 fn a_store_with_no_demotions_reads_back_empty_rather_than_failing() {
     let dir = tempdir();
@@ -2592,9 +2379,6 @@ fn a_store_with_no_demotions_reads_back_empty_rather_than_failing() {
 }
 
 /// THE SPENT-TOKEN LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
-/// bytes on its second presentation exactly as on its first; only a record that the first happened
-/// tells them apart. Held in RAM that record dies with the process while the approval it records is
-/// still openable, so this drops the store, reopens the FILE, and asks again.
 #[test]
 fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
     let dir = tempdir();
@@ -2624,8 +2408,6 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
          redemption is the whole defect the gate exists to stop"
     );
 
-    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
-    // above and would have deleted the feature.
     assert!(
         reopened
             .redeem_plane_token("ask", "nonce-b", expires, now + 2)
@@ -2633,7 +2415,7 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
         "a different approval is not the one that was spent; refusing it would make the ledger a \
          blanket refusal of every confirmation after the first"
     );
-    // The ledger is per KIND: the same token string under another kind is a different grant.
+
     assert!(reopened
         .redeem_plane_token("other-kind", "nonce-a", expires, now + 3)
         .unwrap());
@@ -2641,8 +2423,6 @@ fn a_reopened_store_refuses_a_second_redemption_of_the_same_approval() {
 }
 
 /// TWO HANDLES ON ONE FILE ARE TWO NODES OF A FLEET. They share the deployment's signing key, so
-/// they share the seal — every check but this one passes on both — and the ledger is the only thing
-/// standing between one operator confirmation and one execution per node.
 #[test]
 fn a_second_handle_on_the_same_file_cannot_redeem_what_the_first_spent() {
     let dir = tempdir();
@@ -2666,15 +2446,13 @@ fn a_second_handle_on_the_same_file_cannot_redeem_what_the_first_spent() {
 }
 
 /// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case: two redemptions in flight at once are
-/// what a read-then-write check answers "first" to twice. Exactly one of N racing threads may win.
 #[test]
 fn exactly_one_of_many_racing_redemptions_wins() {
     let dir = tempdir();
     let file = dir.join("race.db");
     let path = file.to_str().unwrap().to_string();
     let now = token_test_now();
-    // Each contender owns a separate connection, as independent processes sharing the file do.
-    // Opening before the barrier keeps schema initialization outside the redemption race.
+
     let stores: Vec<_> = (0..8)
         .map(|_| SqliteStore::open(&path, 5000).unwrap())
         .collect();
@@ -2719,8 +2497,6 @@ fn exactly_one_of_many_racing_redemptions_wins() {
 }
 
 /// The store clock determines which receipts have lapsed before a new redemption.
-/// A seeded past receipt can be swept; live receipts must remain protected.
-
 #[test]
 fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
     const TOKEN_KIND: &str = "expiry-sweep";
@@ -2752,7 +2528,6 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
 }
 
 /// A caller reaching its claimed expiry boundary cannot force store cleanup early.
-
 #[test]
 fn caller_expiry_boundary_does_not_evict_a_live_receipt() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2767,13 +2542,10 @@ fn caller_expiry_boundary_does_not_evict_a_live_receipt() {
 }
 
 /// Permanent grant storage and unrelated recorded-at refusal retain their existing semantics.
-/// A caller-supplied unsigned maximum is not an expiry authority.
-
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let s = SqliteStore::open_in_memory().unwrap();
-    // `expires_at` saturates: u64::MAX is busbar's "never expires" for a minting claim, it is only
-    // compared by the sweep and never read back, so it is stored as i64::MAX, spent once.
+
     assert!(s
         .redeem_plane_token("ask", "n", u64::MAX, 1_700_000_000)
         .unwrap());
@@ -2793,15 +2565,13 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
         "an unstorable recorded_at must be an error rather than a row that does not read back as \
          itself"
     );
-    // And the in-range boundary still stores.
+
     assert!(s
         .redeem_plane_token("ask", "boundary", i64::MAX as u64, 1_700_000_000)
         .unwrap());
 }
 
 /// `plane_token_live` is the MULTI-USE capability check (a push callback token): live while its
-/// record is present, still active, and inside its deadline — and it SPENDS NOTHING, because one task
-/// legitimately draws several callbacks. Every other answer is `false`, fail-closed.
 #[test]
 fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
     let dir = tempdir();
@@ -2851,7 +2621,7 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
             .unwrap(),
         "the capability is per kind"
     );
-    // The task ends: the write that made it terminal flips the record's disposition.
+
     s.upsert_plane_record(cfg(PlaneDisposition::Terminal).view())
         .unwrap();
     assert!(
@@ -2859,7 +2629,7 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
             .unwrap(),
         "a terminal record names finished work; its token is revoked"
     );
-    // And the revoke leg deletes it outright.
+
     s.upsert_plane_record(cfg(PlaneDisposition::Active).view())
         .unwrap();
     s.delete_plane_record("push_config", "tok-1").unwrap();
@@ -2874,7 +2644,6 @@ fn a_push_callback_token_is_live_until_its_task_ends_or_its_deadline_passes() {
 }
 
 /// A kind no plane in this build has ever named is stored and served exactly like the ones that
-/// exist: the store is kind-neutral, so a plane added after this build ships needs no store change.
 #[test]
 fn a_kind_this_build_has_never_heard_of_round_trips() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -2898,15 +2667,11 @@ fn a_kind_this_build_has_never_heard_of_round_trips() {
             .unwrap(),
         vec![rec.body.clone()]
     );
-    // Not `task`, so its retention is every-row-older-than, active or not.
+
     assert_eq!(s.purge_plane_records_before("future_kind", 6).unwrap(), 1);
 }
 
-// ── 1.6.0 record shapes: keys, usage units, metering instants ────────────────────────────────
-
 /// Every non-pool scope kind round-trips WITH its kind. Before v10 the store kept only bare values
-/// in `allowed_pools`, so an `mcp_server` grant came back as a POOL grant: the MCP grant was lost and
-/// a pool the key was never granted was opened.
 #[test]
 fn non_pool_scope_grants_round_trip_with_their_kind() {
     let dir = tempdir();
@@ -2949,8 +2714,7 @@ fn non_pool_scope_grants_round_trip_with_their_kind() {
         "a grant of ONLY non-pool kinds is still an explicit grant, never the omitted-grant wildcard"
     );
     assert!(!got.scope_allowed("pool", "anything"));
-    // And the key serializes back out over the plugin seam (the contract refuses an unregistered
-    // non-pool kind on the wire; a kind read from this store is registered on the way out).
+
     serde_json::to_string(&got).expect("a stored non-pool grant must re-serialize");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2979,7 +2743,7 @@ fn the_1_6_attribution_fields_round_trip() {
     assert_eq!(got.idp_subject.as_deref(), Some("user@example.test"));
     assert_eq!(got.binding_mode.as_deref(), Some("user-bound"));
     assert_eq!(got.minted_by.as_deref(), Some("vk_admin"));
-    // An update that clears them clears them.
+
     k.minted_by = None;
     s.put_key(&k).unwrap();
     assert_eq!(s.get_key("vk_attr").unwrap().unwrap().minted_by, None);
@@ -2992,8 +2756,6 @@ fn the_1_6_attribution_fields_round_trip() {
 }
 
 /// The OPEN usage units (every name the four reserved token columns do not hold) accumulate and
-/// floor at zero exactly like the reserved ones, survive an absolute `put_usage`, and go with their
-/// window when retention sweeps it.
 #[test]
 fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3029,7 +2791,6 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     );
     assert_eq!(ledger.requests, 2);
 
-    // An absolute set replaces the open units too, not just the columns.
     let mut model = ModelTokens {
         model: "rerank".into(),
         ..Default::default()
@@ -3050,8 +2811,6 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
 }
 
 /// `priced_from_ms` is part of a metering cell's KEY: a rate-card edit mid-day SPLITS the day's cell
-/// so each half prices at the card it was earned under. The open classes ride on the cell they were
-/// accrued with, additively.
 #[test]
 fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3086,16 +2845,8 @@ fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
     assert_eq!(rows[1].tokens_input, 10);
     assert_eq!(rows[1].usage_units.get("tool_calls"), Some(&1));
 
-    // An instant SQLite cannot hold is refused: clamped, it would merge into another card's cell.
     assert!(s.add_metering(&d(u64::MAX, 1)).is_err());
 }
-
-// ── Upgrading a database the OLD code wrote ──────────────────────────────────────────────────
-//
-// `tests/fixtures/` holds a database file byte-for-byte as the old code left them (see the
-// `gen_*.rs` provenance files beside them): `v6-release-1.0.6.db`, written by the latest RELEASE
-// (store-sqlite v1.0.6 on busbar 1.5.5, schema v6) — the file every existing deployment has. Each test
-// copies it to a scratch dir, opens it with THIS build, and reads every row back.
 
 fn open_fixture(name: &str) -> (TempDir, SqliteStore) {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3157,8 +2908,6 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
         .expect("the credential survived");
     assert_eq!(cred.meta.key_id, "vk_live");
     assert_eq!(cred.plaintext(), Some("fixture-secret"));
-    // (Not `updated_at`: v1.0.6 stored `created_at` there — the bug fixed on `dev` since — and an
-    // upgrade carries the stored value across, it does not invent one.)
 
     assert_eq!(
         s.list_denylist().unwrap(),
@@ -3199,7 +2948,6 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
     );
     assert!(r.usage_units.is_empty());
 
-    // The rebuilt metering table still accrues onto the SAME cell, and still guards the key.
     s.add_metering(&MeteringDelta {
         key_id: "vk_live".into(),
         bucket: 1_699_920_000,
@@ -3225,14 +2973,12 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
         "the hard-delete guard is back on the rebuilt metering table"
     );
 
-    // And the upgraded file takes 1.6.0 writes.
     s.upsert_plane_record(task_record(&sample_task("t-new", "working", 5)).view())
         .unwrap();
     assert!(get_task(s, "t-new").is_some());
 }
 
 /// Every table/column/index an upgraded file carries is the one a fresh v10 file carries, so an
-/// upgraded deployment and a new one are the same database from here on.
 fn assert_schema_matches_a_fresh_one(s: &SqliteStore, ignore: &[&str]) {
     let shape = |conn: &Connection| -> Vec<String> {
         let mut out = Vec::new();
@@ -3290,17 +3036,6 @@ fn a_real_v6_database_from_the_released_plugin_opens_and_upgrades_losslessly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ── Upgrading the rows the 1.5.5 BINARY wrote ────────────────────────────────────────────────
-//
-// Provenance: `tests/fixtures/1.5.5/` was RECORDED, not generated by this crate — busbar's
-// `scripts/store-migration-fixture.sh` drove the published, digest-pinned busbar v1.5.5 binary
-// over the published store-sqlite v1.0.6 plugin through a fixed request script (two keys, one in a
-// group with a day budget; three models, one cached, one refunded after an upstream 503). The
-// binary/plugin digests and every file's sha256 are pinned in `MANIFEST.tsv`; `rows.json` is every
-// table's rows as written (via sqlite3) and `governance.db` is the database exactly as 1.5.5 left
-// it. The tests read EVERY recorded row back through this build's `migrate` — the per-backend
-// migration conformance gate (a missing fixture fails CI).
-
 /// Copy the recorded database to a scratch dir; returns the dir and the copied file's path.
 fn copy_the_1_5_5_fixture() -> (TempDir, String) {
     let src =
@@ -3331,8 +3066,6 @@ fn recorded_str(v: &serde_json::Value) -> &str {
 }
 
 /// Every recorded row of `usage_metering`, `usage_windows`, `keys` and `audit_log`, read back through
-/// the 1.6.0 surface and asserted equal field for field. Returns the reads in a canonical form so
-/// a second open can be compared with the first.
 fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) -> Vec<String> {
     let mut seen = Vec::new();
 
@@ -3345,7 +3078,6 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
         "the upgrade must stamp the current version"
     );
 
-    // usage_metering: every recorded cell is listed under its bucket, and nothing else is.
     let metering = rows["usage_metering"].as_array().unwrap();
     assert!(!metering.is_empty(), "the fixture records metering rows");
     let mut buckets: Vec<u64> = metering
@@ -3425,7 +3157,6 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
         }
     }
 
-    // usage_windows: requests/billable_requests ride the model='' sentinel row, tokens the model rows.
     let windows = rows["usage_windows"].as_array().unwrap();
     assert!(!windows.is_empty(), "the fixture records usage windows");
     let mut ledgers: Vec<(String, u64)> = windows
@@ -3496,7 +3227,6 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
         }
     }
 
-    // keys
     for w in rows["keys"].as_array().unwrap() {
         let id = recorded_str(&w["id"]);
         let k = s
@@ -3509,7 +3239,6 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
         seen.push(format!("key {id} {:?} {} {}", k.group, k.name, k.enabled));
     }
 
-    // audit_log: the same chain, seq for seq and hash for hash.
     let audit = s.list_audit().unwrap();
     let want = rows["audit_log"].as_array().unwrap();
     assert_eq!(
@@ -3542,9 +3271,6 @@ fn the_1_5_5_binarys_rows_read_back_through_migrate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// `migrate` runs in ONE transaction and the crate has no hook to stop it half-way, so crash
-// idempotence is covered by running it twice over the same file: the second open re-enters
-// `migrate` over the already-upgraded rows and must change nothing.
 #[test]
 fn migrate_over_the_1_5_5_rows_is_idempotent() {
     let (dir, path) = copy_the_1_5_5_fixture();
@@ -3567,8 +3293,6 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
 }
 
 /// A FILE FROM A LATER BUILD IS REFUSED, NOT RESTAMPED. Opening it would run this build's schema
-/// pass over it and stamp it back down to `SCHEMA_VERSION`, so the newer build would later re-run
-/// its own version-gated steps against data it already migrated.
 #[test]
 fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
     let dir = tempdir();
@@ -3602,14 +3326,11 @@ fn a_database_stamped_by_a_newer_build_is_refused_and_left_untouched() {
 }
 
 /// A plain filesystem path that merely CONTAINS `mode=memory` (or starts like `:memory:`) is a file,
-/// not an in-memory database: SQLite gives in-memory meaning only to the exact `:memory:` or to a
-/// `file:` URI.
 #[test]
 fn a_plain_path_containing_mode_memory_is_a_real_file() {
     assert!(!is_memory_path("/srv/mode=memory/governance.db"));
     assert!(!is_memory_path(":memory:-archive.db"));
-    // Inside a `file:` URI the trigger text counts only where SQLite reads it: `mode=memory` as a
-    // query parameter, `:memory:` as the whole path.
+
     assert!(!is_memory_path("file:/srv/mode=memory/gov.db"));
     assert!(!is_memory_path("file:/data/:memory:/gov.db"));
     for memory in [
@@ -3645,7 +3366,6 @@ fn a_plain_path_containing_mode_memory_is_a_real_file() {
 }
 
 /// A NULL `allowed_pools` with a PRESENT but unparseable `scope_grants` must read as the empty
-/// (most restrictive) grant, never as the omitted-grant wildcard (`None`).
 #[test]
 fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3661,9 +3381,6 @@ fn unparseable_scope_grants_with_null_pools_is_not_the_wildcard() {
 }
 
 /// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /
-/// `get_plane_record`), with or without a parent: an upserted record that names a parent reads back
-/// by its own id, a second id under the same parent is a second record (never an overwrite), and
-/// the parent-scoped listing still returns both.
 #[test]
 fn a_parented_upserted_record_reads_back_by_its_own_id() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3693,7 +3410,6 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
     listed.sort();
     assert_eq!(listed, vec![b"one".to_vec(), b"two".to_vec()]);
 
-    // A second upsert of one id replaces it; deleting it by id removes it alone.
     s.upsert_plane_record(child("t1", b"one'").view()).unwrap();
     assert_eq!(
         s.get_plane_record("task", "t1").unwrap(),
@@ -3707,10 +3423,7 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
     );
 }
 
-// ── Kind alignment: credential re-mint (R3) ──────────────────────────────────────────────────
-
 /// A revoked credential id is spent: re-putting it, into its own slot or another, is refused and
-/// writes nothing; a NEW id into the revoked slot reclaims the slot with its own `created_at`.
 #[test]
 fn a_revoked_credential_id_is_never_re_minted() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3753,10 +3466,7 @@ fn a_revoked_credential_id_is_never_re_minted() {
     assert!(rows[0].revoked_at.is_none());
 }
 
-// ── Kind alignment: re-putting a live credential (R4) ────────────────────────────────────────
-
 /// Identical content (revision aside) is an Ok no-op that writes nothing; different content, or
-/// another id in the slot, is refused with the live-slot text.
 #[test]
 fn re_putting_a_live_credential_is_a_no_op_only_when_identical() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -3794,8 +3504,6 @@ fn re_putting_a_live_credential_is_a_no_op_only_when_identical() {
     assert_eq!(s.put_credential(&other_id).unwrap_err().0, live, "other id");
     assert_eq!(s.list_credentials("vk_r4").unwrap().len(), 1);
 }
-
-// ── Kind alignment: put_key_with_credential refuses up front (R5) ────────────────────────────
 
 #[test]
 fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
@@ -3851,7 +3559,6 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     assert!(s.get_key("vk_r5c").unwrap().is_none());
     assert!(s.list_credentials("vk_r5other").unwrap().is_empty());
 
-    // Over an existing LIVE key id it upserts.
     s.put_key(&sample_key("vk_r5d", "g1")).unwrap();
     s.put_key_with_credential(
         &sample_key("vk_r5d", "g2"),
@@ -3861,8 +3568,6 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     assert_eq!(s.get_key("vk_r5d").unwrap().unwrap().generation_hash, "g2");
     assert_eq!(s.list_credentials("vk_r5d").unwrap().len(), 1);
 }
-
-// ── Kind alignment: revoke destroys the secret (R7) ──────────────────────────────────────────
 
 fn store_revision(s: &SqliteStore) -> i64 {
     s.lock_writer()
@@ -3944,7 +3649,6 @@ CREATE TABLE credentials_v13 (
 ";
 
 /// A v13 file (current rows, the old `credentials` table) upgrades in place: every row survives,
-/// a row revoked under v13 loses the secret it kept, and a revoke works afterwards.
 #[test]
 fn a_v13_database_upgrades_its_credentials_table_losslessly() {
     let dir = tempdir();
@@ -4020,8 +3724,6 @@ fn a_v13_database_upgrades_its_credentials_table_losslessly() {
     );
 }
 
-// ── Kind alignment: list_credentials_since lists unstamped rows (R9) ─────────────────────────
-
 #[test]
 fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -4041,8 +3743,6 @@ fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
         assert_eq!(ids, vec!["cred_AKIA_R9".to_string()], "since {since}");
     }
 }
-
-// ── Kind alignment: a purged or deleted task takes its event chain (R13) ────────────────
 
 fn seed_task_with_events(s: &SqliteStore, id: &str, state: &str) {
     s.upsert_plane_record(task_record(&sample_task(id, state, 100)).view())
@@ -4099,8 +3799,6 @@ fn deleting_a_task_deletes_its_event_chain() {
     assert!(get_task(&s, "t-keep").is_some());
 }
 
-// ── Kind alignment: get_usage is sparse for open units (R19) ─────────────────────────────────
-
 #[test]
 fn get_usage_omits_zero_count_open_units() {
     let s = SqliteStore::open_in_memory().unwrap();
@@ -4132,8 +3830,6 @@ fn get_usage_omits_zero_count_open_units() {
     let back = s.get_usage("vk_r19", 200).unwrap();
     assert!(!back.models[0].usage_units.contains_key("idle"));
 }
-
-// ── Kind alignment: one text per condition (W2) ──────────────────────────────────────────────
 
 #[test]
 fn refusal_texts_name_the_real_op_and_quote_ids() {
@@ -4185,8 +3881,6 @@ fn refusal_texts_name_the_real_op_and_quote_ids() {
          revoke it first"
     );
 }
-
-// ── Kind alignment: deterministic list orders (W5) ───────────────────────────────────────────
 
 #[test]
 fn list_keys_and_list_keys_since_break_ties_by_id() {

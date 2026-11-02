@@ -21,9 +21,6 @@ const IGNORE_REWRAP_TRIGGER: &str =
      BEGIN SELECT RAISE(IGNORE); END;";
 
 /// The executable and cdylib each bundle SQLite. Their process-local VFS lock tables are
-/// independent, while POSIX locks belong to the process. Keep raw observers in another process
-/// so closing one engine's connection cannot interfere with the live dropped provider's WAL.
-/// The parent keeps its Store open: this still witnesses the commit immediately after READY.
 fn raw_sqlite(path: &std::path::Path, operation: &str) -> Option<i64> {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", RAW_SQLITE_TEST, "--nocapture", "--color=never"])
@@ -66,7 +63,6 @@ fn raw_sqlite(path: &std::path::Path, operation: &str) -> Option<i64> {
 }
 
 /// Entered only by raw_sqlite's scoped child environment, before either scenario opens a Store.
-/// No new ignored test or external SQL interpreter is needed; SQL failures fail the child test.
 fn raw_sqlite_helper_mode() -> bool {
     let Some(operation) = std::env::var_os(RAW_SQLITE_OPERATION) else {
         return false;
@@ -160,8 +156,6 @@ fn scenario(by: Door, tag: &str) {
     let expected = row(&store);
     let before = revision(&path);
 
-    // The database commits through the real slot, but the caller loses the result before it
-    // consumes the leased extension. Cancelling that ticket cannot undo a completed transaction.
     let request = rewrap::Request::new(&expected, "v1:test:new-envelope");
     let payload = serde_json::to_vec(&request).unwrap();
     let intent = extensions::encode(&[(rewrap::INTENT, b"1")]);
@@ -294,8 +288,7 @@ fn ignored_update_rolls_back(by: Door, tag: &str) {
     let expected = row(&store);
     let owner = store.get_key("owner").unwrap().unwrap();
     let before = revision(&path);
-    // Suppress the actual credential UPDATE only after the same transaction allocated its next
-    // revision. SQLite reports zero changed rows without raising a SQL error.
+
     assert!(raw_sqlite(&path, "create-ignore-trigger").is_none());
     let error = store
         .rewrap_credential(&expected, "v1:test:replacement")

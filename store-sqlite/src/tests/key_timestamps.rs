@@ -92,7 +92,6 @@ fn unsigned_invalid_key_expiry_rolls_back_owner_credential_and_revision() {
     }
 }
 
-// The pre-v16 signed-expiry table is literal released DDL, independent of the new CHECK.
 const LEGACY_KEYS: &str = "CREATE TABLE keys_legacy (
  id TEXT NOT NULL PRIMARY KEY,
  name TEXT NOT NULL,
@@ -146,7 +145,7 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
             .put_key_with_credential(&key, &sample_credential(&id, &format!("public-{n}"), 0))
             .unwrap();
     }
-    // Include unrelated durable data so a failed upgrade must roll back the whole database.
+
     store
         .append_audit(&AuditRecord {
             seq: 1,
@@ -161,8 +160,7 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
         .unwrap();
     drop(store);
     let conn = Connection::open(path).unwrap();
-    // The bundled SQLite enables FKs by default. This fixture replaces the parent table to
-    // reconstruct released DDL; it must retain the children that the real migration will judge.
+
     disable_fixture_foreign_keys(&conn);
     let credentials_before: i64 = conn
         .query_row("SELECT count(*) FROM credentials", [], |row| row.get(0))
@@ -182,8 +180,7 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
         credentials_after, credentials_before,
         "legacy fixture setup must preserve every child credential"
     );
-    // Both unsigned-valid cross-sign imports and the old CHECK's signed-only valid rows are
-    // deliberate migration inputs. No production admission rule is disabled by this fixture.
+
     conn.pragma_update(None, "ignore_check_constraints", true)
         .unwrap();
     for (n, (created, expires)) in times.iter().enumerate() {
@@ -394,7 +391,7 @@ fn an_orphan_legacy_credential_refuses_parent_rebuild_atomically() {
     let path = dir.join("orphan.db");
     legacy_file(&path, 15, &[(0, None)]);
     let conn = Connection::open(&path).unwrap();
-    // Deliberately corrupt a real legacy child so startup's foreign_key_check must refuse it.
+
     disable_fixture_foreign_keys(&conn);
     assert_eq!(
         conn.execute("UPDATE credentials SET key_id='missing-owner'", [])
