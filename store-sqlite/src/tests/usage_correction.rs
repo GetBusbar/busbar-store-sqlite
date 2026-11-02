@@ -4,7 +4,7 @@
 //! Atomic correction through the actual negotiated synchronous store slot.
 use super::*;
 use busbar_contract::abi::sdk::store::correction::{Decision, Request, UsageAddress, UsageChange};
-use busbar_contract::records::{ModelTokens, ModelTokensDelta, UNIT_INPUT};
+use busbar_contract::records::{ModelTokens, ModelTokensDelta, UNIT_INPUT, UNIT_OUTPUT};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value;
 use std::sync::mpsc;
@@ -626,4 +626,69 @@ fn legacy_sentinel_empty_model_units_survive_read_and_first_exact_add() {
     let mut fresh = ledger(1);
     fresh.models[0].model.clear();
     assert_eq!(store.get_usage(BUCKET, WINDOW + 1).unwrap(), fresh);
+}
+
+#[test]
+fn zero_open_units_stay_sparse_in_exact_rows_and_correction_replays() {
+    let (store, path, _dir) = on_file();
+    let mut offered = ledger(u64::MAX);
+    offered.models[0].model = "future.model/v7:\u{1e}opaque%|空".into();
+    offered.models[0].usage_units.insert("idle".into(), 0);
+    offered.models[0].usage_units.insert(UNIT_OUTPUT.into(), 0);
+    let mut expected = offered.clone();
+    expected.models[0].usage_units.remove("idle");
+    store.put_usage(BUCKET, WINDOW, &offered).unwrap();
+    assert_eq!(store.get_usage(BUCKET, WINDOW).unwrap(), expected);
+    let saved: Vec<u8> = store
+        .lock_reader()
+        .query_row(
+            "SELECT ledger FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
+            params![WINDOW as i64, BUCKET],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<UsageLedger>(&saved).unwrap(),
+        expected
+    );
+
+    // A v18 exact row written before the sparse repair reads the same way without a rewrite.
+    store
+        .write(true, |tx| {
+            exec(
+                tx,
+                "UPDATE usage_window_exact SET ledger=?3 WHERE window_start=?1 AND bucket_id=?2",
+                params![WINDOW as i64, BUCKET, serde_json::to_vec(&offered).unwrap()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.get_usage(BUCKET, WINDOW).unwrap(), expected);
+
+    let mut request = candidate(&store, 1);
+    correction::canonical_ledger(&mut request.usage[0].expected).unwrap();
+    request.usage[0].replacement = request.usage[0].expected.clone();
+    assert_eq!(apply(&store, &request), Ok(Decision::Applied));
+    assert_eq!(
+        store.get_usage(BUCKET, WINDOW).unwrap(),
+        request.usage[0].replacement
+    );
+
+    let mut refund = delta();
+    refund.requests = -1;
+    refund.billable_requests = -1;
+    refund.models[0].model = offered.models[0].model.clone();
+    for count in refund.models[0].usage_units.values_mut() {
+        *count = -1;
+    }
+    store.add_usage(BUCKET, WINDOW, &refund).unwrap();
+    let committed = snapshot(&store);
+    drop(store);
+    let reopened = SqliteStore::open(&path, BUSY_TIMEOUT_MS).unwrap();
+    assert_eq!(apply(&reopened, &request), Ok(Decision::Applied));
+    assert_eq!(snapshot(&reopened), committed);
+    assert_eq!(
+        reopened.get_usage(BUCKET, WINDOW).unwrap().requests,
+        u64::MAX - 1
+    );
 }

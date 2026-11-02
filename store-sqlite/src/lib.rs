@@ -741,6 +741,15 @@ fn open_units<V>(units: &BTreeMap<String, V>) -> impl Iterator<Item = (&String, 
         .filter(|(k, _)| !RESERVED_COLUMNS.contains(&k.as_str()))
 }
 
+/// Exact rows retain the same sparse open-unit shape as the legacy column reader.
+fn omit_zero_open_units(ledger: &mut UsageLedger) {
+    for model in &mut ledger.models {
+        model
+            .usage_units
+            .retain(|unit, count| *count != 0 || RESERVED_COLUMNS.contains(&unit.as_str()));
+    }
+}
+
 fn table_exists(tx: &rusqlite::Connection, table: &str) -> RecordStoreResult<bool> {
     tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -1073,7 +1082,10 @@ fn usage_in(
         params![window_start as i64, bucket_id],
         |row| row.get::<_, Vec<u8>>(0),
     )? {
-        return serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()));
+        let mut ledger =
+            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
+        omit_zero_open_units(&mut ledger);
+        return Ok(ledger);
     }
     usage_columns_in(conn, bucket_id, window_start)
 }
@@ -1220,7 +1232,9 @@ fn put_usage_in(
             )?;
         }
     }
-    let bytes = serde_json::to_vec(ledger).map_err(|error| RecordStoreError(error.to_string()))?;
+    let mut exact = ledger.clone();
+    omit_zero_open_units(&mut exact);
+    let bytes = serde_json::to_vec(&exact).map_err(|error| RecordStoreError(error.to_string()))?;
     let changed = exec(
         tx,
         "INSERT INTO usage_window_exact(window_start,bucket_id,ledger) VALUES (?1,?2,?3)",
@@ -1241,15 +1255,17 @@ fn verify_usage_in(
     window_start: u64,
     ledger: &UsageLedger,
 ) -> RecordStoreResult<()> {
-    let expected =
-        serde_json::to_vec(ledger).map_err(|error| RecordStoreError(error.to_string()))?;
+    let mut expected_ledger = ledger.clone();
+    omit_zero_open_units(&mut expected_ledger);
+    let expected = serde_json::to_vec(&expected_ledger)
+        .map_err(|error| RecordStoreError(error.to_string()))?;
     let exact: Option<Vec<u8>> = query_one(
         tx,
         "SELECT ledger FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
         params![window_start as i64, bucket_id],
         |row| row.get(0),
     )?;
-    let mut mirror = ledger.clone();
+    let mut mirror = expected_ledger;
     mirror.requests = column::clamp(mirror.requests) as u64;
     mirror.billable_requests = column::clamp(mirror.billable_requests) as u64;
     mirror.models.retain(|model| !model.model.is_empty());

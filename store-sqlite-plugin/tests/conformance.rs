@@ -664,3 +664,64 @@ fn a_failed_usage_cleanup_rolls_back_both_tables_through_either_door() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
+    use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
+
+    for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
+        let dir = scratch(&format!("sparse-exact-usage-{tag}"));
+        let cfg = serde_json::json!({"db_path": dir.join("store.db")}).to_string();
+        let store = open(by, &cfg).unwrap();
+        let model = "future.model/v7:\u{1e}opaque%|空";
+        let mut offered = UsageLedger {
+            requests: u64::MAX,
+            billable_requests: u64::MAX,
+            models: vec![ModelTokens {
+                model: model.into(),
+                usage_units: [
+                    ("input".into(), u64::MAX),
+                    ("tool_calls".into(), 17),
+                    ("idle".into(), 0),
+                ]
+                .into(),
+            }],
+        };
+        store.put_usage("opaque", 60, &offered).unwrap();
+        offered.models[0].usage_units.remove("idle");
+        assert_eq!(store.get_usage("opaque", 60).unwrap(), offered);
+        let cells = [(
+            "opaque",
+            60,
+            UsageDelta {
+                requests: -1,
+                billable_requests: -1,
+                models: vec![ModelTokensDelta {
+                    model: model.into(),
+                    usage_units: [
+                        ("input".into(), -1),
+                        ("tool_calls".into(), -1),
+                        ("idle".into(), 0),
+                    ]
+                    .into(),
+                }],
+            },
+        )];
+        block(sc::StoreCalls::add_usage_batch(&store, op(1), &cells)).unwrap();
+        offered.requests -= 1;
+        offered.billable_requests -= 1;
+        offered.models[0]
+            .usage_units
+            .insert("input".into(), u64::MAX - 1);
+        offered.models[0]
+            .usage_units
+            .insert("tool_calls".into(), 16);
+        assert_eq!(store.get_usage("opaque", 60).unwrap(), offered);
+        close(store);
+        let reopened = open(by, &cfg).unwrap();
+        block(sc::StoreCalls::add_usage_batch(&reopened, op(1), &cells)).unwrap();
+        assert_eq!(reopened.get_usage("opaque", 60).unwrap(), offered);
+        close(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
