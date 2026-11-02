@@ -28,6 +28,7 @@ busbar-contract = { workspace = true }
 # `bundled` compiles SQLite from source so the plugin has no system libsqlite3 dependency at all.
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+zeroize = { workspace = true }
 
 # The `RecordStore` contract conformance suite lives in this crate's own
 # `src/tests/store_conformance.rs` (#2/#31 forbid a shared test util between plugins). The one
