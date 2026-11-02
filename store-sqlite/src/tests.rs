@@ -4657,7 +4657,8 @@ fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows(
 /// Read the same local SQLite clock as redemption; fixture caller clocks may differ deliberately.
 fn token_test_now() -> u64 {
     let c = rusqlite::Connection::open_in_memory().unwrap();
-    c.query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap()
+    let now: i64 = c.query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+    u64::try_from(now).expect("the SQLite fixture clock is nonnegative")
 }
 
 #[test]

@@ -2,10 +2,14 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! Atomic correction through the actual negotiated synchronous store slot.
-use super::*;
+use super::{
+    correction, exec, put_usage_in, query_all, record, Dedupe, MeteringDelta, MeteringRow, Op,
+    OpId, OpRefused, OpResult, RecordStore, SqliteStore, Step, UsageDelta, UsageLedger, VirtualKey,
+};
 use busbar_contract::abi::sdk::store::correction::{Decision, Request, UsageAddress, UsageChange};
 use busbar_contract::records::{ModelTokens, ModelTokensDelta, UNIT_INPUT, UNIT_OUTPUT};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::params;
 use rusqlite::types::Value;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -116,7 +120,11 @@ fn candidate(store: &SqliteStore, serial: u64) -> Request {
 }
 
 fn apply(store: &SqliteStore, request: &Request) -> OpResult<Decision> {
-    match <SqliteStore as StoreSlots>::apply_usage_correction(store, &mut Op::detached(), request) {
+    match <SqliteStore as busbar_contract::abi::sdk::store::StoreSlots>::apply_usage_correction(
+        store,
+        &mut Op::detached(),
+        request,
+    ) {
         Step::Ready(answer) => answer,
         Step::Pending { .. } => panic!("local SQLite never retains an operation across Pending"),
     }
