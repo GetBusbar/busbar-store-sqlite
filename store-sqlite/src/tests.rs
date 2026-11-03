@@ -614,9 +614,9 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
     );
 }
 
-/// Accruals saturate at `i64::MAX`; an overflow must not poison the batch.
+/// The public u64 counter range survives SQLite's signed-column mirror.
 #[test]
-fn add_usage_saturates_at_i64_max_instead_of_erroring() {
+fn add_usage_saturates_at_u64_max_instead_of_erroring() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut d = delta(i64::MAX, "m", i64::MAX, i64::MAX);
     d.models[0]
@@ -624,17 +624,18 @@ fn add_usage_saturates_at_i64_max_instead_of_erroring() {
         .insert("custom".to_string(), i64::MAX);
     s.add_usage("vk_sat", 1, &d).unwrap();
     s.add_usage("vk_sat", 1, &d).unwrap();
+    s.add_usage("vk_sat", 1, &d).unwrap();
     let ledger = s.get_usage("vk_sat", 1).unwrap();
-    assert_eq!(ledger.requests, i64::MAX as u64);
-    assert_eq!(ledger.billable_requests, i64::MAX as u64);
+    assert_eq!(ledger.requests, u64::MAX);
+    assert_eq!(ledger.billable_requests, u64::MAX);
     let m = &ledger.models[0];
-    assert_eq!(m.tier(UNIT_INPUT), i64::MAX as u64);
-    assert_eq!(m.tier(UNIT_OUTPUT), i64::MAX as u64);
-    assert_eq!(m.tier("custom"), i64::MAX as u64);
+    assert_eq!(m.tier(UNIT_INPUT), u64::MAX);
+    assert_eq!(m.tier(UNIT_OUTPUT), u64::MAX);
+    assert_eq!(m.tier("custom"), u64::MAX);
 }
 
 #[test]
-fn add_metering_saturates_at_i64_max_instead_of_erroring() {
+fn add_metering_saturates_at_u64_max_instead_of_erroring() {
     for v in [i64::MAX as u64, u64::MAX] {
         let s = SqliteStore::open_in_memory().unwrap();
         let d = MeteringDelta {
@@ -655,8 +656,9 @@ fn add_metering_saturates_at_i64_max_instead_of_erroring() {
         };
         s.add_metering(&d).unwrap();
         s.add_metering(&d).unwrap();
+        s.add_metering(&d).unwrap();
         let r = &s.list_metering(1).unwrap()[0];
-        let max = i64::MAX as u64;
+        let max = u64::MAX;
         assert_eq!(
             [
                 r.tokens_input,
@@ -4596,4 +4598,134 @@ fn shared_clock_equality_admits_once_retains_ticket_and_fails_closed_on_clock_er
         )
         .unwrap();
     assert_eq!(after, i64::MAX, "clock failure cannot overwrite the winner");
+}
+
+/// Exact counts and first-seen order are durable state, not a read-side projection.
+#[test]
+fn full_width_usage_and_first_seen_models_survive_reopen() {
+    let dir = tempdir();
+    let path = dir.join("exact-usage.db");
+    let expected = {
+        let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        for model in ["zeta", "alpha", "mid", "zeta"] {
+            let mut change = delta(i64::MAX, model, i64::MAX, i64::MAX);
+            change.models[0]
+                .usage_units
+                .insert("custom".into(), i64::MAX);
+            store.add_usage("key", 1, &change).unwrap();
+        }
+        store.add_usage("key", 1, &delta(1, "zeta", 1, 1)).unwrap();
+        let ledger = store.get_usage("key", 1).unwrap();
+        assert_eq!(ledger.requests, u64::MAX);
+        assert_eq!(ledger.billable_requests, u64::MAX);
+        assert_eq!(
+            ledger
+                .models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha", "mid"]
+        );
+        assert_eq!(ledger.models[0].tier(UNIT_INPUT), u64::MAX);
+        assert_eq!(ledger.models[0].tier("custom"), u64::MAX - 1);
+        store
+            .add_usage("key", 1, &delta(i64::MIN, "zeta", i64::MIN, i64::MIN))
+            .unwrap();
+        let ledger = store.get_usage("key", 1).unwrap();
+        assert_eq!(ledger.requests, i64::MAX as u64);
+        assert_eq!(ledger.models[0].tier(UNIT_INPUT), i64::MAX as u64);
+        ledger
+    };
+    let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(reopened.get_usage("key", 1).unwrap(), expected);
+}
+
+fn full_width_metering_delta() -> MeteringDelta {
+    MeteringDelta {
+        key_id: "key".into(),
+        bucket: 1,
+        model: "model".into(),
+        provider: "provider".into(),
+        tokens_input: u64::MAX,
+        tokens_output: u64::MAX,
+        tokens_cache_read: u64::MAX,
+        tokens_cache_write: u64::MAX,
+        requests: u64::MAX,
+        billable_requests: u64::MAX,
+        key_group_at_use: "group".into(),
+        pricing_version: "version".into(),
+        priced_from_ms: 17,
+        usage_units: [("custom".into(), u64::MAX)].into_iter().collect(),
+    }
+}
+
+#[test]
+fn full_width_metering_promotes_legacy_cells_and_survives_reopen() {
+    let dir = tempdir();
+    let path = dir.join("exact-metering.db");
+    {
+        let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        store.lock_writer().execute_batch("DROP TABLE usage_metering_exact;
+            INSERT INTO usage_metering(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,requests,tokens_input)
+            VALUES ('1','key','provider','model',17,'group','version',5,7);
+            PRAGMA user_version=18;").unwrap();
+    }
+    let expected = {
+        let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        assert_eq!(store.list_metering(1).unwrap()[0].requests, 5);
+        let change = full_width_metering_delta();
+        store.add_metering(&change).unwrap();
+        store.add_metering(&change).unwrap();
+        let rows = store.list_metering(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            [
+                row.requests,
+                row.billable_requests,
+                row.tokens_input,
+                row.tokens_output,
+                row.tokens_cache_read,
+                row.tokens_cache_write
+            ],
+            [u64::MAX; 6]
+        );
+        assert_eq!(row.usage_units["custom"], u64::MAX);
+        assert_eq!(
+            (
+                &row.key_group_at_use,
+                &row.pricing_version,
+                row.priced_from_ms
+            ),
+            (&"group".to_string(), &"version".to_string(), 17)
+        );
+        rows
+    };
+    let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(reopened.list_metering(1).unwrap(), expected);
+    let mut other = full_width_metering_delta();
+    other.priced_from_ms = 18;
+    reopened.add_metering(&other).unwrap();
+    assert_eq!(reopened.list_metering(1).unwrap().len(), 2);
+}
+
+#[test]
+fn exact_metering_write_failure_rolls_back_its_column_mirror() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    store
+        .lock_writer()
+        .execute_batch(
+            "CREATE TRIGGER refuse_exact_metering BEFORE INSERT ON usage_metering_exact
+        BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    assert!(store.add_metering(&full_width_metering_delta()).is_err());
+    assert!(store.list_metering(1).unwrap().is_empty());
+    let columns: i64 = store
+        .lock_reader()
+        .query_row("SELECT COUNT(*) FROM usage_metering_units", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(columns, 0);
 }

@@ -31,7 +31,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 macro_rules! unsigned_expiry_order {
     () => {
@@ -189,6 +189,20 @@ CREATE TABLE IF NOT EXISTS usage_window_exact (
     bucket_id TEXT NOT NULL,
     ledger BLOB NOT NULL,
     PRIMARY KEY (window_start, bucket_id)
+) STRICT, WITHOUT ROWID;
+
+-- Full-width accumulated metering counts, written atomically with the signed-column mirror.
+-- The identity is the same dated billing cell as usage_metering; old databases promote lazily.
+CREATE TABLE IF NOT EXISTS usage_metering_exact (
+    bucket TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL,
+    key_group_at_use TEXT NOT NULL,
+    pricing_version TEXT NOT NULL,
+    ledger BLOB NOT NULL,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
 ) STRICT, WITHOUT ROWID;
 
 -- The open usage units (every one the four reserved token columns do not hold), one row per unit
@@ -917,8 +931,7 @@ fn row_to_cred_meta(r: &rusqlite::Row) -> rusqlite::Result<CredentialMeta> {
         revision: column::read_u64(r.get(11)?),
     })
 }
-const CRED_META_COLS: &str =
-    "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
+const CRED_META_COLS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
 
 /// The meta columns, then `secret`.
 fn row_to_cred_secret(r: &rusqlite::Row) -> rusqlite::Result<CredentialSecret> {
@@ -1121,15 +1134,16 @@ fn put_usage_in(
         .store()?;
     }
 
-    insert_usage_in(tx,
-                "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
-                params![
-                    window_start as i64,
-                    bucket_id,
-                    column::clamp(ledger.requests),
-                    column::clamp(ledger.billable_requests)
-                ],
-            )?;
+    insert_usage_in(
+        tx,
+        "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests) VALUES (?1,?2,'',?3,?4)",
+        params![
+            window_start as i64,
+            bucket_id,
+            column::clamp(ledger.requests),
+            column::clamp(ledger.billable_requests)
+        ],
+    )?;
     for m in ledger.models.iter().filter(|model| !model.model.is_empty()) {
         insert_usage_in(tx,
                     "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
@@ -1214,7 +1228,37 @@ fn verify_usage_in(
 }
 
 /// Complete day selection read under the caller's snapshot, including every C4 attribution field.
+fn same_metering_cell(left: &MeteringRow, right: &MeteringRow) -> bool {
+    left.key_id == right.key_id
+        && left.provider == right.provider
+        && left.model == right.model
+        && left.priced_from_ms == right.priced_from_ms
+        && left.key_group_at_use == right.key_group_at_use
+        && left.pricing_version == right.pricing_version
+}
+
 fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
+    let mut rows = metering_columns_in(conn, bucket)?;
+    for bytes in query_all(
+        conn,
+        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1",
+        params![(bucket as i64).to_string()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )? {
+        let exact: MeteringRow =
+            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
+        if let Some(row) = rows.iter_mut().find(|row| same_metering_cell(row, &exact)) {
+            *row = exact;
+        } else {
+            return Err(RecordStoreError(
+                "sqlite: exact metering cell has no column mirror".into(),
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+fn metering_columns_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
     let u = column::read_u64;
     let mut rows = query_all(
         conn,
@@ -1289,114 +1333,67 @@ fn add_usage_in(
     delta: &UsageDelta,
 ) -> RecordStoreResult<()> {
     refuse_reserved_usage(bucket_id)?;
-    let exact: Option<bool> = query_one(
-        tx,
-        "SELECT EXISTS(SELECT 1 FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2)",
-        params![window_start as i64, bucket_id],
-        |row| row.get(0),
-    )?;
-
-    if exact == Some(true) || delta.models.iter().any(|model| model.model.is_empty()) {
-        let mut ledger = usage_in(tx, bucket_id, window_start)?;
-        ledger.requests = ledger.requests.saturating_add_signed(delta.requests);
-        ledger.billable_requests = ledger
-            .billable_requests
-            .saturating_add_signed(delta.billable_requests);
-        for change in &delta.models {
-            let index = match ledger
-                .models
-                .iter()
-                .position(|model| model.model == change.model)
-            {
-                Some(index) => index,
-                None => {
-                    ledger.models.push(ModelTokens {
-                        model: change.model.clone(),
-                        ..Default::default()
-                    });
-                    ledger.models.len() - 1
-                }
-            };
-            for (unit, amount) in &change.usage_units {
-                let count = ledger.models[index]
-                    .usage_units
-                    .entry(unit.clone())
-                    .or_default();
-                *count = count.saturating_add_signed(*amount);
-            }
-            ledger.models[index]
-                .usage_units
-                .retain(|_, count| *count != 0);
-        }
-        ledger
-            .models
-            .sort_by(|left, right| left.model.cmp(&right.model));
-        return put_usage_in(tx, bucket_id, window_start, &ledger);
-    }
-
-    tx.prepare_cached(concat!(
-        "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests)
-         VALUES (?1,?2,'',MAX(0,?3),MAX(0,?4))
-         ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-            requests = MAX(0, ",
-        sat_add!("requests", "?3"),
-        "),
-            billable_requests = MAX(0, ",
-        sat_add!("billable_requests", "?4"),
-        ")"
-    ))
-    .store()?
-    .execute(params![
-        window_start as i64,
-        bucket_id,
-        delta.requests,
-        delta.billable_requests
-    ])
-    .store()?;
-    for m in &delta.models {
-        let d = |unit: &str| m.usage_units.get(unit).copied().unwrap_or(0);
-        tx.prepare_cached(concat!(
-            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
-                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-             VALUES (?1,?2,?3,0,0,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
-             ON CONFLICT(window_start, bucket_id, model) DO UPDATE SET
-                tokens_input       = MAX(0, ", sat_add!("tokens_input", "?4"), "),
-                tokens_output      = MAX(0, ", sat_add!("tokens_output", "?5"), "),
-                tokens_cache_read  = MAX(0, ", sat_add!("tokens_cache_read", "?6"), "),
-                tokens_cache_write = MAX(0, ", sat_add!("tokens_cache_write", "?7"), ")"
-        ))
-        .store()?
-        .execute(params![
-            window_start as i64,
-            bucket_id,
-            m.model,
-            d(UNIT_INPUT),
-            d(UNIT_OUTPUT),
-            d(UNIT_CACHE_READ),
-            d(UNIT_CACHE_WRITE),
-        ])
-        .store()?;
-
-        for (unit, d) in open_units(&m.usage_units) {
-            tx.prepare_cached(concat!(
-                "INSERT INTO usage_window_units (window_start, bucket_id, model, unit, count)
-                 VALUES (?1,?2,?3,?4,MAX(0,?5))
-                 ON CONFLICT(window_start, bucket_id, model, unit) DO UPDATE SET
-                    count = MAX(0, ",
-                sat_add!("count", "?5"),
-                ")"
-            ))
-            .store()?
-            .execute(params![window_start as i64, bucket_id, m.model, unit, d])
-            .store()?;
-        }
-    }
-    Ok(())
+    // The exact ledger is the authority for every accrual, including the first. SQLite INTEGER
+    // cannot represent the public u64 counters, and its primary-key order is not first-seen order.
+    let mut ledger = usage_in(tx, bucket_id, window_start)?;
+    ledger.apply_delta(delta);
+    put_usage_in(tx, bucket_id, window_start, &ledger)
 }
 
 /// [`RecordStore::add_metering`]'s writes, inside the caller's transaction.
 fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> {
     let priced_from = column::storable_i64("add_metering", "priced_from_ms", d.priced_from_ms)?;
+    let mut exact = MeteringRow {
+        key_id: d.key_id.clone(),
+        model: d.model.clone(),
+        provider: d.provider.clone(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: d.key_group_at_use.clone(),
+        pricing_version: d.pricing_version.clone(),
+        priced_from_ms: d.priced_from_ms,
+        usage_units: Default::default(),
+    };
+    let persisted: Option<Vec<u8>> = query_one(
+        tx,
+        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1 AND key_id=?2 AND provider=?3
+         AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        params![
+            (d.bucket as i64).to_string(),
+            d.key_id,
+            d.provider,
+            d.model,
+            priced_from,
+            d.key_group_at_use,
+            d.pricing_version
+        ],
+        |row| row.get(0),
+    )?;
+    if let Some(bytes) = persisted {
+        exact =
+            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
+    } else if let Some(previous) = metering_columns_in(tx, d.bucket)?
+        .into_iter()
+        .find(|row| same_metering_cell(row, &exact))
+    {
+        exact = previous;
+    }
+    exact.tokens_input = exact.tokens_input.saturating_add(d.tokens_input);
+    exact.tokens_output = exact.tokens_output.saturating_add(d.tokens_output);
+    exact.tokens_cache_read = exact.tokens_cache_read.saturating_add(d.tokens_cache_read);
+    exact.tokens_cache_write = exact
+        .tokens_cache_write
+        .saturating_add(d.tokens_cache_write);
+    exact.requests = exact.requests.saturating_add(d.requests);
+    exact.billable_requests = exact.billable_requests.saturating_add(d.billable_requests);
+    for (unit, amount) in &d.usage_units {
+        let count = exact.usage_units.entry(unit.clone()).or_default();
+        *count = count.saturating_add(*amount);
+    }
     exec(
         tx,
         concat!("INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
@@ -1444,6 +1441,30 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
                 column::clamp(*count),
             ],
         )?;
+    }
+    let bytes = serde_json::to_vec(&exact).map_err(|error| RecordStoreError(error.to_string()))?;
+    if exec(
+        tx,
+        "INSERT INTO usage_metering_exact
+        (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,ledger)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        ON CONFLICT(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version)
+        DO UPDATE SET ledger=excluded.ledger",
+        params![
+            (d.bucket as i64).to_string(),
+            d.key_id,
+            d.provider,
+            d.model,
+            priced_from,
+            d.key_group_at_use,
+            d.pricing_version,
+            bytes
+        ],
+    )? != 1
+    {
+        return Err(RecordStoreError(
+            "sqlite: exact metering cell was not written".into(),
+        ));
     }
     Ok(())
 }
@@ -2017,9 +2038,12 @@ impl RecordStore for SqliteStore {
         if kind == TICKET_RECORD_KIND {
             let conn = self.lock_reader();
             let _snapshot = conn.unchecked_transaction().store()?;
-            let row: Option<(i64, String)> = query_one(&conn,
+            let row: Option<(i64, String)> = query_one(
+                &conn,
                 "SELECT ts, disposition FROM plane_records WHERE kind=?1 AND identity=?2 AND seq=?3",
-                params![kind, token, UPSERT_SEQ], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                params![kind, token, UPSERT_SEQ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             let store_now = shared_clock(&conn)? as u64;
             return Ok(store_now <= expires_at
                 && row.is_some_and(|(ts, disposition)| {
@@ -2111,14 +2135,14 @@ fn put_credential_inner(
             return Err(RecordStoreError(format!(
                 "{method}: key '{}' does not exist; a credential must hang off a real key",
                 m.key_id
-            )))
+            )));
         }
         Some(false) => {
             return Err(RecordStoreError(format!(
                 "{method}: key '{}' is tombstoned; its credentials were revoked with it and are \
                  never reissued",
                 m.key_id
-            )))
+            )));
         }
         Some(true) => {}
     }
