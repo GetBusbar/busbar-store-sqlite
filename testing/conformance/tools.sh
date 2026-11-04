@@ -9,7 +9,9 @@
 # against the sha256 pinned here BEFORE it is unpacked, and cached under
 # ${MODERNCI_CACHE_DIR:-$HOME/.cache}/conformance-tools/. A tool already on PATH at the pinned major is
 # used as is. A platform with no pin, a failed download or a sha mismatch is a refusal (return 1),
-# never a fall-back. An instrument that needs system libraries (a browser, a JVM suite) runs in a
+# never a fall-back. Managed cache versions keep the current pins, two recent inactive installs
+# and every leased install. Unmanaged legacy entries are preserved for compatibility with active
+# older drivers; no process is assumed idle merely because its cache files are old. An instrument that needs system libraries (a browser, a JVM suite) runs in a
 # docker image pinned by digest in the suite's own script, not here.
 #
 #   rust  rustup 1.28.2 (sha-pinned rustup-init) installing what rust-toolchain.toml names; cargo
@@ -22,6 +24,104 @@ _ct_root="$_ct_root/conformance-tools"
 _ct_node_ver=v22.23.3
 _ct_node_major="${_ct_node_ver#v}"; _ct_node_major="${_ct_node_major%%.*}"
 _ct_rustup_ver=1.28.2
+
+# Seal verified-download executable bytes before publication, and recheck before every reuse.
+# System tools outside this cache retain the explicit PATH trust policy described above.
+_ct_integrity() {
+  python3 -I - "$1" "$2" "$3" <<'PYINTEGRITY'
+import hashlib, json, pathlib, sys
+mode, directory, probe = sys.argv[1:4]
+root = pathlib.Path(directory)
+try:
+    executable = (root / probe).resolve(strict=True)
+    if not executable.is_relative_to(root.resolve()):
+        raise ValueError("executable escapes the installation")
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    record = {"probe": probe, "sha256": digest}
+    path = root / ".busbar-tool.json"
+    if mode == "seal":
+        path.write_text(json.dumps(record) + "\n")
+    elif json.loads(path.read_text()) != record:
+        raise ValueError("cached executable bytes differ from the verified installation")
+except (OSError, ValueError) as error:
+    print(f"tools.sh: cached tool integrity refused: {error}", file=sys.stderr)
+    sys.exit(1)
+PYINTEGRITY
+}
+
+# Managed versions hold this shared lease for the sourcing shell's lifetime. Existing caches
+# without a lease marker remain unmanaged: an older driver may still be using those paths.
+_ct_cache_lease() {
+  local key="$1" lease
+  lease="$_ct_root/.leases/$key.lock"
+  if [ ! -f "$lease" ] && [ -e "$_ct_root/$key" ]; then return 0; fi
+  mkdir -p "$_ct_root/.leases" || return 1
+  exec {_ct_cache_fd}>"$lease" || return 1
+  python3 -I -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_SH)' "$_ct_cache_fd"
+}
+
+# Protect a managed tool already inherited on PATH before considering any cache deletion.
+_ct_path_lease() {
+  local path key
+  path="$(command -v "$1" 2>/dev/null)" || return 0
+  case "$path" in
+    "$_ct_root"/*)
+      key="${path#"$_ct_root"/}"; key="${key%%/*}"
+      [ ! -f "$_ct_root/.leases/$key.lock" ] || _ct_cache_lease "$key" || return 1
+      _ct_integrity check "$_ct_root/$key" "${path#"$_ct_root/$key"/}"
+      ;;
+  esac
+}
+
+# Keep current versions, two recent inactive installations per tool, and every active lease.
+# Lease files remain stable so opening a lease can never race with replacing its lock inode.
+_ct_prune() {
+  python3 -I - "$_ct_root" "$_ct_node_ver" "$_ct_rustup_ver" <<'PYCACHE'
+import fcntl, os, pathlib, re, shutil, sys
+root = pathlib.Path(sys.argv[1])
+current_node, current_rustup = sys.argv[2:4]
+leases = root / ".leases"
+if not leases.is_dir():
+    sys.exit(0)
+patterns = {"node": r"node-v[0-9]+\.[0-9]+\.[0-9]+-(?:linux|darwin)-(?:x64|arm64)",
+            "rustup": r"rustup-[0-9]+\.[0-9]+\.[0-9]+"}
+try:
+    for family, pattern in patterns.items():
+        inactive = 0
+        markers = sorted(leases.glob("*.lock"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for marker in markers:
+            key = marker.name[:-5]
+            if re.fullmatch(pattern, key) is None:
+                continue
+            dest = root / key
+            archives = [root / (key + ".tar.gz"), *root.glob(key + ".tar.gz.part.*")] if family == "node" else list(root.glob("rustup-init-" + key[7:] + "-*"))
+            if not dest.exists() and not any(p.exists() for p in archives):
+                continue
+            with marker.open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                probe = dest / ("bin/node" if family == "node" else "cargo/bin/cargo")
+                for archive in archives:
+                    if ".part." in archive.name or (os.access(probe, os.X_OK) and (dest / ".busbar-tool.json").is_file()):
+                        archive.unlink(missing_ok=True)
+                current = key.startswith("node-" + current_node + "-") if family == "node" else key == "rustup-" + current_rustup
+                if current:
+                    continue
+                inactive += 1
+                if inactive > 2:
+                    if dest.is_symlink():
+                        dest.unlink()
+                    elif dest.exists():
+                        shutil.rmtree(dest)
+                    for archive in archives:
+                        archive.unlink(missing_ok=True)
+except OSError as error:
+    print(f"tools.sh: cannot prune managed cache: {error}", file=sys.stderr)
+    sys.exit(1)
+PYCACHE
+}
 
 _ct_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -90,6 +190,7 @@ _ct_node() {
     *) echo "tools.sh: no pinned node for $plat" >&2; return 1 ;;
   esac
   dir="$_ct_root/node-$_ct_node_ver-$plat"
+  _ct_cache_lease "node-$_ct_node_ver-$plat" || return 1
   if [ ! -x "$dir/bin/node" ]; then
     _ct_fetch "https://nodejs.org/dist/$_ct_node_ver/node-$_ct_node_ver-$plat.tar.gz" "$sha" "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" || return 1
     (
@@ -97,13 +198,16 @@ _ct_node() {
       trap 'rm -rf "$stage"' EXIT
       trap 'exit 1' HUP INT TERM
       tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$stage" || exit 1
+      _ct_integrity seal "$stage/node-$_ct_node_ver-$plat" bin/node || exit 1
       _ct_publish "$stage/node-$_ct_node_ver-$plat" "$dir" bin/node
     ) || return 1
   fi
+  _ct_integrity check "$dir" bin/node || return 1
   PATH="$dir/bin:$PATH"; export PATH
 }
 
 _ct_rust() {
+  [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] || { echo "tools.sh: no pinned Rust toolchain" >&2; return 1; }
   command -v cargo >/dev/null 2>&1 && return 0
   local t sha
   case "$(uname -s)-$(uname -m)" in
@@ -114,21 +218,23 @@ _ct_rust() {
     *) echo "tools.sh: no pinned rustup for $(uname -s)-$(uname -m)" >&2; return 1 ;;
   esac
   local home="$_ct_root/rustup-$_ct_rustup_ver"
+  _ct_cache_lease "rustup-$_ct_rustup_ver" || return 1
   RUSTUP_HOME="$home/rustup"; CARGO_HOME="$home/cargo"
   export RUSTUP_HOME CARGO_HOME
   if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
-    _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$t" || return 1
-    chmod +x "$_ct_root/rustup-init-$t" || { echo "tools.sh: cannot make rustup installer executable" >&2; return 1; }
+    _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || return 1
+    chmod +x "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || { echo "tools.sh: cannot make rustup installer executable" >&2; return 1; }
     (
       stage="$(mktemp -d "$_ct_root/.rustup-stage.XXXXXX")" || exit 1
       trap 'rm -rf "$stage"' EXIT
       trap 'exit 1' HUP INT TERM
-      RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$t" -y --no-modify-path --default-toolchain none || exit 1
+      RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$_ct_rustup_ver-$t" -y --no-modify-path --default-toolchain none || exit 1
+      _ct_integrity seal "$stage" cargo/bin/cargo || exit 1
       _ct_publish "$stage" "$home" cargo/bin/cargo
     ) || return 1
   fi
+  _ct_integrity check "$home" cargo/bin/cargo || return 1
   PATH="$CARGO_HOME/bin:$PATH"; export PATH
-  [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] || { echo "tools.sh: no pinned Rust toolchain" >&2; return 1; }
   python3 -I - "$home/toolchain.lock" <<'PY'
 import fcntl, subprocess, sys
 with open(sys.argv[1], "a") as lock:
@@ -140,6 +246,8 @@ PY
 }
 
 for _ct_t in "$@"; do
+  case "$_ct_t" in rust) _ct_path_lease cargo || return 1 ;; node) _ct_path_lease node || return 1 ;; esac
+  _ct_prune || return 1
   case "$_ct_t" in
     rust) _ct_rust || return 1 ;;
     node) _ct_node || return 1 ;;

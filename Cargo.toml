@@ -15,6 +15,8 @@
 # `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
 # `deps.toml` row in busbar first. Heal seeds resolution from busbar's lock at the pin; this
 # plugin retains its own Cargo.lock and CI checks its pinned core revision and dependency policy.
+# These table-source revisions record generated dependency provenance independently of the
+# runtime SDK revision in `.busbar-ref`; repinning the SDK does not regenerate these tables.
 [workspace]
 resolver = "2"
 members = [
