@@ -1,7 +1,7 @@
 # RENDERED by `busbar-release plugin heal busbar-store-sqlite` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. Weekly: does the newest
 # PUBLISHED release still work for a user (busbar's plugin-consumer-verify.yml)? A publish-time check
-# cannot see an artifact that rots afterwards; release.yml verifies each release as it publishes.
+# cannot see an artifact that rots once it is out.
 name: consumer-verify
 
 on:
@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@892773b8ed5d0cc78694bbcf5a10d89346ad61e6
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@16530bfbda93e34caa5bbf81b8e6c65307305477
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-sqlite
