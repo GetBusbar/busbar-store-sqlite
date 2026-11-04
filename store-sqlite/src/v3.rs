@@ -487,6 +487,11 @@ macro_rules! ready {
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
 /// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
+    fn ephemeral(&self) -> Option<bool> {
+        // Ask the actual opened connection, including temporary and memory URI databases.
+        Some(self.lock_writer().path().is_none_or(str::is_empty))
+    }
+
     const RECORD_TRANSACTION: bool = true;
     const USAGE_CORRECTION: bool = true;
 

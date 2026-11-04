@@ -89,7 +89,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=16530bfbda93e34caa5bbf81b8e6c65307305477#16530bfbda93e34caa5bbf81b8e6c65307305477"
+source = "git+https://github.com/GetBusbar/busbar?rev=5d7b3e634773a9734b08d0c45726e5909bdd9bf0#5d7b3e634773a9734b08d0c45726e5909bdd9bf0"
 dependencies = [
  "async-trait",
  "aws-lc-sys",
@@ -118,21 +118,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "busbar-kernel-seams"
-version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=16530bfbda93e34caa5bbf81b8e6c65307305477#16530bfbda93e34caa5bbf81b8e6c65307305477"
-dependencies = [
- "busbar-contract",
-]
-
-[[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=16530bfbda93e34caa5bbf81b8e6c65307305477#16530bfbda93e34caa5bbf81b8e6c65307305477"
+source = "git+https://github.com/GetBusbar/busbar?rev=5d7b3e634773a9734b08d0c45726e5909bdd9bf0#5d7b3e634773a9734b08d0c45726e5909bdd9bf0"
 dependencies = [
  "arc-swap",
  "busbar-contract",
- "busbar-kernel-seams",
  "ed25519-dalek",
  "flate2",
  "futures",

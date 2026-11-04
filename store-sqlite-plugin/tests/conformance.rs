@@ -793,3 +793,18 @@ fn the_dropped_store_has_a_distinct_door_and_operation_table() {
     assert_ne!(door, linked as *const _ as usize);
     assert_ne!(ops, parts.ops as usize);
 }
+
+#[test]
+fn each_open_reports_actual_memory_or_file_durability_through_both_doors() {
+    for by in [Door::Linked, Door::Dropped] {
+        let memory = open(by, r#"{"db_path":":memory:"}"#).unwrap();
+        assert_eq!(sc::StoreCalls::ephemeral(&memory), Some(true));
+        close(memory);
+        let path = scratch("runtime-durability");
+        let settings = serde_json::json!({"db_path": path}).to_string();
+        let file = open(by, &settings).unwrap();
+        assert_eq!(sc::StoreCalls::ephemeral(&file), Some(false));
+        close(file);
+        std::fs::remove_file(&path).unwrap();
+    }
+}

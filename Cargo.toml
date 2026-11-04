@@ -36,8 +36,8 @@ repository = "https://github.com/GetBusbar/busbar-store-sqlite"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "16530bfbda93e34caa5bbf81b8e6c65307305477" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "16530bfbda93e34caa5bbf81b8e6c65307305477" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "5d7b3e634773a9734b08d0c45726e5909bdd9bf0" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "5d7b3e634773a9734b08d0c45726e5909bdd9bf0" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"
