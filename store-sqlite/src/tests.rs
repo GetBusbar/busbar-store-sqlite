@@ -3682,7 +3682,7 @@ fn a_v13_database_upgrades_its_credentials_table_losslessly() {
              CREATE UNIQUE INDEX cred_public_id_uq ON credentials (kind, public_id);
              CREATE UNIQUE INDEX cred_slot_uq ON credentials (key_id, kind, slot);
              CREATE INDEX cred_revision_idx ON credentials (revision);
-             PRAGMA user_version = 13;",
+             PRAGMA user_version=6;",
         )
         .unwrap();
     }
@@ -4167,7 +4167,7 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
 ) STRICT, WITHOUT ROWID;
 
 
-        PRAGMA user_version=16;
+        PRAGMA user_version=6;
         INSERT INTO usage_metering (bucket,key_id,provider,model,key_group_at_use,pricing_version,requests,tokens_input,priced_from_ms)
           VALUES ('-1','history','p','m','old|group','old%version',1,7,9007199254740993),
                  ('-1','unknown','p','m','','',1,3,0);
@@ -4261,7 +4261,7 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
 
 
 
-        PRAGMA user_version=16;
+        PRAGMA user_version=6;
         INSERT INTO usage_metering_units (bucket,key_id,provider,model,priced_from_ms,unit,count)
           VALUES ('-1','orphan','p','m',0,'tool_calls',9007199254740993);
     "#,
@@ -4273,7 +4273,7 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
     let v: i64 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 16);
+    assert_eq!(v, FIRST_RELEASED_SCHEMA);
     let n: i64 = c
         .query_row("SELECT count FROM usage_metering_units", [], |r| r.get(0))
         .unwrap();
@@ -4668,7 +4668,7 @@ fn full_width_metering_promotes_legacy_cells_and_survives_reopen() {
         store.lock_writer().execute_batch("DROP TABLE usage_metering_exact;
             INSERT INTO usage_metering(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,requests,tokens_input)
             VALUES ('1','key','provider','model',17,'group','version',5,7);
-            PRAGMA user_version=18;").unwrap();
+            PRAGMA user_version=6;").unwrap();
     }
     let expected = {
         let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();

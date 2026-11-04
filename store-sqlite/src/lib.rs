@@ -31,7 +31,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 7;
 
 macro_rules! unsigned_expiry_order {
     () => {
@@ -626,14 +626,14 @@ impl SqliteStore {
         {
             rebuild_usage_metering_for_v10(&tx)?;
         }
-        if version < 17 && table_exists(&tx, "usage_metering")? {
+        if version < SCHEMA_VERSION && table_exists(&tx, "usage_metering")? {
             rebuild_metering_for_v17(&tx)?;
         }
 
-        if version != 0 && version < 15 && table_exists(&tx, "credentials")? {
+        if version != 0 && version < SCHEMA_VERSION && table_exists(&tx, "credentials")? {
             rebuild_credentials_for_v15(&tx)?;
         }
-        if version < 16 && table_exists(&tx, "keys")? {
+        if version < SCHEMA_VERSION && table_exists(&tx, "keys")? {
             add_v10_key_columns(&tx)?;
             rebuild_keys_for_v16(&tx)?;
         }

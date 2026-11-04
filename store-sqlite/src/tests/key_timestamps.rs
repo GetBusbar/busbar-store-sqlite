@@ -129,7 +129,7 @@ fn disable_fixture_foreign_keys(conn: &Connection) {
     assert_eq!(enabled, 0, "the legacy fixture must not execute FK actions");
 }
 
-fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
+fn legacy_file(path: &Path, times: &[(u64, Option<u64>)]) {
     let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
     for n in 0..times.len() {
         let id = format!("owner-{n}");
@@ -204,7 +204,8 @@ fn legacy_file(path: &Path, version: i64, times: &[(u64, Option<u64>)]) {
          WHEN NEW.name='blocked' BEGIN SELECT RAISE(ABORT,'custom key guard'); END;",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", version).unwrap();
+    conn.pragma_update(None, "user_version", FIRST_RELEASED_SCHEMA)
+        .unwrap();
 }
 
 type Snapshot = (
@@ -263,93 +264,94 @@ fn snapshot(path: &Path) -> Snapshot {
 
 #[test]
 fn legacy_unsigned_keys_preserve_every_row_revision_and_external_guard() {
-    for version in [14, 15] {
-        let dir = tempdir();
-        let path = dir.join("legacy-keys.db");
-        legacy_file(
-            &path,
-            version,
-            &[
-                (1, Some(u64::MAX)),
-                (SIGNED_MAX + 1, Some(u64::MAX)),
-                (u64::MAX, None),
-            ],
-        );
-        let before = snapshot(&path);
-        let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    let dir = tempdir();
+    let path = dir.join("legacy-keys.db");
+    legacy_file(
+        &path,
+        &[
+            (1, Some(u64::MAX)),
+            (SIGNED_MAX + 1, Some(u64::MAX)),
+            (u64::MAX, None),
+        ],
+    );
+    let before = snapshot(&path);
+    let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(
+        snapshot(&path).0,
+        SCHEMA_VERSION,
+        "released readers must refuse the repaired schema"
+    );
+    assert_eq!(
+        snapshot(&path).2,
+        before.2,
+        "all rows and the global counter must survive"
+    );
+    let keys = store.list_keys().unwrap();
+    let before_revision = store_revision(&store);
+    for key in &keys {
         assert_eq!(
-            snapshot(&path).0,
-            SCHEMA_VERSION,
-            "v15 readers must refuse the repaired schema"
+            store.list_credentials(&key.id).unwrap().len(),
+            1,
+            "the parent rebuild must not cascade-delete credentials"
         );
-        assert_eq!(
-            snapshot(&path).2,
-            before.2,
-            "all rows and the global counter must survive"
-        );
-        let keys = store.list_keys().unwrap();
-        let before_revision = store_revision(&store);
-        for key in &keys {
-            assert_eq!(
-                store.list_credentials(&key.id).unwrap().len(),
-                1,
-                "the parent rebuild must not cascade-delete credentials"
-            );
-        }
-        let conn = store.lock_writer();
-        assert!(conn
-            .execute("UPDATE keys SET name='blocked' WHERE id='owner-0'", [])
-            .is_err());
-        let index: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='keys_custom_name_idx'", [], |row| row.get(0)).unwrap();
-        assert_eq!(index, 1);
-        let fk: i64 = conn
-            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(fk, 1);
-        assert!(conn
-            .execute("DELETE FROM keys WHERE id='owner-0'", [])
-            .is_ok());
-        drop(conn);
-        assert!(
-            store.list_credentials("owner-0").unwrap().is_empty(),
-            "cascade still works after migration"
-        );
-        store
-            .put_key(&sample_key("after-upgrade", "generation"))
-            .unwrap();
-        let after = store_revision(&store);
-        assert_eq!(
-            after,
-            before_revision + 1,
-            "migration consumes no mutation revision"
-        );
-        drop(store);
-        let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
-        assert_eq!(store_revision(&reopened), after);
-        assert!(reopened.get_key("after-upgrade").unwrap().is_some());
     }
+    let conn = store.lock_writer();
+    assert!(conn
+        .execute("UPDATE keys SET name='blocked' WHERE id='owner-0'", [])
+        .is_err());
+    let index: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='keys_custom_name_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1);
+    let fk: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(fk, 1);
+    assert!(conn
+        .execute("DELETE FROM keys WHERE id='owner-0'", [])
+        .is_ok());
+    drop(conn);
+    assert!(
+        store.list_credentials("owner-0").unwrap().is_empty(),
+        "cascade still works after migration"
+    );
+    store
+        .put_key(&sample_key("after-upgrade", "generation"))
+        .unwrap();
+    let after = store_revision(&store);
+    assert_eq!(
+        after,
+        before_revision + 1,
+        "migration consumes no mutation revision"
+    );
+    drop(store);
+    let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert_eq!(store_revision(&reopened), after);
+    assert!(reopened.get_key("after-upgrade").unwrap().is_some());
 }
 
 #[test]
 fn legacy_signed_only_key_expiry_refuses_without_changing_any_schema_or_row() {
-    for version in [14, 15] {
-        let dir = tempdir();
-        let path = dir.join("invalid-key-times.db");
-        legacy_file(&path, version, &[(SIGNED_MAX + 1, Some(1)), (0, None)]);
-        let before = snapshot(&path);
-        let error = match SqliteStore::open(path.to_str().unwrap(), 5000) {
-            Ok(_) => panic!("unsigned-invalid legacy keys must refuse migration"),
-            Err(error) => error,
-        };
-        assert!(error.0.contains("owner-0"));
-        assert!(error.0.contains("unsigned timestamp order"));
-        assert!(error.0.contains(&(SIGNED_MAX + 1).to_string()));
-        assert_eq!(
-            snapshot(&path),
-            before,
-            "schema, all rows, secrets, counter and stamp must roll back together"
-        );
-    }
+    let dir = tempdir();
+    let path = dir.join("invalid-key-times.db");
+    legacy_file(&path, &[(SIGNED_MAX + 1, Some(1)), (0, None)]);
+    let before = snapshot(&path);
+    let error = match SqliteStore::open(path.to_str().unwrap(), 5000) {
+        Ok(_) => panic!("unsigned-invalid legacy keys must refuse migration"),
+        Err(error) => error,
+    };
+    assert!(error.0.contains("owner-0"));
+    assert!(error.0.contains("unsigned timestamp order"));
+    assert!(error.0.contains(&(SIGNED_MAX + 1).to_string()));
+    assert_eq!(
+        snapshot(&path),
+        before,
+        "schema, all rows, secrets, counter and stamp must roll back together"
+    );
 }
 
 #[test]
@@ -367,7 +369,8 @@ fn refused_key_migration_restores_foreign_key_enforcement() {
         .unwrap();
         conn.pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
-        conn.pragma_update(None, "user_version", 15).unwrap();
+        conn.pragma_update(None, "user_version", FIRST_RELEASED_SCHEMA)
+            .unwrap();
     }
     assert!(store.migrate().is_err());
     let conn = store.lock_writer();
@@ -382,14 +385,14 @@ fn refused_key_migration_restores_foreign_key_enforcement() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, FIRST_RELEASED_SCHEMA);
 }
 
 #[test]
 fn an_orphan_legacy_credential_refuses_parent_rebuild_atomically() {
     let dir = tempdir();
     let path = dir.join("orphan.db");
-    legacy_file(&path, 15, &[(0, None)]);
+    legacy_file(&path, &[(0, None)]);
     let conn = Connection::open(&path).unwrap();
 
     disable_fixture_foreign_keys(&conn);

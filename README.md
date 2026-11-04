@@ -54,7 +54,7 @@ its identity and decoded timestamps. The transaction leaves the schema,
 rows and revision counter unchanged on refusal, so the source data can be
 reviewed before retrying.
 
-Schema v17 preserves each metering row’s recorded group and price version in its identity, including open units. Existing rows keep their recorded attribution; history already combined by an older writer cannot be reconstructed. An open-unit row without its parent refuses the transaction rather than guessing attribution. Stop older writers before upgrading; they cannot safely write the new metering keys.
+Schema v7 preserves each metering row’s recorded group and price version in its identity, including open units. Existing rows keep their recorded attribution; history already combined by an older writer cannot be reconstructed. An open-unit row without its parent refuses the transaction rather than guessing attribution. Stop older writers before upgrading; they cannot safely write the new metering keys.
 
 On a successful upgrade, keys, credentials, tombstones, usage and metering
 counts, the audit log and the denylist retain their data; existing

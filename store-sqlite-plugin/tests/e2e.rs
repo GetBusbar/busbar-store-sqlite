@@ -313,7 +313,7 @@ fn migrated_schema(path: &std::path::Path) -> rusqlite::Result<bool> {
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    const EXPECTED_MIGRATED_SCHEMA: i64 = 18;
+    const EXPECTED_MIGRATED_SCHEMA: i64 = 7;
     if version != EXPECTED_MIGRATED_SCHEMA {
         return Ok(false);
     }

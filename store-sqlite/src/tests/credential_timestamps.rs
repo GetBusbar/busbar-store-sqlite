@@ -206,7 +206,8 @@ fn legacy_file(path: &Path, version: i64, rows: &[(u64, Option<u64>)], imported_
     conn.pragma_update(None, "ignore_check_constraints", false)
         .unwrap();
     conn.execute_batch(SCHEMA).unwrap();
-    conn.pragma_update(None, "user_version", version).unwrap();
+    conn.pragma_update(None, "user_version", FIRST_RELEASED_SCHEMA)
+        .unwrap();
 }
 
 type Snapshot = (
@@ -281,7 +282,7 @@ fn v14_timestamp_rows_keep_all_bits_metadata_and_revision_on_upgrade() {
         .unwrap();
     assert_eq!(
         version, SCHEMA_VERSION,
-        "older v14 readers must not reopen the repaired schema"
+        "released readers must not reopen the repaired schema"
     );
     drop(store);
     let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
