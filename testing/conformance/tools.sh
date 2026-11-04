@@ -52,12 +52,28 @@ PYINTEGRITY
 # Managed versions hold this shared lease for the sourcing shell's lifetime. Existing caches
 # without a lease marker remain unmanaged: an older driver may still be using those paths.
 _ct_cache_lease() {
-  local key="$1" lease
+  local key="$1" lease mode=shared held
+  # Bash 3.2 (the macOS system shell) has no dynamic descriptor allocation. One descriptor
+  # per tool remains open for the driver's lifetime; changing PATH replaces the old tool lease.
+  case "$key" in
+    node-*) _ct_cache_fd=8; held=_ct_node_cache_key ;;
+    rustup-*) _ct_cache_fd=9; held=_ct_rustup_cache_key ;;
+    *) echo "tools.sh: unknown cache lease key" >&2; return 1 ;;
+  esac
+  [ "${!held-}" != "$key" ] || return 0
   lease="$_ct_root/.leases/$key.lock"
-  if [ ! -f "$lease" ] && [ -e "$_ct_root/$key" ]; then return 0; fi
+  if [ ! -f "$lease" ] && [ -e "$_ct_root/$key" ]; then
+    # A separate marker protects migration without claiming ownership of a legacy install.
+    lease="$_ct_root/.leases/legacy-$key.lock"
+    [ -f "$_ct_root/$key/.busbar-tool.json" ] || mode=exclusive
+  fi
   mkdir -p "$_ct_root/.leases" || return 1
-  exec {_ct_cache_fd}>"$lease" || return 1
-  python3 -I -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_SH)' "$_ct_cache_fd"
+  case "$_ct_cache_fd" in
+    8) exec 8>"$lease" || return 1 ;;
+    9) exec 9>"$lease" || return 1 ;;
+  esac
+  python3 -I -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX if sys.argv[2] == "exclusive" else fcntl.LOCK_SH)' "$_ct_cache_fd" "$mode" || return 1
+  printf -v "$held" '%s' "$key"
 }
 
 # Protect a managed tool already inherited on PATH before considering any cache deletion.
@@ -67,8 +83,10 @@ _ct_path_lease() {
   case "$path" in
     "$_ct_root"/*)
       key="${path#"$_ct_root"/}"; key="${key%%/*}"
-      [ ! -f "$_ct_root/.leases/$key.lock" ] || _ct_cache_lease "$key" || return 1
-      _ct_integrity check "$_ct_root/$key" "${path#"$_ct_root/$key"/}"
+      _ct_cache_lease "$key" || return 1
+      # Unsealed legacy bytes are never executed to query their version. Provisioning obtains
+      # the pinned official asset and compares it before adding integrity metadata.
+      [ ! -f "$_ct_root/$key/.busbar-tool.json" ] || _ct_integrity check "$_ct_root/$key" "${path#"$_ct_root/$key"/}"
       ;;
   esac
 }
@@ -147,7 +165,7 @@ _ct_fetch() (
 # replaced, never used.
 _ct_publish() {
   python3 -I - "$1" "$2" "$3" <<'PY'
-import fcntl, os, shutil, sys
+import fcntl, hashlib, json, os, pathlib, shutil, sys, tempfile
 stage, dest, probe = sys.argv[1:4]
 done = lambda: os.access(os.path.join(dest, probe), os.X_OK)
 try:
@@ -162,7 +180,20 @@ try:
             os.rename(stage, dest)
         if not done():
             raise OSError("published tool has no executable probe")
-except OSError as error:
+        known = pathlib.Path(stage) / ".busbar-tool.json"
+        metadata = pathlib.Path(dest) / ".busbar-tool.json"
+        if known.is_file() and not metadata.exists():
+            expected = json.loads(known.read_text())
+            executable = (pathlib.Path(dest) / probe).resolve(strict=True)
+            if not executable.is_relative_to(pathlib.Path(dest).resolve()):
+                raise ValueError("legacy executable escapes its installation")
+            actual = {"probe": probe, "sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+            if actual != expected:
+                raise ValueError("legacy executable differs from the pinned official asset")
+            with tempfile.NamedTemporaryFile(mode="w", dir=dest, prefix=".integrity-", delete=False) as record:
+                record.write(json.dumps(expected) + "\n")
+            os.replace(record.name, metadata)
+except (OSError, ValueError) as error:
     print(f"tools.sh: cannot publish {dest}: {error}", file=sys.stderr)
     sys.exit(1)
 finally:
@@ -179,7 +210,18 @@ _ct_plat() { # <os>-<arch> as nodejs.org names them
 
 _ct_node() {
   local have plat sha dir
-  have="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  local existing key
+  existing="$(command -v node 2>/dev/null || true)"
+  have=0
+  case "$existing" in
+    "$_ct_root"/*)
+      key="${existing#"$_ct_root"/}"; key="${key%%/*}"
+      if [ -f "$_ct_root/$key/.busbar-tool.json" ]; then
+        have="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+      fi
+      ;;
+    *) have="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" ;;
+  esac
   [ "$have" = "$_ct_node_major" ] && return 0
   plat="$(_ct_plat)" || { echo "tools.sh: no pinned node for $(uname -s)-$(uname -m)" >&2; return 1; }
   case "$plat" in
@@ -191,7 +233,7 @@ _ct_node() {
   esac
   dir="$_ct_root/node-$_ct_node_ver-$plat"
   _ct_cache_lease "node-$_ct_node_ver-$plat" || return 1
-  if [ ! -x "$dir/bin/node" ]; then
+  if [ ! -x "$dir/bin/node" ] || [ ! -f "$dir/.busbar-tool.json" ]; then
     _ct_fetch "https://nodejs.org/dist/$_ct_node_ver/node-$_ct_node_ver-$plat.tar.gz" "$sha" "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" || return 1
     (
       stage="$(mktemp -d "$_ct_root/.node-stage.XXXXXX")" || exit 1
@@ -203,12 +245,22 @@ _ct_node() {
     ) || return 1
   fi
   _ct_integrity check "$dir" bin/node || return 1
+  python3 -I -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_SH)' "$_ct_cache_fd" || return 1
   PATH="$dir/bin:$PATH"; export PATH
 }
 
 _ct_rust() {
   [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] || { echo "tools.sh: no pinned Rust toolchain" >&2; return 1; }
-  command -v cargo >/dev/null 2>&1 && return 0
+  local existing key
+  existing="$(command -v cargo 2>/dev/null)" && {
+    case "$existing" in
+      "$_ct_root"/*)
+        key="${existing#"$_ct_root"/}"; key="${key%%/*}"
+        [ ! -f "$_ct_root/$key/.busbar-tool.json" ] || return 0
+        ;;
+      *) return 0 ;;
+    esac
+  }
   local t sha
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)  t=x86_64-unknown-linux-gnu;  sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
@@ -221,7 +273,7 @@ _ct_rust() {
   _ct_cache_lease "rustup-$_ct_rustup_ver" || return 1
   RUSTUP_HOME="$home/rustup"; CARGO_HOME="$home/cargo"
   export RUSTUP_HOME CARGO_HOME
-  if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+  if [ ! -x "$CARGO_HOME/bin/cargo" ] || [ ! -f "$home/.busbar-tool.json" ]; then
     _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || return 1
     chmod +x "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || { echo "tools.sh: cannot make rustup installer executable" >&2; return 1; }
     (
@@ -234,6 +286,7 @@ _ct_rust() {
     ) || return 1
   fi
   _ct_integrity check "$home" cargo/bin/cargo || return 1
+  python3 -I -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_SH)' "$_ct_cache_fd" || return 1
   PATH="$CARGO_HOME/bin:$PATH"; export PATH
   python3 -I - "$home/toolchain.lock" <<'PY'
 import fcntl, subprocess, sys

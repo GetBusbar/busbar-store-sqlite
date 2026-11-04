@@ -237,8 +237,8 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$here/target}"
 
 # One driver owns this checkout's fixed output tree until its suites and judgments finish.
 mkdir -p "$(dirname "$OUT")" || { say "the output parent could not be created"; exit 2; }
-exec {CONF_OUTPUT_FD}>"$OUT.lock" || { say "the output lease could not be opened"; exit 2; }
-python3 -I - "$CONF_OUTPUT_FD" <<'PYOUTPUT' || exit 2
+exec 7>"$OUT.lock" || { say "the output lease could not be opened"; exit 2; }
+python3 -I - 7 <<'PYOUTPUT' || exit 2
 import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
