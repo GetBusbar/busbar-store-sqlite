@@ -245,8 +245,8 @@ fn failed_ready_closes_the_real_opened_store_once() {
     );
     assert_eq!(
         first() - before,
-        3,
-        "one OPEN, failing READY, actual cleanup CLOSE"
+        4,
+        "one OPEN, metadata lease retirement, failing READY, actual cleanup CLOSE"
     );
     let w = READY_WITNESS.lock().unwrap();
     assert_eq!(w.ready_calls, 1, "failing READY is not retried");

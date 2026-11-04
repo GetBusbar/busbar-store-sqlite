@@ -800,11 +800,12 @@ fn each_open_reports_actual_memory_or_file_durability_through_both_doors() {
         let memory = open(by, r#"{"db_path":":memory:"}"#).unwrap();
         assert_eq!(sc::StoreCalls::ephemeral(&memory), Some(true));
         close(memory);
-        let path = scratch("runtime-durability");
+        let dir = scratch("runtime-durability");
+        let path = dir.join("store.db");
         let settings = serde_json::json!({"db_path": path}).to_string();
         let file = open(by, &settings).unwrap();
         assert_eq!(sc::StoreCalls::ephemeral(&file), Some(false));
         close(file);
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

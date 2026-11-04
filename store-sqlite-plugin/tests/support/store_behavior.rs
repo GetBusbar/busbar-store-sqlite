@@ -163,7 +163,9 @@ pub(super) fn behavior(by: Door, tag: &str) -> std::collections::BTreeMap<&'stat
         answers.insert("facts", value)
     };
     let before_open = count();
-    let open_pin = 1 + u64::from(p.has_ready());
+    // OPEN's instance metadata owns one answer lease, retired before READY. This is a
+    // boot-only crossing; the exact per-operation crossing assertions below remain one.
+    let open_pin = 2 + u64::from(p.has_ready());
     let st = busbar_plugin_loader::store_v3::LoadedStore::open(
         p,
         d.clone(),
@@ -174,7 +176,7 @@ pub(super) fn behavior(by: Door, tag: &str) -> std::collections::BTreeMap<&'stat
     assert_eq!(
         count() - before_open,
         open_pin,
-        "open: exact first crossings"
+        "open: OPEN, metadata lease retirement, and optional READY"
     );
     let b: &dyn RecordStore = &st;
     let before_ready = count();
