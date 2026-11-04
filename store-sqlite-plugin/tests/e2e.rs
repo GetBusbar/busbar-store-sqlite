@@ -63,6 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// RAII scratch directory: removes itself on drop, including on an early return via a panicking
+/// assertion partway through a test.
 struct ScratchDir(PathBuf);
 
 impl ScratchDir {
@@ -94,6 +95,9 @@ impl Drop for ScratchDir {
 }
 
 /// A spawned busbar process that is killed and reaped when it goes out of scope, including on a
+/// panicking assertion partway through a test. Without it, a failed assertion between spawn and
+/// the explicit kill leaves a running gateway holding its ports and its sqlite file after the
+/// scratch directory is gone. Declared after the test's `ScratchDir`, so it drops (kills) first.
 struct KillOnDrop(std::process::Child);
 
 impl std::ops::Deref for KillOnDrop {
@@ -117,6 +121,14 @@ impl Drop for KillOnDrop {
 }
 
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib. The same holds for the `#[cfg(test)]` modules this repo keeps
+/// under `src/` (a `tests.rs` file, and anything in a `src/**/tests/` directory, pulled in by
+/// `#[path]`): they are absent from the non-test lib's dep-info, so cargo never rebuilds the cdylib
+/// for them, and counting them would fail every e2e with STALE ARTIFACT after a unit-test edit.
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -192,11 +204,15 @@ fn plugin_path() -> PathBuf {
 }
 
 /// The node's one `op_id` allocator, as the kernel hands a store handle its own: the bridge's
+/// additive writes mint from it. Its node half is one no test op id uses.
 fn mint() -> busbar_contract::abi::store::OpId {
     static N: AtomicU64 = AtomicU64::new(0);
     busbar_contract::abi::store::OpId::from_parts(0x5e1f, N.fetch_add(1, Ordering::Relaxed) + 1)
 }
 /// THE DROPPED-IN DOOR, opened as the host opens a store: the cdylib at `path` `dlopen`ed by the
+/// loader's `load_dropped` against the Statement rendering its own door states (what
+/// `busbar-plugin-pack` signs into the manifest), bound to a real dispatcher, then `open`ed on
+/// `cfg` through the store v3 table (`LoadedStore`). Every call on the handle crosses that table.
 fn door_store(path: &std::path::Path, cfg: &str) -> Result<LoadedStore, String> {
     static N: AtomicU64 = AtomicU64::new(0);
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
@@ -222,6 +238,16 @@ fn close(store: LoadedStore) {
 }
 
 /// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
+///
+/// busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and exit 1 when
+/// one cannot resolve, rather than only checking the reference's SHAPE. A fixture config that names
+/// a real-looking env var (here, `MOCK_KEY`) then fails `--validate` on any machine that doesn't
+/// happen to have that var set -- which is every CI runner and most dev machines. Hardcoding
+/// `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future one, names
+/// a different variable. Extracting the names generically (same approach `GetBusbar/busbar-store-mysql`'s
+/// own `store-mysql-plugin/tests/e2e.rs` already took for this exact change, and the core repo's
+/// `crates/busbar/tests/docs_examples.rs`) keeps the harness working no matter what the fixture
+/// references.
 fn referenced_env_vars(text: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for (i, _) in text.match_indices("env:") {
@@ -239,9 +265,13 @@ fn referenced_env_vars(text: &str) -> Vec<String> {
 }
 
 /// A placeholder value for a fixture-referenced secret: 64 hex chars, which is valid for
+/// `auth.signing_key` and harmless as any other secret's value.
 const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` if set, else the sibling
+/// `../../busbar` (relative to this crate). It must be a checkout of the rev `.busbar-ref` pins — CI
+/// checks exactly that rev out beside this repo. Missing is a FAILURE, never a skip: these tests are
+/// the only proof the plugin installs through a real busbar's boot and admin paths.
 fn busbar_root() -> PathBuf {
     let root = std::env::var_os("BUSBAR_CHECKOUT")
         .map(PathBuf::from)
@@ -256,6 +286,8 @@ fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
+/// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
+/// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
@@ -308,13 +340,26 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     )
 }
 
+/// The schema version this build stamps, read off a file it just created (the store keeps it
+/// private), so the boot witness below cannot go stale when the schema moves.
+fn this_builds_schema() -> i64 {
+    static VERSION: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let dir = ScratchDir::create("schema-version");
+        let path = dir.join("fresh.db");
+        drop(SqliteStore::open(path.to_str().unwrap(), 5000).expect("open a fresh store"));
+        rusqlite::Connection::open(&path)
+            .and_then(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get(0)))
+            .expect("read the fresh store's schema version")
+    })
+}
+
 /// Observe the child's committed migration without opening the provider or creating a file.
 fn migrated_schema(path: &std::path::Path) -> rusqlite::Result<bool> {
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    const EXPECTED_MIGRATED_SCHEMA: i64 = 7;
-    if version != EXPECTED_MIGRATED_SCHEMA {
+    if version != this_builds_schema() {
         return Ok(false);
     }
     let revision: i64 = conn.query_row(
@@ -338,6 +383,11 @@ fn migrated_schema(path: &std::path::Path) -> rusqlite::Result<bool> {
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the
+/// real validation and boot against a config naming `store: { module: sqlite }`, and confirm the
+/// real on-disk sqlite file was actually initialized — via the documented file-drop mechanism,
+/// never a direct `load_store()` call. Persistence is then proven through the real file across a
+/// full close + reopen: usage written through the dropped-in plugin door is read back by an
+/// independent connection that never touches the plugin/ABI/loader.
 #[test]
 fn load_and_exercise_sqlite_plugin_via_file_drop() {
     let so_path = plugin_path();
@@ -488,9 +538,11 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         }],
     };
     {
-        let writer = SqliteStore::open(db_path.to_str().unwrap(), 5000)
-            .expect("reopen the real file to write usage");
+        let cfg = serde_json::json!({ "db_path": db_path.to_str().unwrap() }).to_string();
+        let writer = door_store(&so_path, &cfg)
+            .expect("open the real file through the dropped-in plugin door to write usage");
         writer.put_usage("vk_filedrop", 200, &ledger).unwrap();
+        close(writer);
     }
     let reopened = SqliteStore::open(db_path.to_str().unwrap(), 5000)
         .expect("reopen the real file after the writer closed");
@@ -508,11 +560,15 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
 }
 
 /// Reserve an ephemeral loopback address until its child configuration is ready. A boot's data
+/// and admin listeners are reserved together so their ports differ. Releasing them before spawn
+/// still permits another process to bind the addresses; readiness observes the real child.
 fn reserve_port() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral loopback port")
 }
 
 /// Pack the built sqlite plugin cdylib into a real signed-shape tarball (same `busbar-plugin-pack`
+/// tool CI's SIGNOFF step uses, `--allow-unsigned` locally exactly like CI's own unsigned-key
+/// fallback), returning the raw tarball bytes.
 fn pack_sqlite_tarball(
     pack_bin: &std::path::Path,
     so_path: &std::path::Path,
@@ -548,6 +604,7 @@ fn pack_sqlite_tarball(
 }
 
 /// Poll `GET /api/v1/admin/info` (with the admin token) until it answers 200, or the deadline
+/// passes / the child exits first. Real over-the-wire readiness, not a fixed sleep.
 fn wait_for_admin_ready(
     client: &reqwest::blocking::Client,
     admin_addr: &str,
@@ -577,6 +634,19 @@ fn wait_for_admin_ready(
 }
 
 /// The full install-path proof: the sqlite plugin installed the way a real operator
+/// actually installs it — a `POST /api/v1/admin/plugins` call against a REAL running busbar admin
+/// listener, never file-drop, never a direct `load_store()`/loader call — then EXERCISED through
+/// that same live instance's own admin API (mint a virtual key + an attached AWS SigV4 credential
+/// via `POST /api/v1/admin/keys`), with the write independently verified by opening the real sqlite
+/// file on disk with a SECOND, completely independent connection that never touches the
+/// plugin/ABI/admin-API/loader at all.
+///
+/// Two-boot shape, because `store:` is documented as restart-to-apply (busbar never hot-swaps the
+/// durable governance store on a config reload — see `admin/v1/json/handlers.rs::restart`'s own doc
+/// comment): boot 1 runs with an in-memory store just to reach a live admin listener to install
+/// against; boot 2 (a fresh process over the SAME plugins dir, so it dlopens the EXACT tarball boot
+/// 1's admin API wrote to disk, not a copy this test placed by hand) runs with `store: { module:
+/// sqlite }` and is the one whose admin API mints the key/credential that lands in the real file.
 #[test]
 fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
     let so_path = plugin_path();
@@ -799,6 +869,8 @@ fn install_sqlite_plugin_via_admin_api_and_verify_persistence() {
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct door
+/// load): an `open()` config that cannot produce a usable store surfaces back across
+/// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -821,8 +893,8 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
     let err = door_store(&path, &cfg)
         .expect_err("a db_path under a nonexistent directory must fail to load");
     assert!(
-        !err.is_empty(),
-        "expected a descriptive sqlite open failure, got an empty string"
+        err.contains("unable to open database file"),
+        "expected SQLite's own open failure across the ABI, got: {err}"
     );
     assert!(
         !bogus_dir.exists(),
@@ -831,6 +903,7 @@ fn load_and_exercise_sqlite_plugin_bad_config_fails_over_abi() {
 }
 
 /// Encode a stand-in plane row as the opaque `PlaneRecord::body` the planes send (`serde_json`).
+/// The store never decodes it; these tests do, to prove it came back verbatim.
 fn body(v: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap()
 }
@@ -840,6 +913,22 @@ fn decode(b: &[u8]) -> serde_json::Value {
 }
 
 /// THE DURABILITY PROOF FOR THE PLANE-RECORD VERBS, OVER THE REAL PLUGIN PATH.
+///
+/// busbar 1.6.0 carries every durable plane record — an A2A task and its provenance chain, the MCP
+/// per-call log — through eight kind-tagged verbs (`upsert_plane_record`, `append_plane_record`,
+/// `list_plane_records`, `list_plane_record_parents`, `purge_plane_records_before`, …), all of which
+/// `busbar_contract::records::RecordStore` DEFAULTS to accept-and-keep-nothing. A plugin seam that does not RELAY them
+/// silently substitutes those defaults: every write returns `Ok`, every read answers empty, and a
+/// deployment running this backend as a plugin — which is the ONLY way it ever runs — loses every
+/// in-flight task and every tool-call record while reporting success. Tests of `SqliteStore` called
+/// directly, in-process, cannot see that.
+///
+/// So this test goes through the dropped-in door (`door_store`): a REAL `dlopen` of the cdylib, the
+/// store v3 table, the host's real `LoadedStore`. It writes AT ARITY > 1 (three tasks across two states, three
+/// events on one task and one on another, three call records for one principal and one for a
+/// second), DROPS the handle — which unloads the library — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A single-row round trip would not distinguish a relayed verb from a
+/// lucky default; a multi-row one over a restart cannot be faked by either.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();

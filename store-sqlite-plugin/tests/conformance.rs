@@ -2,6 +2,25 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE SQLITE STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
+//! store kind's memory ABI (THE DESIGN §11, store v3), run against the busbar rev this repo pins
+//! (`.busbar-ref`).
+//!
+//! The store is held two ways at once: LINKED (the logic crate's `door::door`, through the loader's
+//! `load_linked`, the row a busbar build that compiles it in registers) and DROPPED IN (this crate's
+//! built cdylib, `dlopen`ed by the loader's `load_dropped` against the Statement rendering the door
+//! states, which is what `busbar-plugin-pack` signs into the manifest). Each is bound to a real
+//! dispatcher and opened as the host opens a store (`LoadedStore`), and driven through ONE scenario
+//! against its own real database file: the config refusals, a key, a usage window, plane records of
+//! an upsert and an append-only kind, the v3 slots (a count batch and its replay and conflict, and
+//! schema records), a SECOND live handle on the same file (the
+//! cross-handle view), and a RESTART — every handle closed, the file reopened, everything read back
+//! and every `op_id` replayed. The two arms must agree on the whole transcript.
+//!
+//! The RED arms are their own tests (plugin-gates `bothways` needs a RED arm beside the both-ways
+//! test): (a) the door asked for as another kind is refused, linked and dropped in; (b) the
+//! dropped-in door opened on a file that already holds a foreign key yields a transcript that
+//! DIFFERS from the linked one — so the comparison above can see a real difference
+//! and is not vacuously equal. A missing cdylib PANICS: this test IS the dropped-in door's proof.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,6 +110,7 @@ fn load<K: busbar_plugin_loader::dispatch::Kind>(
 }
 
 /// The node's one `op_id` allocator, as the kernel hands a store handle its own: the bridge's
+/// additive writes mint from it. Its node half is one no test op id uses.
 fn mint() -> busbar_contract::abi::store::OpId {
     static N: AtomicU64 = AtomicU64::new(0);
     busbar_contract::abi::store::OpId::from_parts(0x5e1f, N.fetch_add(1, Ordering::Relaxed) + 1)
@@ -333,6 +353,7 @@ fn transcript(by: Door, tag: &str, seed: Option<&str>) -> serde_json::Value {
 }
 
 /// The sqlite store behaves as ONE store through either door (the RED arms below show the
+/// comparison can tell a different store apart).
 #[test]
 fn the_linked_and_the_dropped_in_sqlite_store_are_one_store() {
     assert_eq!(
@@ -416,6 +437,11 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
 }
 
 /// The store's Statement declares exactly its secret fields (`secret_refs`), never `*`: busbar
+/// resolves a secret reference only at a position the Statement declares secret and refuses one
+/// anywhere else (busbar #1699, ORACLE-SIGNOFF G14: each plugin declares its secret fields). The one
+/// secret-valued key a 1.5.5 sqlite config carried is `license_key` (busbar oracle BOOT-170: its
+/// unresolved reference refuses the boot with the 1.5.5 text); `db_path` and `busy_timeout_ms` are
+/// not secrets. The dropped-in library states the same Statement (the test above).
 #[test]
 fn the_statement_declares_exactly_its_secret_fields() {
     let stated = busbar_contract::abi::mechanism::rendering::read(
@@ -697,7 +723,10 @@ fn a_store_refuses_a_schema_newer_than_its_build() {
         stamp_newer_schema("", cfg.as_bytes());
         match open(by, &cfg) {
             Ok(_) => panic!("a newer schema must be refused"),
-            Err(e) => assert!(!e.is_empty(), "the refusal states why"),
+            Err(e) => assert!(
+                e.contains("newer than this build"),
+                "the refusal states why, across the door: {e}"
+            ),
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

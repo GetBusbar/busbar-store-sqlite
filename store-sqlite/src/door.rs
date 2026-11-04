@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The door: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`), and [`open`], the
+//! settings parser its `open` slot runs. A build that links this crate registers `door`; the
+//! `busbar-store-sqlite-plugin` cdylib exports the same one as `busbar_plugin_door`. The store
+//! answers every call Ready: it is local-disk-bound and runs on the host's bounded disk lane.
 
 use crate::SqliteStore;
 
@@ -9,6 +12,10 @@ use crate::SqliteStore;
 pub const NAME: &str = "busbar-store-sqlite";
 
 /// The settings paths this store declares may hold a secret reference (`secret_refs`): `license_key`,
+/// the one secret-valued key a 1.5.5 sqlite config carried (busbar oracle BOOT-170). `db_path` and
+/// `busy_timeout_ms` are not secrets. busbar resolves a reference only where the Statement declares
+/// one and refuses it anywhere else (G14: each plugin declares its secret fields), so the store names
+/// its field rather than `*`.
 const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
     &[busbar_contract::abi::sdk::door::abi_str("license_key")];
 
@@ -20,6 +27,7 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
 ]);
 
 /// The most ops the host may have in flight against this store at once. Every slot answers Ready
+/// on the host's bounded disk lane, so this only caps the queue it feeds.
 pub const MAX_INFLIGHT: u32 = 64;
 
 busbar_contract::store_door!(
@@ -59,8 +67,14 @@ pub struct Settings {
     pub busy_timeout_ms: i64,
 }
 
+/// Every top-level setting the parser accepts; any other key is refused, naming these.
+const ACCEPTED: [&str; 3] = ["db_path", "busy_timeout_ms", "license_key"];
+
 impl Settings {
     /// Parse the section's JSON exactly as [`open`] reads it.
+    ///
+    /// # Errors
+    /// The refusal text [`open`] carries for the same settings.
     pub fn parse(cfg: &str) -> Result<Self, String> {
         const BAD: &str = "invalid sqlite plugin config";
         let v: serde_json::Value = if cfg.trim().is_empty() {
@@ -83,10 +97,11 @@ impl Settings {
             .as_object()
             .into_iter()
             .flat_map(|o| o.keys())
-            .find(|k| !matches!(k.as_str(), "db_path" | "busy_timeout_ms" | "license_key"))
+            .find(|k| !ACCEPTED.contains(&k.as_str()))
         {
             return Err(format!(
-                "{BAD}: unknown setting `{unknown}` (accepted: db_path, busy_timeout_ms, license_key)"
+                "{BAD}: unknown setting `{unknown}` (accepted: {})",
+                ACCEPTED.join(", ")
             ));
         }
         let path = match v.get("db_path") {
@@ -124,6 +139,12 @@ impl Settings {
                     ));
                 }
                 ms
+            }
+            Some(serde_json::Value::Number(_)) => {
+                return Err(format!(
+                    "{BAD}: `busy_timeout_ms` must be a whole number of milliseconds, got a \
+                     fractional or exponent number"
+                ))
             }
             Some(other) => {
                 return Err(format!(

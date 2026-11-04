@@ -190,16 +190,16 @@ pub(super) fn behavior(by: Door, tag: &str) -> std::collections::BTreeMap<&'stat
         format!("has_ready={} {ready:?}", st.plugin().has_ready()),
     );
     answers.insert("open", format!("Ready {:?}", st.facts()));
-    assert!(matches!(
+    let refused = matches!(
         super::load::<busbar_plugin_loader::dispatch::kinds::hook::Hook>(by, &d),
         Err(busbar_plugin_loader::dispatch::LoadError::ManifestKind {
             stated: busbar_contract::abi::mechanism::KindCode::Store,
             want: busbar_contract::abi::mechanism::KindCode::Hook
         })
-    ));
+    );
     {
         let before = count();
-        let value = "refused=true".into();
+        let value = format!("refused={refused}");
         assert_eq!(
             count() - before,
             0,
@@ -1011,6 +1011,23 @@ pub(super) fn behavior(by: Door, tag: &str) -> std::collections::BTreeMap<&'stat
     }
     assert!(at("open").starts_with("Ready "), "open: {}", at("open"));
     assert_eq!(at("refused as another kind"), "refused=true");
+    assert!(
+        tail("usage untouched").contains("UsageLedger { requests: 0,"),
+        "{}",
+        at("usage untouched")
+    );
+    assert!(
+        tail("usage j").contains("UsageLedger { requests: 9,"),
+        "{}",
+        at("usage j")
+    );
+    assert_eq!(at("deny"), r#"= ["x"]"#, "the one denied subject lists");
+    assert_eq!(
+        at("parents ev"),
+        r#"= ["t1"]"#,
+        "the one parent holding ev records"
+    );
+    assert_eq!(at("token live"), "= false", "no record: not live");
     for label in [
         "put grouped",
         "put plain",

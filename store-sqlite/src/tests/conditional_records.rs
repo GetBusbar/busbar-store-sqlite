@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The conditional-record backend's ordinary behavior. These feature tests require the negotiated
+//! SDK interface; an older SDK's missing API is not a behavioral RED for this implementation.
 
 use super::*;
 use busbar_contract::abi::sdk::store::conditional::{
@@ -216,6 +217,7 @@ fn an_empty_blob_is_present_and_differs_from_an_absent_record() {
 }
 
 /// Pause SQLite while it prepares the second, DELETE mutation, after the first INSERT executed.
+/// A separate live store observes the old pair and no receipt, then the new pair and its receipt.
 #[test]
 fn independent_readers_never_observe_a_partial_record_batch_or_receipt() {
     let (writer, path, _dir) = on_file("atomic-visibility");

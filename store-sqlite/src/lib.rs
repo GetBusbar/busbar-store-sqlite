@@ -2,6 +2,14 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The built-in SQLite backend for busbar's durable governance store. Implements
+//! `busbar_contract::records::RecordStore` over embedded rusqlite connections: one mutex-guarded
+//! writer, plus a small pool of `query_only` readers so a long read (a billing report, a hydrate)
+//! and the hot-path usage flush never wait on each other (WAL readers are unaffected by an
+//! in-flight writer). Retention sweeps are writes: they take the writer like every other write.
+//!
+//! [`door::door`] answers the store v3 table over [`SqliteStore`] through the contract's store SDK:
+//! the base op set is the [`RecordStore`] implementation below, the v3 additions are in `v3`. A
+//! build that links this crate registers `door`; the `busbar-store-sqlite-plugin` cdylib exports it.
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// rusqlite error -> `RecordStoreError` (the contract crate stays storage-free, so the `From` impl
+/// behind `?` cannot live there): write `<rusqlite call>.store()?`.
 trait IntoStoreResult<T> {
     fn store(self) -> RecordStoreResult<T>;
 }
@@ -30,7 +39,30 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 /// Reserved kernel ticket records carry their absolute expiry in ts (governance::tickets).
 const TICKET_RECORD_KIND: &str = "ticket";
 
+/// The A2A task record kind: its age-only retention drops only TERMINAL rows, and it owns a chain.
+const TASK_RECORD_KIND: &str = "task";
+
+/// A task's provenance chain, filed at the task's id: purged and deleted with its task.
+const TASK_EVENT_RECORD_KIND: &str = "task_event";
+
 /// Store schema version, kept in `PRAGMA user_version`. A file older than v6 is refused: no
+/// release ever wrote one. A v6 file (the v1.0.x releases) upgrades in place to v7 in ONE
+/// transaction, through the steps below. Their `_v10`/`_v15`/`_v16`/`_v17` names are the
+/// development steps they were written as, consolidated into v7; no file is ever stamped with them.
+/// - `keys` gains `scope_grants`, `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`;
+///   `usage_metering` gains `priced_from_ms` in its key (existing rows copied at 0); open usage
+///   units get their own tables; kind-tagged `plane_records` / `plane_tokens`; the store v3 state
+///   (`store_ops`, `schema_records`), `plane_tokens` indexed by expiry. The v6 `mcp_calls` table is
+///   left unread: its body is a digest stream no backend can rebuild.
+/// - `credentials` is rebuilt so a revoked row may hold no secret (revoke destroys it); a row
+///   revoked under an older build loses the secret it kept. Credential expiry compares the unsigned
+///   timestamps preserved by the INTEGER bit codec: a legacy row whose expiry precedes creation in
+///   that order refuses the entire migration.
+/// - The same unsigned expiry order applies to keys, preserving their full-width codec. An
+///   incompatible legacy key refuses the entire migration.
+/// - Metering cells and their units are keyed by the recorded group and price version.
+///
+/// A file stamped by a later build is refused.
 const SCHEMA_VERSION: i64 = 7;
 
 macro_rules! unsigned_expiry_order {
@@ -266,6 +298,8 @@ CREATE TABLE IF NOT EXISTS plane_tokens (
     expires_at INTEGER NOT NULL,
     PRIMARY KEY (kind, token)
 ) STRICT, WITHOUT ROWID;
+-- Every redemption sweeps the lapsed receipts first; without this the sweep scans the ledger.
+CREATE INDEX IF NOT EXISTS plane_tokens_expires_idx ON plane_tokens (expires_at);
 
 -- The durable `op_id` dedupe log: an applied op's body (`Dedupe::body_hex`; an older build's
 -- `{:?}` form still replays) in the same transaction as its effect. `answer` is a constant.
@@ -304,27 +338,93 @@ CREATE TRIGGER IF NOT EXISTS plane_records_chain_no_update BEFORE UPDATE ON plan
   BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END;
 ");
 
-/// Caller holds its transaction or snapshot; a failed clock cannot authorize expiry or cleanup.
-fn shared_clock(tx: &Connection) -> RecordStoreResult<i64> {
-    let read_clock = || -> RecordStoreResult<i64> {
-        tx.query_row("SELECT unixepoch()", [], |r| r.get(0)).store()
+/// How a store reads the shared clock on a connection holding its transaction or snapshot.
+type Clock = fn(&Connection) -> RecordStoreResult<i64>;
+
+/// SQLite's own Unix clock, the one every connection to the file shares.
+fn sqlite_unixepoch(conn: &Connection) -> RecordStoreResult<i64> {
+    conn.prepare_cached("SELECT unixepoch()")
+        .store()?
+        .query_row([], |r| r.get(0))
+        .store()
+}
+
+/// The filesystem path a file-backed `db_path` names: the path itself, or the percent-decoded path
+/// of a `file:` URI (whose authority, as SQLite requires, is empty or `localhost`). `None` for a URI
+/// SQLite itself refuses or that names no file; SQLite then reports it on open.
+fn file_path_of(path: &str) -> Option<String> {
+    let Some(uri) = path.strip_prefix("file:") else {
+        return Some(path.to_string());
     };
-    #[cfg(test)]
-    let now = match tests::shared_clock_override() {
-        Some(now) => now,
-        None => read_clock()?,
+    let uri = uri.split('#').next().unwrap_or_default();
+    let file = uri.split_once('?').map_or(uri, |(file, _)| file);
+    let file = match file.strip_prefix("//") {
+        Some(rest) => {
+            let (authority, rest) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            if !(authority.is_empty() || authority.eq_ignore_ascii_case("localhost")) {
+                return None;
+            }
+            rest
+        }
+        None => file,
     };
-    #[cfg(not(test))]
-    let now = read_clock()?;
-    if now < 0 {
-        return Err(RecordStoreError(
-            "sqlite: shared clock precedes Unix epoch".into(),
-        ));
+    let hex = |b: Option<&u8>| b.and_then(|&b| char::from(b).to_digit(16));
+    let bytes = file.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            (byte, _, _) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
     }
-    Ok(now)
+    String::from_utf8(decoded).ok().filter(|p| !p.is_empty())
+}
+
+/// Refuse a file-backed `file:` URI parameter that breaks the one-writer + reader-pool design:
+/// `cache=shared` puts every connection in one table-locked cache (readers fail `SQLITE_LOCKED`
+/// under the writer, which no busy timeout covers), `nolock` (and `vfs=unix-none`, the same thing as
+/// a VFS) drops the file locks that keep two processes from interleaving writes, and `immutable`
+/// lets a reader miss committed writes.
+fn refuse_unsafe_uri(path: &str) -> RecordStoreResult<()> {
+    let Some(uri) = path.strip_prefix("file:") else {
+        return Ok(());
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let Some((_, query)) = uri.split_once('?') else {
+        return Ok(());
+    };
+    for param in query.split('&') {
+        let (key, value) = param.split_once('=').unwrap_or((param, ""));
+        let unsafe_param = match key {
+            "cache" => value.eq_ignore_ascii_case("shared"),
+            "vfs" => value == "unix-none",
+            "nolock" | "immutable" => !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "no" | "false" | "off"
+            ),
+            _ => false,
+        };
+        if unsafe_param {
+            return Err(RecordStoreError(format!(
+                "sqlite: db_path URI parameter `{param}` is not supported: it breaks the store's \
+                 single-writer locking; use a plain file path"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
+/// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
+/// contains those characters elsewhere is a real file. Pragma selection and `SqliteStore::open`'s
+/// single-connection routing both use this one check.
 fn is_memory_path(path: &str) -> bool {
     if path == ":memory:" {
         return true;
@@ -338,6 +438,9 @@ fn is_memory_path(path: &str) -> bool {
 }
 
 /// Apply the fixed pragma set, `busy_timeout` FIRST (switching a file into WAL itself briefly
+/// acquires the database, so the timeout must already be set). `is_writer` gates the writer-only
+/// pragmas and `query_only` (readers only; `SQLITE_OPEN_READ_ONLY` cannot create the `-wal`/`-shm`
+/// files on a fresh database).
 fn apply_pragmas(
     conn: &Connection,
     path: &str,
@@ -375,7 +478,10 @@ fn apply_pragmas(
     conn.pragma_update(None, "cache_size", if is_writer { -65536 } else { -16384 })
         .store()?;
 
-    let mmap = if path.contains("//") && !path.starts_with(':') {
+    // No mmap on a path that looks like a network filesystem (best effort, not an fs-type probe);
+    // a `file:` URI is judged by the file it names, so `file:///var/x.db` keeps mmap.
+    let file = file_path_of(path).unwrap_or_else(|| path.to_string());
+    let mmap = if file.contains("//") && !file.starts_with(':') {
         0
     } else {
         268_435_456
@@ -432,38 +538,82 @@ fn exec(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> RecordSt
 }
 
 /// Embedded SQLite `Store` backend. One mutex-guarded writer connection (all mutations, `BEGIN
+/// IMMEDIATE`, never `DEFERRED`: every write here is read-then-write and `DEFERRED`'s upgrade can
+/// return `SQLITE_BUSY_SNAPSHOT`, which bypasses the busy handler) plus a small round-robin pool of
+/// `query_only` reader connections.
 pub struct SqliteStore {
     writer: Mutex<Connection>,
     /// The writer's current `synchronous` mode (FULL = true), so the PRAGMA is issued only on a
+    /// change. Read and written only under the `writer` lock.
     writer_full: AtomicBool,
     /// Ops recorded since open, pacing the `store_ops` retention sweep.
     ops_recorded: AtomicU64,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     path: String,
+    /// The shared clock single-use tokens and ticket deadlines are judged by.
+    clock: Clock,
 }
 
 /// Create a missing database file 0600 (it holds recoverable secrets) so SQLite, which gives the
+/// `-wal`/`-shm` files the main file's mode, never creates it with the umask. A `file:` URI is
+/// created at the file it names, unless its `mode` (`ro`, `rw`) tells SQLite never to create one:
+/// a missing file then stays an open error rather than becoming a fresh, empty store. An existing
+/// file is left alone, and so is any failure to create (SQLite reports it on open).
 #[cfg(unix)]
 fn create_private(path: &str) {
     use std::os::unix::fs::OpenOptionsExt;
-    if !path.starts_with("file:") {
+    let mode = path
+        .strip_prefix("file:")
+        .and_then(|uri| uri.split('#').next())
+        .and_then(|uri| uri.split_once('?'))
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .rev()
+                .find_map(|param| param.strip_prefix("mode="))
+        });
+    if mode.is_some_and(|mode| mode != "rwc") {
+        return;
+    }
+    if let Some(file) = file_path_of(path) {
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(path);
+            .open(file);
     }
 }
 
 #[cfg(not(unix))]
 fn create_private(_: &str) {}
 
+/// Best effort: checkpoint the whole WAL into the main file and truncate it, so the frames that
+/// still hold bytes a commit just destroyed (a revoked secret, a replaced envelope, a dropped
+/// table) do not outlive them in the `-wal` file. It never blocks and never fails the write it
+/// follows: the busy timeout is lifted for the checkpoint, so a reader holding a snapshot leaves it
+/// partial (a later scrub, or SQLite's own checkpoints, finish it). The store's busy handling is
+/// only ever `busy_timeout`, restored exactly; a custom busy handler (only tests install one) is
+/// cleared by the lift. An in-memory store has no WAL.
+fn scrub_wal(conn: &Connection, path: &str) {
+    if is_memory_path(path) {
+        return;
+    }
+    let Ok(timeout) = conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0)) else {
+        return;
+    };
+    if conn.pragma_update(None, "busy_timeout", 0).is_ok() {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
+    let _ = conn.pragma_update(None, "busy_timeout", timeout);
+}
+
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: i64) -> RecordStoreResult<Self> {
         if is_memory_path(path) {
             return Self::open_in_memory();
         }
+        refuse_unsafe_uri(path)?;
         Self::open_with_readers(
             path,
             busy_timeout_ms,
@@ -495,12 +645,14 @@ impl SqliteStore {
             readers,
             next_reader: AtomicUsize::new(0),
             path: path.to_string(),
+            clock: sqlite_unixepoch,
         };
         store.migrate()?;
         Ok(store)
     }
 
     /// In-memory store with one connection for both roles (a separate reader pool would see a
+    /// different empty database).
     pub fn open_in_memory() -> RecordStoreResult<Self> {
         let conn = Connection::open_in_memory().store()?;
         apply_pragmas(&conn, ":memory:", 5000, true)?;
@@ -511,6 +663,7 @@ impl SqliteStore {
             readers: Vec::new(),
             next_reader: AtomicUsize::new(0),
             path: ":memory:".to_string(),
+            clock: sqlite_unixepoch,
         };
         store.migrate()?;
         Ok(store)
@@ -518,6 +671,18 @@ impl SqliteStore {
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.writer.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The shared clock, read on `conn` (which holds the caller's transaction or snapshot); a
+    /// failed or pre-epoch clock is an error, so it can never authorize expiry or cleanup.
+    fn shared_clock(&self, conn: &Connection) -> RecordStoreResult<i64> {
+        let now = (self.clock)(conn)?;
+        if now < 0 {
+            return Err(RecordStoreError(
+                "sqlite: shared clock precedes Unix epoch".into(),
+            ));
+        }
+        Ok(now)
     }
 
     /// The filesystem path (or `:memory:`) this store was opened against.
@@ -544,7 +709,20 @@ impl SqliteStore {
             .unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Like [`Self::write`] for a write that destroys secret material (revoke, rewrap, key
+    /// delete): once it commits, the WAL frames that still hold the old bytes are scrubbed.
+    fn write_destroying_secrets<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> RecordStoreResult<T>,
+    ) -> RecordStoreResult<T> {
+        let out = self.write(true, f)?;
+        scrub_wal(&self.lock_writer(), &self.path);
+        Ok(out)
+    }
+
     /// Run `f` in one `BEGIN IMMEDIATE` transaction on the writer, committing when it returns `Ok`.
+    /// `full` escalates to `synchronous=FULL` for the transaction (mint, revoke, rotate, delete,
+    /// the metering flush, audit, every plane write: a power cut must not hand back the old state).
     fn write<T>(
         &self,
         full: bool,
@@ -578,8 +756,13 @@ impl SqliteStore {
                     "sqlite: foreign_keys could not be disabled for the schema migration".into(),
                 ));
             }
+            // An upgrade drops the tables it rebuilds, and `secure_delete=FAST` zeroes only freed
+            // space inside live pages: a dropped table's pages (the secret a revoked legacy row
+            // kept among them) would go to the freelist intact. ON zeroes them; FAST is restored.
+            conn.pragma_update(None, "secure_delete", "ON").store()?;
             Self::migrate_transaction(&mut conn)
         })();
+        let fast = conn.pragma_update(None, "secure_delete", "FAST").store();
 
         let restored = conn
             .pragma_update(None, "foreign_keys", "ON")
@@ -597,11 +780,17 @@ impl SqliteStore {
                     ))
                 }
             });
-        result?;
-        restored
+        let upgraded = result?;
+        restored?;
+        fast?;
+        if upgraded {
+            scrub_wal(&conn, &self.path);
+        }
+        Ok(())
     }
 
-    fn migrate_transaction(conn: &mut Connection) -> RecordStoreResult<()> {
+    /// The migration in one `BEGIN IMMEDIATE` transaction; whether it upgraded an older file.
+    fn migrate_transaction(conn: &mut Connection) -> RecordStoreResult<bool> {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .store()?;
@@ -657,10 +846,11 @@ impl SqliteStore {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
         tx.commit().store()?;
-        Ok(())
+        Ok(version != 0 && version < SCHEMA_VERSION)
     }
 
     /// Bump the store-global revision counter, inside the same `BEGIN IMMEDIATE` transaction as the
+    /// mutation it stamps (`RETURNING` hands the value back in one round trip).
     fn bump_revision(tx: &rusqlite::Transaction) -> RecordStoreResult<i64> {
         query_one(
             tx,
@@ -692,6 +882,7 @@ macro_rules! sat_add {
 }
 
 /// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
+/// Every other unit name is an OPEN unit and lives in `usage_window_units`.
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
 
 /// The OPEN (non-reserved) entries of a name-keyed usage map.
@@ -728,7 +919,12 @@ fn column_exists(tx: &rusqlite::Connection, table: &str, column: &str) -> Record
     .store()
 }
 
-/// Rebuild a pre-v10 `usage_metering` with `priced_from_ms` in its primary key, the one change SQLite
+/// Rebuild a v6 `usage_metering` with `priced_from_ms` in its primary key, the one change SQLite
+/// cannot make in place. Every row is copied at `priced_from_ms = 0`, the opening card's instant.
+/// The column list must stay identical to [`SCHEMA`]'s; [`rebuild_metering_for_v17`] then adds the
+/// recorded group and price version to the key. The trigger naming `usage_metering` is dropped
+/// first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates it right
+/// after.
 fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS keys_guard_hard_delete;
@@ -760,7 +956,10 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
     .store()
 }
 
-/// Rebuild a pre-v15 `credentials` with unsigned expiry order, copying every row; a row revoked
+/// Rebuild a v6 `credentials` with unsigned expiry order, copying every row; a row revoked under
+/// an older build keeps its metadata and loses the secret it held. The trigger naming `credentials`
+/// is dropped first because `ALTER TABLE ... RENAME` re-parses every trigger; `SCHEMA` recreates
+/// it and the indexes right after.
 fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     let invalid: Option<(String, i64, i64)> = query_one(
         tx,
@@ -775,7 +974,7 @@ fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<(
     if let Some((id, created, expires)) = invalid {
         return Err(RecordStoreError(format!(
             "sqlite: credential '{id}' expires_at={} is not after created_at={} in unsigned \
-             timestamp order; refusing schema v15 migration",
+             timestamp order; refusing the schema v{SCHEMA_VERSION} migration",
             expires as u64, created as u64
         )));
     }
@@ -796,6 +995,7 @@ fn rebuild_credentials_for_v15(tx: &rusqlite::Connection) -> RecordStoreResult<(
 }
 
 /// Replace the parent without renaming the old table: credential FK references stay `keys`.
+/// The caller disabled FK actions before BEGIN and checks all FK links before COMMIT.
 fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     let invalid: Option<(String, i64, i64)> = query_one(
         tx,
@@ -810,7 +1010,7 @@ fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     if let Some((id, created, expires)) = invalid {
         return Err(RecordStoreError(format!(
             "sqlite: key '{id}' expires_at={} is not after created_at={} in unsigned \
-             timestamp order; refusing schema v16 migration",
+             timestamp order; refusing the schema v{SCHEMA_VERSION} migration",
             expires as u64, created as u64
         )));
     }
@@ -841,7 +1041,8 @@ fn rebuild_keys_for_v16(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     Ok(())
 }
 
-/// The v10 `keys` columns: nullable `ADD COLUMN`s, so a pre-v10 row reads back exactly as before
+/// The v7 `keys` columns: nullable `ADD COLUMN`s, so a v6 row reads back exactly as before
+/// (no non-pool scope grant, `None` for the attribution fields).
 fn add_v10_key_columns(tx: &rusqlite::Connection) -> RecordStoreResult<()> {
     add_v10_key_columns_to(tx, "keys")
 }
@@ -999,16 +1200,26 @@ fn put_key_inner(
             key.id
         )));
     }
+    if key.deleted_at.is_some() {
+        // A tombstone says every credential row for the key is destroyed, whichever verb wrote it.
+        exec(
+            conn,
+            "DELETE FROM credentials WHERE key_id=?1",
+            params![key.id],
+        )?;
+    }
     Ok(())
 }
 
 const CRED_SECRET_COLS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision,secret";
 
+/// The refusal of an ordinary write to a reserved adjustment bucket, whichever verb it came through.
+const RESERVED_USAGE_REFUSAL: &str =
+    "sqlite: reserved adjustment rows require atomic usage correction";
+
 fn refuse_reserved_usage(bucket: &str) -> RecordStoreResult<()> {
     if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket) {
-        return Err(RecordStoreError(
-            "sqlite: reserved adjustment rows require atomic usage correction".into(),
-        ));
+        return Err(RecordStoreError(RESERVED_USAGE_REFUSAL.into()));
     }
     Ok(())
 }
@@ -1025,8 +1236,12 @@ fn usage_in(
         params![window_start as i64, bucket_id],
         |row| row.get::<_, Vec<u8>>(0),
     )? {
-        let mut ledger =
-            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
+        let mut ledger = serde_json::from_slice(&bytes).map_err(|error| {
+            RecordStoreError(format!(
+                "sqlite: exact usage ledger of bucket '{bucket_id}' window {window_start} is \
+                 unreadable: {error}"
+            ))
+        })?;
         omit_zero_open_units(&mut ledger);
         return Ok(ledger);
     }
@@ -1126,12 +1341,12 @@ fn put_usage_in(
     window_start: u64,
     ledger: &UsageLedger,
 ) -> RecordStoreResult<()> {
-    for table in ["usage_windows", "usage_window_units", "usage_window_exact"] {
-        tx.execute(
-            &format!("DELETE FROM {table} WHERE window_start=?1 AND bucket_id=?2"),
-            params![window_start as i64, bucket_id],
-        )
-        .store()?;
+    for sql in [
+        "DELETE FROM usage_windows WHERE window_start=?1 AND bucket_id=?2",
+        "DELETE FROM usage_window_units WHERE window_start=?1 AND bucket_id=?2",
+        "DELETE FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
+    ] {
+        exec(tx, sql, params![window_start as i64, bucket_id])?;
     }
 
     insert_usage_in(
@@ -1145,18 +1360,21 @@ fn put_usage_in(
         ],
     )?;
     for m in ledger.models.iter().filter(|model| !model.model.is_empty()) {
-        insert_usage_in(tx,
-                    "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
-                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                     VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
-                    params![
-                        window_start as i64, bucket_id, m.model,
-                        column::clamp(m.tier(UNIT_INPUT)),
-                        column::clamp(m.tier(UNIT_OUTPUT)),
-                        column::clamp(m.tier(UNIT_CACHE_READ)),
-                        column::clamp(m.tier(UNIT_CACHE_WRITE)),
-                    ],
-                )?;
+        insert_usage_in(
+            tx,
+            "INSERT INTO usage_windows (window_start, bucket_id, model, requests, billable_requests,
+                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+             VALUES (?1,?2,?3,0,0,?4,?5,?6,?7)",
+            params![
+                window_start as i64,
+                bucket_id,
+                m.model,
+                column::clamp(m.tier(UNIT_INPUT)),
+                column::clamp(m.tier(UNIT_OUTPUT)),
+                column::clamp(m.tier(UNIT_CACHE_READ)),
+                column::clamp(m.tier(UNIT_CACHE_WRITE)),
+            ],
+        )?;
         for (unit, count) in open_units(&m.usage_units) {
             insert_usage_in(
                 tx,
@@ -1227,33 +1445,49 @@ fn verify_usage_in(
     Ok(())
 }
 
-/// Complete day selection read under the caller's snapshot, including every C4 attribution field.
-fn same_metering_cell(left: &MeteringRow, right: &MeteringRow) -> bool {
-    left.key_id == right.key_id
-        && left.provider == right.provider
-        && left.model == right.model
-        && left.priced_from_ms == right.priced_from_ms
-        && left.key_group_at_use == right.key_group_at_use
-        && left.pricing_version == right.pricing_version
+/// A metering cell's identity, every C4 attribution field included:
+/// `(key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)`.
+type CellKey = (String, String, String, u64, String, String);
+
+fn cell_key(row: &MeteringRow) -> CellKey {
+    (
+        row.key_id.clone(),
+        row.provider.clone(),
+        row.model.clone(),
+        row.priced_from_ms,
+        row.key_group_at_use.clone(),
+        row.pricing_version.clone(),
+    )
 }
 
+/// Complete day selection read under the caller's snapshot: the column mirror, each cell replaced
+/// by its exact ledger where one exists.
 fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
     let mut rows = metering_columns_in(conn, bucket)?;
+    let index: std::collections::HashMap<CellKey, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (cell_key(row), i))
+        .collect();
     for bytes in query_all(
         conn,
         "SELECT ledger FROM usage_metering_exact WHERE bucket=?1",
         params![(bucket as i64).to_string()],
         |row| row.get::<_, Vec<u8>>(0),
     )? {
-        let exact: MeteringRow =
-            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
-        if let Some(row) = rows.iter_mut().find(|row| same_metering_cell(row, &exact)) {
-            *row = exact;
-        } else {
-            return Err(RecordStoreError(
-                "sqlite: exact metering cell has no column mirror".into(),
-            ));
-        }
+        let exact: MeteringRow = serde_json::from_slice(&bytes).map_err(|error| {
+            RecordStoreError(format!(
+                "sqlite: an exact metering cell of bucket {bucket} is unreadable: {error}"
+            ))
+        })?;
+        let Some(&i) = index.get(&cell_key(&exact)) else {
+            return Err(RecordStoreError(format!(
+                "sqlite: exact metering cell of key '{}' model '{}' in bucket {bucket} has no \
+                 column mirror",
+                exact.key_id, exact.model
+            )));
+        };
+        rows[i] = exact;
     }
     Ok(rows)
 }
@@ -1286,46 +1520,100 @@ fn metering_columns_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<
         },
     )?;
     let units = query_all(
-            conn,
-            "SELECT key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count
+        conn,
+        "SELECT key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count
              FROM usage_metering_units WHERE bucket = ?1",
-            params![(bucket as i64).to_string()],
-            |r| {
-                Ok((
+        params![(bucket as i64).to_string()],
+        |r| {
+            Ok((
+                (
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     u(r.get(3)?),
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    u(r.get(7)?),
-                ))
-            },
-        )?;
-    let mut index: std::collections::HashMap<(String, String, String, u64, String, String), usize> =
-        std::collections::HashMap::with_capacity(rows.len());
-    for (i, m) in rows.iter().enumerate() {
-        index
-            .entry((
-                m.key_id.clone(),
-                m.provider.clone(),
-                m.model.clone(),
-                m.priced_from_ms,
-                m.key_group_at_use.clone(),
-                m.pricing_version.clone(),
+                ),
+                r.get::<_, String>(6)?,
+                u(r.get(7)?),
             ))
-            .or_insert(i);
-    }
-    for (key_id, provider, model, priced_from_ms, group, version, unit, count) in units {
-        if let Some(&i) = index.get(&(key_id, provider, model, priced_from_ms, group, version)) {
-            rows[i].usage_units.insert(unit, count);
-        }
+        },
+    )?;
+    let index: std::collections::HashMap<CellKey, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (cell_key(row), i))
+        .collect();
+    for (cell, unit, count) in units {
+        let Some(&i) = index.get(&cell) else {
+            // The upgrade refuses an open unit without its parent rather than guess attribution;
+            // a read does not drop one silently either (it would under-report the cell's usage).
+            return Err(RecordStoreError(format!(
+                "sqlite: metering unit '{unit}' of key '{}' in bucket {bucket} has no attribution \
+                 parent",
+                cell.0
+            )));
+        };
+        rows[i].usage_units.insert(unit, count);
     }
     Ok(rows)
 }
 
+/// The one column-mirror cell `cell` names, its open units included, for a cell that has no exact
+/// ledger yet: a point read on the cell's primary key, never the whole bucket.
+fn metering_cell_in(
+    conn: &Connection,
+    bucket: u64,
+    priced_from: i64,
+    cell: &MeteringRow,
+) -> RecordStoreResult<Option<MeteringRow>> {
+    let u = column::read_u64;
+    let bucket = (bucket as i64).to_string();
+    let at = params![
+        bucket,
+        cell.key_id,
+        cell.provider,
+        cell.model,
+        priced_from,
+        cell.key_group_at_use,
+        cell.pricing_version
+    ];
+    let Some(mut row) = query_one(
+        conn,
+        "SELECT tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests,
+                billable_requests
+             FROM usage_metering WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4
+             AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        at,
+        |r| {
+            Ok(MeteringRow {
+                tokens_input: u(r.get(0)?),
+                tokens_output: u(r.get(1)?),
+                tokens_cache_read: u(r.get(2)?),
+                tokens_cache_write: u(r.get(3)?),
+                requests: u(r.get(4)?),
+                billable_requests: u(r.get(5)?),
+                ..cell.clone()
+            })
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    for (unit, count) in query_all(
+        conn,
+        "SELECT unit, count FROM usage_metering_units WHERE bucket=?1 AND key_id=?2 AND provider=?3
+             AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        at,
+        |r| Ok((r.get::<_, String>(0)?, u(r.get(1)?))),
+    )? {
+        row.usage_units.insert(unit, count);
+    }
+    Ok(Some(row))
+}
+
 /// [`RecordStore::add_usage`]'s writes, inside the caller's transaction (the trait method's own, or
+/// a store v3 slot's, where the `op_id` record shares it).
 fn add_usage_in(
     tx: &Connection,
     bucket_id: &str,
@@ -1374,12 +1662,14 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
         |row| row.get(0),
     )?;
     if let Some(bytes) = persisted {
-        exact =
-            serde_json::from_slice(&bytes).map_err(|error| RecordStoreError(error.to_string()))?;
-    } else if let Some(previous) = metering_columns_in(tx, d.bucket)?
-        .into_iter()
-        .find(|row| same_metering_cell(row, &exact))
-    {
+        exact = serde_json::from_slice(&bytes).map_err(|error| {
+            RecordStoreError(format!(
+                "sqlite: exact metering cell of key '{}' model '{}' in bucket {} is unreadable: \
+                 {error}",
+                d.key_id, d.model, d.bucket
+            ))
+        })?;
+    } else if let Some(previous) = metering_cell_in(tx, d.bucket, priced_from, &exact)? {
         exact = previous;
     }
     exact.tokens_input = exact.tokens_input.saturating_add(d.tokens_input);
@@ -1541,19 +1831,40 @@ fn append_plane_record_in(tx: &Connection, record: PlaneRecordRef<'_>) -> Record
     Ok(())
 }
 
+/// A deduped batch's refusal as the trait's error: a reused `op_id` with another body answers the
+/// contract's conflict diagnostic.
+fn deduped_refusal(error: busbar_contract::abi::sdk::store::OpRefused) -> RecordStoreError {
+    use busbar_contract::abi::sdk::store::OpRefused;
+    RecordStoreError(match error {
+        OpRefused::Conflict => busbar_contract::abi::store::DIAG_OPID_CONFLICT.into(),
+        OpRefused::Refused(reason) | OpRefused::Failed(reason) => reason,
+    })
+}
+
 impl RecordStore for SqliteStore {
     fn add_usage_batch_deduped(
         &self,
         op: busbar_contract::abi::store::OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> RecordStoreResult<()> {
-        use busbar_contract::abi::sdk::store::OpRefused;
-        self.v3_add_usage_batch(op, cells).map_err(|error| {
-            RecordStoreError(match error {
-                OpRefused::Conflict => busbar_contract::abi::store::DIAG_OPID_CONFLICT.into(),
-                OpRefused::Refused(reason) | OpRefused::Failed(reason) => reason,
-            })
-        })
+        self.v3_add_usage_batch(op, cells).map_err(deduped_refusal)
+    }
+
+    fn supports_usage_batch_deduped(&self) -> bool {
+        true
+    }
+
+    fn add_metering_batch_deduped(
+        &self,
+        op: busbar_contract::abi::store::OpId,
+        deltas: &[MeteringDelta],
+    ) -> RecordStoreResult<()> {
+        self.v3_add_metering_batch(op, deltas)
+            .map_err(deduped_refusal)
+    }
+
+    fn supports_metering_batch_deduped(&self) -> bool {
+        true
     }
 
     fn apply_usage_correction(
@@ -1574,9 +1885,15 @@ impl RecordStore for SqliteStore {
     }
 
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
-        self.write(true, |tx| {
-            put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
-        })
+        if key.deleted_at.is_some() {
+            self.write_destroying_secrets(|tx| {
+                put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
+            })
+        } else {
+            self.write(true, |tx| {
+                put_key_inner(tx, key, Self::bump_revision(tx)?, "put_key")
+            })
+        }
     }
 
     fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
@@ -1608,7 +1925,7 @@ impl RecordStore for SqliteStore {
     }
 
     fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
-        self.write(true, |tx| {
+        self.write_destroying_secrets(|tx| {
             let already_deleted: Option<i64> = tx
                 .query_row(
                     "SELECT deleted_at FROM keys WHERE id=?1",
@@ -1623,11 +1940,8 @@ impl RecordStore for SqliteStore {
             }
             let rev = Self::bump_revision(tx)?;
             let now = now_secs();
-
-
             tx.execute("DELETE FROM credentials WHERE key_id=?1", params![id])
                 .store()?;
-
             let changed = tx
                 .execute(
                     "UPDATE keys SET enabled=0, deleted_at=?2, updated_at=?2, revision=?3 WHERE id=?1",
@@ -1652,7 +1966,7 @@ impl RecordStore for SqliteStore {
         expected: &CredentialSecret,
         replacement: &str,
     ) -> RecordStoreResult<bool> {
-        self.write(true, |tx| {
+        let rewrapped = self.write(true, |tx| {
             if expected.meta.revoked_at.is_some()
                 || expected.meta.secret_form != SecretForm::Recoverable
                 || expected.secret == replacement
@@ -1694,7 +2008,12 @@ impl RecordStore for SqliteStore {
                 ));
             }
             Ok(true)
-        })
+        })?;
+        if rewrapped {
+            // The replaced envelope must not outlive the rewrap in the WAL.
+            scrub_wal(&self.lock_writer(), &self.path);
+        }
+        Ok(rewrapped)
     }
 
     fn put_key_with_credential(
@@ -1743,7 +2062,7 @@ impl RecordStore for SqliteStore {
     }
 
     fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
-        self.write(true, |tx| {
+        self.write_destroying_secrets(|tx| {
             let revoked: Option<bool> = tx
                 .query_row(
                     "SELECT revoked_at IS NOT NULL FROM credentials WHERE id=?1",
@@ -1848,6 +2167,7 @@ impl RecordStore for SqliteStore {
     }
 
     /// FULL sync, like every revocation path: a denial lost to a power cut makes the token valid
+    /// again on reboot with no error ever reported.
     fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
             tx.execute(
@@ -1869,7 +2189,8 @@ impl RecordStore for SqliteStore {
     fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         let row = PlaneRow::of(record, record.id, UPSERT_SEQ, "upsert_plane_record")?;
         self.write(true, |tx| {
-            tx.execute(
+            exec(
+                tx,
                 "INSERT INTO plane_records (kind, identity, seq, id, parent, ts, disposition, body) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
                  ON CONFLICT(kind, identity, seq) DO UPDATE SET \
@@ -1877,12 +2198,12 @@ impl RecordStore for SqliteStore {
                     disposition=excluded.disposition, body=excluded.body",
                 row.params(&record),
             )
-            .store()
             .map(drop)
         })
     }
 
     /// An upserted record lives at `(kind, id, 0)`. No caller-scoping filter: authorization stays
+    /// engine-side, or an unauthorized reader bypasses it by configuring a different backend.
     fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
         query_one(
             &self.lock_reader(),
@@ -1897,6 +2218,7 @@ impl RecordStore for SqliteStore {
     }
 
     /// Unfiltered beyond the selector, terminal rows included (boot rehydrate wants the active
+    /// rows, the retention sweep the terminal ones). Oldest-first by `seq`.
     fn list_plane_records(
         &self,
         kind: &str,
@@ -1930,8 +2252,9 @@ impl RecordStore for SqliteStore {
     }
 
     /// The age-only entry: `task` drops only its TERMINAL rows, every other kind every older row. A
+    /// caller that carries the rule calls `purge_plane_records`.
     fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
-        let retention = if kind == "task" {
+        let retention = if kind == TASK_RECORD_KIND {
             Retention::TerminalOnly
         } else {
             Retention::Age
@@ -1940,6 +2263,10 @@ impl RecordStore for SqliteStore {
     }
 
     /// STRICTLY older than the cutoff, by the rule the call carries (never one inferred from the
+    /// kind's name): `TerminalOnly` drops only TERMINAL rows (an interrupted task waiting on a human
+    /// sits still longest), `Age` every older row; under either, a purged task takes its
+    /// `task_event` chain with it, and the count is the task rows. A cutoff past the signed
+    /// timestamp range includes every storable timestamp, including the signed maximum.
     fn purge_plane_records(
         &self,
         kind: &str,
@@ -1949,52 +2276,59 @@ impl RecordStore for SqliteStore {
         let terminal_only = retention == Retention::TerminalOnly;
         self.write(false, |tx| {
             let before = if kind == TICKET_RECORD_KIND {
-                before.min(shared_clock(tx)? as u64)
+                before.min(self.shared_clock(tx)? as u64)
             } else {
                 before
             };
-            let above_max = before > i64::MAX as u64;
+            // Past the signed range every storable timestamp is older, the signed maximum
+            // included, so the clamped cutoff is inclusive there. Either form is a range seek on
+            // `plane_records_kind_ts_idx`.
+            let older = if before > i64::MAX as u64 {
+                "ts <= ?2"
+            } else {
+                "ts < ?2"
+            };
             let before = column::clamp(before);
             let predicate = if terminal_only {
-                "kind=?1 AND (?3 OR ts < ?2) AND disposition='terminal'"
+                format!("kind=?1 AND {older} AND disposition='terminal'")
             } else {
-                "kind=?1 AND (?3 OR ts < ?2)"
+                format!("kind=?1 AND {older}")
             };
-            if kind == "task" {
-                tx.execute(
+            if kind == TASK_RECORD_KIND {
+                exec(
+                    tx,
                     &format!(
-                        "DELETE FROM plane_records WHERE kind='task_event' AND parent IN \
+                        "DELETE FROM plane_records WHERE kind=?3 AND parent IN \
                          (SELECT identity FROM plane_records WHERE {predicate})"
                     ),
-                    params![kind, before, above_max],
-                )
-                .store()?;
+                    params![kind, before, TASK_EVENT_RECORD_KIND],
+                )?;
             }
-            let removed = tx
-                .execute(
-                    &format!("DELETE FROM plane_records WHERE {predicate}"),
-                    params![kind, before, above_max],
-                )
-                .store()?;
+            let removed = exec(
+                tx,
+                &format!("DELETE FROM plane_records WHERE {predicate}"),
+                params![kind, before],
+            )?;
             Ok(removed as u64)
         })
     }
 
     /// Absent is a no-op; every `seq` under the identity goes, so a chain is never left partial.
+    /// A task takes its `task_event` chain with it.
     fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         self.write(true, |tx| {
-            if kind == "task" {
-                tx.execute(
-                    "DELETE FROM plane_records WHERE kind='task_event' AND parent=?1",
-                    params![id],
-                )
-                .store()?;
+            if kind == TASK_RECORD_KIND {
+                exec(
+                    tx,
+                    "DELETE FROM plane_records WHERE kind=?2 AND parent=?1",
+                    params![id, TASK_EVENT_RECORD_KIND],
+                )?;
             }
-            tx.execute(
+            exec(
+                tx,
                 "DELETE FROM plane_records WHERE kind=?1 AND identity=?2",
                 params![kind, id],
             )
-            .store()
             .map(drop)
         })
     }
@@ -2007,27 +2341,30 @@ impl RecordStore for SqliteStore {
         _now: u64,
     ) -> RecordStoreResult<bool> {
         self.write(true, |tx| {
-            let now_i = shared_clock(tx)?;
+            let now_i = self.shared_clock(tx)?;
             let store_now = now_i as u64;
             if expires_at < store_now {
                 return Ok(false);
             }
-
             let expires = column::clamp(expires_at);
-            tx.execute("DELETE FROM plane_tokens WHERE expires_at < ?1", [now_i])
-                .store()?;
-            let inserted = tx
-                .execute(
-                    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES (?1,?2,?3) \
+            exec(
+                tx,
+                "DELETE FROM plane_tokens WHERE expires_at < ?1",
+                [now_i],
+            )?;
+            let inserted = exec(
+                tx,
+                "INSERT INTO plane_tokens (kind, token, expires_at) VALUES (?1,?2,?3) \
                  ON CONFLICT(kind, token) DO NOTHING",
-                    params![kind, token, expires],
-                )
-                .store()?;
+                params![kind, token, expires],
+            )?;
             Ok(inserted == 1)
         })
     }
 
     /// Multi-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record, live while
+    /// present, still `active`, and `now` not past `expires_at`. Reserved tickets instead require
+    /// their terminal record and exact deadline under the shared clock. Uncertain answers fail closed.
     fn plane_token_live(
         &self,
         kind: &str,
@@ -2044,7 +2381,7 @@ impl RecordStore for SqliteStore {
                 params![kind, token, UPSERT_SEQ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let store_now = shared_clock(&conn)? as u64;
+            let store_now = self.shared_clock(&conn)? as u64;
             return Ok(store_now <= expires_at
                 && row.is_some_and(|(ts, disposition)| {
                     u64::try_from(ts).ok() == Some(expires_at)
@@ -2083,6 +2420,9 @@ struct PlaneRow {
 
 impl PlaneRow {
     /// Refused rather than mangled: a `u64` past `i64::MAX` would wrap negative and read back
+    /// clamped, so a wrapped `seq` reorders a chain and a wrapped `ts` changes what retention does.
+    /// `identity` is where the row lives: an appended record's chain (its parent, else its id), an
+    /// upserted record's own id.
     fn of(
         record: PlaneRecordRef<'_>,
         identity: &str,
@@ -2158,7 +2498,13 @@ fn put_credential_inner(
         params![m.id],
         row_to_cred_secret,
     )?;
-    if let Some(stored) = by_id {
+    if let Some(mut stored) = by_id {
+        // The stored secret is read only to compare; it is wiped before any answer, and the
+        // caller's is compared in place, never copied.
+        let mut meta = m.clone();
+        meta.revision = stored.meta.revision;
+        let identical = meta == stored.meta && secret.secret == stored.secret;
+        zeroize::Zeroize::zeroize(&mut stored.secret);
         let sm = &stored.meta;
         if sm.revoked_at.is_some() {
             return Err(RecordStoreError(format!(
@@ -2166,10 +2512,7 @@ fn put_credential_inner(
                 m.id
             )));
         }
-
-        let mut same = secret.clone();
-        same.meta.revision = sm.revision;
-        if same == stored {
+        if identical {
             return Ok(());
         }
         return Err(live_slot(&sm.kind, &sm.key_id, sm.slot));

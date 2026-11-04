@@ -1,9 +1,9 @@
-
-
-
-
-
-
+// NOT COMPILED BY THIS CRATE — provenance for tests/fixtures/v6-release-1.0.6.db.
+//
+// That database file was written by THIS program running as an example of store-sqlite v1.0.6 (the latest RELEASE, schema v6) built against busbar a71b21e9f (1.5.5):
+//   cargo run -p busbar-store-sqlite --example gen_fixture -- v6-release-1.0.6.db
+// It is kept byte-for-byte as that code left it so the upgrade test opens a database the old code
+// really produced, not one this build imagines the old code would have produced.
 #[path = "gen_common.rs"]
 mod common;
 use busbar_api::*;

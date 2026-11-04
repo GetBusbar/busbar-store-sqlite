@@ -15,7 +15,6 @@ First-party signed kind:store plugin cdylib: the SQLite governance store package
 **This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![CI](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/GetBusbar/busbar-store-sqlite/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-sqlite)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-sqlite)](https://github.com/GetBusbar/busbar-store-sqlite/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -27,6 +26,15 @@ built library into busbar's plugins folder, set
 `store: { module: sqlite, settings: {...} }`, and busbar loads it in-process at boot
 (`dlopen`'d, not spawned as a separate process).
 
+- A durable store for busbar's governance data (the config names its store): virtual
+  keys, credentials, usage and metering ledgers, the durable audit log,
+  and every plane's durable records (A2A tasks and their provenance
+  chains, MCP demotions, single-use approval tokens,
+  push-callback capabilities, and any record kind a plane declares) —
+  single-node, file-backed, zero external dependencies (SQLite is bundled).
+- The reference `kind: store` plugin: a minimal example of adapting an
+  engine-agnostic storage backend to the plugin C ABI.
+
 ### Versioning
 
 This plugin is versioned **independently of busbar** — `v1.6.0` here says
@@ -37,6 +45,8 @@ replaced the per-protocol task/MCP methods, and the 1.6.0 key, usage and
 metering record shapes). Pin both versions explicitly in production; do
 not assume they move together.
 
+### Single-use tokens and ticket deadlines
+
 Single-use token redemption uses SQLite's Unix clock inside its write transaction. The caller's
 `now` does not authorize expiry or cleanup. SQLite has no separate server clock: connections to one
 local file must share one host clock. Sharing a database file across hosts with independent clocks
@@ -46,8 +56,8 @@ candidates leave the replay ledger unchanged. Generic multi-use token checks ret
 ### Upgrading an existing database
 
 Opening a database written by an earlier release upgrades it in place,
-forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-later, to v17). Keys and credentials retain their full-width unsigned
+forward-only, in one transaction (schema v6 — the v1.0.x releases — to
+v7). Keys and credentials retain their full-width unsigned
 timestamps. An older signed expiry check could admit an expiry that
 precedes creation in unsigned order; such a row refuses the upgrade with
 its identity and decoded timestamps. The transaction leaves the schema,
@@ -59,15 +69,18 @@ Schema v7 preserves each metering row’s recorded group and price version in it
 On a successful upgrade, keys, credentials, tombstones, usage and metering
 counts, the audit log and the denylist retain their data; existing
 metering rows are attributed to the opening rate card. A credential
-revoked under an older build loses the secret it kept (v14: a revoke now
-destroys the secret, and the row keeps only its metadata). Back the file
+revoked under an older build loses the secret it kept (a revoke now
+destroys the secret, and the row keeps only its metadata); the upgrade
+zeroes the pages of the tables it replaces, so the destroyed secret is not
+left readable in the file. Back the file
 up before the first boot on the new version — there is no downgrade path,
 and an older plugin build must not be pointed at an upgraded file.
 
 All the actual SQLite logic — schema, key/usage/audit persistence, a
 mutex-guarded writer connection plus a small pool of `query_only` reader
-connections (so a long billing report or retention sweep never blocks the
-hot-path usage flush) — lives in the `busbar-store-sqlite` `lib` crate in
+connections (so a long billing report never blocks the hot-path usage
+flush; a retention sweep is a write and takes the writer like any other) —
+lives in the `busbar-store-sqlite` `lib` crate in
 this repository's `store-sqlite/` directory. The
 `store-sqlite-plugin` crate is deliberately tiny: the logic crate also holds
 its one door (`door::door`, the store v3 table over `SqliteStore` through
@@ -77,15 +90,11 @@ into a `SqliteStore`), and the plugin crate exports that door as
 through the same door a busbar build that LINKS `busbar-store-sqlite`
 registers — one source, both doors. The image carries no other export.
 
-
-- A durable store for busbar's governance data (the config names its store): virtual
-  keys, credentials, usage and metering ledgers, the durable audit log,
-  and every plane's durable records (A2A tasks and their provenance
-  chains, MCP demotions, single-use approval tokens,
-  push-callback capabilities, and any record kind a plane declares) —
-  single-node, file-backed, zero external dependencies (SQLite is bundled).
-- The reference `kind: store` plugin: a minimal example of adapting an
-  engine-agnostic storage backend to the plugin C ABI.
+A revoke, a credential rewrap, a key delete and a `put_key` that writes a
+tombstone (which also destroys the key's credentials) checkpoint and truncate
+the WAL once they commit, so the destroyed secret does not linger in
+`governance.db-wal`. This never blocks or fails the write: if a reader holds
+a snapshot at that moment, the residue goes with a later checkpoint.
 
 ## Config
 
@@ -99,7 +108,7 @@ store:
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file. `:memory:` opens an in-process, non-durable database. |
+| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file, or a `file:` URI naming one (created `0600` like a plain path; the URI parameters `cache=shared`, `nolock`, `immutable` and `vfs=unix-none` break the store's single-writer locking and are refused; `mode=rw`/`mode=ro` keep SQLite's rule that a missing file is an open error). `:memory:` (or a `file:` URI with `mode=memory`) opens an in-process, non-durable database: everything, including `op_id` dedupe receipts and redeemed single-use tokens, is lost on restart, and busbar's boot-time ephemeral-store warning does not fire for it (the plugin states one durability for every `db_path`). |
 | `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value, or one above 2147483647 (SQLite's 32-bit limit; larger silently disables the timeout), is rejected as a config error. |
 
 **`db_path` must be an explicit absolute path in any real deployment.** The

@@ -427,6 +427,17 @@ fn pause_after_begin(store: &SqliteStore) -> (mpsc::Receiver<()>, mpsc::SyncSend
     (waiting, release)
 }
 
+/// Set once the ordinary writer's `BEGIN IMMEDIATE` has met the writer authority the paused
+/// acceptance holds: its connection's busy handler ran.
+static ORDINARY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The ordinary writer's busy handler: note the wait, then keep retrying (for at most ~20 s).
+fn note_ordinary_blocked(attempt: i32) -> bool {
+    ORDINARY_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(5));
+    attempt < 4_000
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OrdinaryWriter {
     Metering,
@@ -443,6 +454,11 @@ fn ordinary_metering_key_delete_and_absent_row_insert_serialize_after_acceptance
     ] {
         let (store, path, _dir) = on_file();
         let other = SqliteStore::open(&path, BUSY_TIMEOUT_MS).unwrap();
+        other
+            .lock_writer()
+            .busy_handler(Some(note_ordinary_blocked))
+            .unwrap();
+        ORDINARY_BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
         let request = candidate(&store, 1);
         let (waiting, release) = pause_after_begin(&store);
         std::thread::scope(|scope| {
@@ -463,6 +479,17 @@ fn ordinary_metering_key_delete_and_absent_row_insert_serialize_after_acceptance
                 }
             });
             starting.recv_timeout(DEADLINE).unwrap();
+            // Release only once the ordinary write is provably waiting on the held authority, so
+            // the interleaving that tells "serialized after acceptance" from "raced in between"
+            // is the one this test runs, every time.
+            let waiting_since = std::time::Instant::now();
+            while !ORDINARY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    waiting_since.elapsed() < DEADLINE,
+                    "the ordinary write never met the writer authority the acceptance holds"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
 
             let during = other.get_usage(BUCKET, WINDOW).unwrap();
             release.send(()).unwrap();

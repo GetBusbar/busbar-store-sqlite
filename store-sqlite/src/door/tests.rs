@@ -20,6 +20,14 @@ fn malformed_json_is_rejected() {
 }
 
 /// A negative `busy_timeout_ms` passes the existing type check (`n.is_i64()` is true for a negative
+/// integer) but is nonsensical as a duration and can only be a config mistake -- unlike `0`, which
+/// is a legal, deliberate "never retry" setting, a negative number names nothing SQLite or an
+/// operator could sensibly mean. That's the same silent-footgun class the type-strict parsing above
+/// already guards against for the wrong JSON type; a negative number must be rejected the same way,
+/// not passed straight through to `SqliteStore::open`. `db_path` is pinned to `:memory:` to keep
+/// the test hermetic: an implementation that fails to reject the negative value would otherwise
+/// reach a real `SqliteStore::open` against the default relative `busbar-governance.db` path and
+/// create a real file in the test's cwd.
 #[test]
 fn negative_busy_timeout_ms_is_rejected() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "busy_timeout_ms": -1}"#));
@@ -30,12 +38,17 @@ fn negative_busy_timeout_ms_is_rejected() {
 }
 
 /// RAII guard that switches the process cwd to a fresh scratch temp directory and restores the
+/// original cwd (then removes the scratch directory) on drop — including on an early return via
+/// panic/`?`, so a failing assertion can never strand files in the repo root. `set_current_dir` is
+/// process-global, so only ONE test may use this guard at a time; see the caller for how that's
+/// enforced against cargo's parallel test runner.
 struct ScratchCwd {
     original: std::path::PathBuf,
     scratch: std::path::PathBuf,
 }
 
 /// Serialises every test that switches the process cwd (`ScratchCwd`), since cargo runs tests in
+/// parallel and the cwd is process-global.
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl ScratchCwd {
@@ -152,11 +165,7 @@ fn nonexistent_parent_directory_is_a_clean_error_not_a_panic() {
 
 #[test]
 fn busy_timeout_ms_is_actually_applied() {
-    let dir = std::env::temp_dir().join(format!(
-        "busbar-sqlite-plugin-busy-timeout-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::tests::tempdir();
     let path = dir.join("busy_timeout.db");
     let path_str = path.to_str().unwrap().to_string();
 
@@ -191,17 +200,36 @@ fn busy_timeout_ms_is_actually_applied() {
         "open() returned too fast ({elapsed}ms) to have honored the configured \
          {CONFIGURED_TIMEOUT_MS}ms busy_timeout — it looks like the timeout wasn't applied at all"
     );
+    // Below the 5000ms default with room for a loaded runner: the bound only has to tell the
+    // configured timeout from a silent fallback to the default.
     assert!(
-        elapsed < 2500,
+        elapsed < 4500,
         "open() took {elapsed}ms, far longer than the configured {CONFIGURED_TIMEOUT_MS}ms — it \
          looks like the plugin silently fell back to the 5000ms default instead of the configured \
          value"
     );
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+/// A fractional or exponent `busy_timeout_ms` says what is wrong with it (it is a number, just not
+/// a whole one), still without echoing the value.
+#[test]
+fn a_non_integer_busy_timeout_ms_names_the_number_form() {
+    for cfg in [
+        r#"{"busy_timeout_ms": 1.5}"#,
+        r#"{"busy_timeout_ms": 5000.0}"#,
+        r#"{"busy_timeout_ms": 1e3}"#,
+    ] {
+        let err = super::Settings::parse(cfg).unwrap_err();
+        assert!(
+            err.contains("whole number of milliseconds") && !err.contains("got a number"),
+            "{cfg}: {err}"
+        );
+    }
 }
 
 /// An explicit JSON `null` for either key is read as ABSENT and falls back to the default, the
+/// semantics this plugin shipped with in busbar 1.5.5. Pinned so a change to them is a decision,
+/// not an accident: `db_path: null` opens the default relative file, exactly as `{}` does.
 #[test]
 fn null_db_path_and_busy_timeout_read_as_absent() {
     let _serial = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -223,6 +251,7 @@ fn null_db_path_and_busy_timeout_read_as_absent() {
 }
 
 /// `0` is a legal, deliberate "never retry" setting (only a negative value is refused), so it must
+/// open.
 #[test]
 fn zero_busy_timeout_ms_is_accepted() {
     open(r#"{"db_path": ":memory:", "busy_timeout_ms": 0}"#)
@@ -230,6 +259,7 @@ fn zero_busy_timeout_ms_is_accepted() {
 }
 
 /// An unsigned value past `i64::MAX` passes the integer type check (`is_u64`) but cannot be a
+/// SQLite busy timeout; it must be refused as out of range, never wrapped or clamped.
 #[test]
 fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
     let err = expect_err(open(
@@ -242,6 +272,7 @@ fn busy_timeout_ms_past_i64_max_is_refused_as_out_of_range() {
 }
 
 /// SQLite parses `PRAGMA busy_timeout` as a 32-bit int; a larger value reads back as 0 and silently
+/// disables the busy handler, so anything above `i32::MAX` is refused (and `i32::MAX` itself is fine).
 #[test]
 fn busy_timeout_ms_above_i32_max_is_refused() {
     use super::Settings;
@@ -258,6 +289,7 @@ fn busy_timeout_ms_above_i32_max_is_refused() {
 }
 
 /// An unknown top-level key is refused (a typo such as `dbpath` would otherwise silently open the
+/// default relative path), naming the accepted keys.
 #[test]
 fn an_unknown_setting_is_refused() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
@@ -316,6 +348,7 @@ fn license_key_is_accepted_and_ignored() {
 }
 
 /// A wrongly typed setting is refused naming the expected and the given JSON type, never the value
+/// (a template can put a secret where a path was expected).
 #[test]
 fn a_wrongly_typed_setting_names_types_never_the_value() {
     use super::Settings;

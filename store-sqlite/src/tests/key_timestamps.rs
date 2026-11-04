@@ -372,7 +372,14 @@ fn refused_key_migration_restores_foreign_key_enforcement() {
         conn.pragma_update(None, "user_version", FIRST_RELEASED_SCHEMA)
             .unwrap();
     }
-    assert!(store.migrate().is_err());
+    let error = store
+        .migrate()
+        .expect_err("the unsigned-order key refuses the migration");
+    assert!(
+        error.0.contains("key 'owner'") && error.0.contains("unsigned timestamp order"),
+        "refused for the key it was set up with, not an earlier step: {}",
+        error.0
+    );
     let conn = store.lock_writer();
     assert!(
         conn.is_autocommit(),

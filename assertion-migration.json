@@ -608,11 +608,11 @@
     }
   },
   "qualification": {
-    "builds": "No builds run under resource lane restriction. rustfmt and git diff --check pass; source-reviewed exact a35493 SDK public APIs. Final SDK compile/runtime qualification pending.",
+    "builds": "At migration (source a35493) no build ran: rustfmt and git diff --check passed and the SDK public APIs were source-reviewed. The migrated tests are now compiled and run by CI (busbar plugin-ci.yml, cargo test --workspace --locked) against the busbar pin in .busbar-ref.",
     "artifact": "BUSBAR_PLUGIN_CDYLIB if supplied, else exact profile library. CI must freshly cargo build -p busbar-store-sqlite-plugin --lib before tests; missing is fatal.",
-    "lock": "Cargo.lock intentionally untouched per ownership instruction. Removing authored dev dependencies requires coordinated lock regeneration before --locked CI.",
+    "lock": "The migration commit left Cargo.lock untouched; it was regenerated with the later SDK alignment commits (dceb1c7, 77e26f7), and CI builds --locked against it.",
     "test_seal": "Removed unused contract test-seal dev feature; source has no consumers.",
-    "crossings": "All 86 original product step counts plus second ready count retained directly with exact pinned SDK public Instance.crossings minus Instance.resumes; future SDK API compatibility remains uncompiled.",
+    "crossings": "All 86 original product step counts plus second ready count retained directly with exact pinned SDK public Instance.crossings minus Instance.resumes; compiled against the busbar pin in .busbar-ref.",
     "both_ways": "Original exact Statement equality, distinct door and ops addresses, all product answers/counts, repeated readiness, and deadline_without_wake=0 retained. Network resume/dialing predicate was inapplicable to SQLite with no needs."
   }
 }

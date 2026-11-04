@@ -2,6 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
+//! `op_id`-carrying count batches and plane-record append, and a plane's kernel-held records. All
+//! DURABLE on a file: the state lives in the tables `SCHEMA` creates (a `:memory:` store keeps it
+//! only for the life of the process). It holds no money (counts x the rate
+//! card, derived in busbar's core).
+//!
+//! DEDUPE (`abi::store` S1-S4, [`Dedupe`]): an `op_id` that APPLIED is recorded in `store_ops` with
+//! the op's body, in the SAME `BEGIN IMMEDIATE` transaction as the op's effect: two racing calls
+//! with one `op_id` apply once, and a replay after a restart answers done. A refusal rolls back and
+//! records nothing. Records older than [`OP_ID_RETENTION_SECS`] are swept when a new one is recorded.
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
@@ -22,6 +31,7 @@ use std::sync::atomic::Ordering;
 use crate::{
     add_metering_in, add_usage_in, append_plane_record_in, exec, metering_in, now_secs,
     put_usage_in, query_all, query_one, usage_in, verify_usage_in, SqliteStore,
+    RESERVED_USAGE_REFUSAL,
 };
 
 fn failed(e: RecordStoreError) -> OpRefused {
@@ -37,14 +47,16 @@ fn refused(e: RecordStoreError) -> OpRefused {
 fn recorded(tx: &Transaction<'_>, op: OpId) -> OpResult<Option<String>> {
     query_one(
         tx,
-        "SELECT body FROM store_ops WHERE op_id=?1 AND recorded_at > ?2",
+        "SELECT body FROM store_ops WHERE op_id=?1 AND recorded_at >= ?2",
         params![op.0.as_slice(), retention_cutoff(now_secs())],
         |r| r.get(0),
     )
     .map_err(failed)
 }
 
-/// A row recorded at or before this is past its retention: never honoured, swept in time.
+/// A row recorded before this is past its retention: never honoured, swept in time. Both stamps are
+/// whole seconds, so a row stamped exactly at the cutoff may be up to a second younger than
+/// [`OP_ID_RETENTION_SECS`] and is still honoured: an `op_id` is remembered AT LEAST that long (S4).
 fn retention_cutoff(now: i64) -> i64 {
     now.saturating_sub(OP_ID_RETENTION_SECS as i64)
 }
@@ -53,12 +65,14 @@ fn retention_cutoff(now: i64) -> i64 {
 const SWEEP_EVERY: u64 = 256;
 
 /// Remember an APPLIED op's body ([`Dedupe::body_hex`]: the column is TEXT); every [`SWEEP_EVERY`]th one also
+/// forgets the ops past their retention (`recorded` already ignores them, so the sweep only
+/// reclaims space). `answer` is written as the one answer older builds read back (`"Done"`).
 fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStoreResult<()> {
     let now = now_secs();
     if sweep {
         exec(
             tx,
-            "DELETE FROM store_ops WHERE recorded_at <= ?1",
+            "DELETE FROM store_ops WHERE recorded_at < ?1",
             params![retention_cutoff(now)],
         )?;
     }
@@ -88,6 +102,7 @@ fn record(tx: &Transaction<'_>, op: OpId, body: &str, sweep: bool) -> RecordStor
 
 impl SqliteStore {
     /// Run one `op_id`-carrying write deduped ([`Dedupe::run`]) in ONE `BEGIN IMMEDIATE`
+    /// transaction at FULL sync. A refusal rolls the transaction back.
     fn op(
         &self,
         op: OpId,
@@ -156,6 +171,7 @@ fn put_record_in(
 }
 
 /// A raw BLOB-prefix selector with an exact byte length. SQLite lengths are nonnegative i64:
+/// a larger checked platform length cannot match any row and is a legal empty range.
 fn record_range(
     tx: &Transaction<'_>,
     schema: &str,
@@ -207,6 +223,7 @@ impl SqliteStore {
     }
 
     /// An upsert on `(schema, key)`; an EMPTY value removes the row (the host's strike), and
+    /// removing a row that is not there is `Ok`.
     pub(crate) fn v3_record_put(
         &self,
         schema: &str,
@@ -223,10 +240,13 @@ impl SqliteStore {
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
         let value = record_value(&self.lock_reader(), schema, key).map_err(|e| e.0)?;
-        value.map(record_bytes).transpose()
+        value.map(|v| record_bytes(schema, v)).transpose()
     }
 
     /// Compare the complete pre-state, then commit every effect and the applied-only receipt in
+    /// the existing FULL-sync BEGIN IMMEDIATE operation. A predicate miss forces rollback, but is
+    /// a definitive decision rather than an operation-id body conflict. SQL/commit errors retain
+    /// their ambiguous failure semantics: callers must replay this exact id and body.
     pub(crate) fn v3_record_transaction(&self, request: &Request) -> OpResult<Decision> {
         request
             .validate()
@@ -318,7 +338,7 @@ impl SqliteStore {
         }
         .map_err(|e| e.0)?;
         rows.into_iter()
-            .map(|(k, v)| Ok((k, record_bytes(v)?)))
+            .map(|(k, v)| Ok((k, record_bytes(schema, v)?)))
             .collect()
     }
 
@@ -327,15 +347,24 @@ impl SqliteStore {
             return Ok(0);
         }
 
-        const OLD: &str = "(window_start > 0 AND (?1 < 0 OR window_start < ?1)) \
+        // `window_start` is a `u64` stored by bit pattern: a cutoff inside the signed range is a
+        // plain range seek on the `window_start`-led primary keys; one past it (stored negative)
+        // takes every positive window and the negatives below it, in unsigned order.
+        const OLD_SIGNED: &str = "window_start > 0 AND window_start < ?1";
+        const OLD_WRAPPED: &str = "(window_start > 0 AND (?1 < 0 OR window_start < ?1)) \
             OR (window_start < 0 AND ?1 < 0 AND window_start < ?1)";
+        let old = if i64::try_from(before).is_ok() {
+            OLD_SIGNED
+        } else {
+            OLD_WRAPPED
+        };
         self.write(true, |tx| {
             let count: Option<i64> = query_one(
                 tx,
                 &format!(
                     "SELECT count(*) FROM (SELECT window_start, bucket_id \
-                    FROM usage_windows WHERE {OLD} UNION SELECT window_start, bucket_id \
-                    FROM usage_window_exact WHERE {OLD})"
+                    FROM usage_windows WHERE {old} UNION SELECT window_start, bucket_id \
+                    FROM usage_window_exact WHERE {old})"
                 ),
                 params![before as i64],
                 |r| r.get(0),
@@ -343,7 +372,7 @@ impl SqliteStore {
             for table in ["usage_windows", "usage_window_units", "usage_window_exact"] {
                 exec(
                     tx,
-                    &format!("DELETE FROM {table} WHERE {OLD}"),
+                    &format!("DELETE FROM {table} WHERE {old}"),
                     params![before as i64],
                 )?;
             }
@@ -363,24 +392,21 @@ impl SqliteStore {
                 .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
             {
                 reserved = true;
-                return Err(RecordStoreError(
-                    "reserved adjustment rows require atomic usage correction".into(),
-                ));
+                return Err(RecordStoreError(RESERVED_USAGE_REFUSAL.into()));
             }
             cells
                 .iter()
                 .try_for_each(|(bucket, window, delta)| add_usage_in(tx, bucket, *window, delta))
         });
         if reserved {
-            Err(OpRefused::Refused(
-                "reserved adjustment rows require atomic usage correction".into(),
-            ))
+            Err(OpRefused::Refused(RESERVED_USAGE_REFUSAL.into()))
         } else {
             result
         }
     }
 
     /// One serialized pre-state and one FULL-sync commit for all rows and the applied receipt.
+    /// A lost commit answer is Failed: retain the immutable request and replay its id/body.
     pub(crate) fn v3_apply_usage_correction(
         &self,
         request: &correction::Request,
@@ -459,6 +485,7 @@ macro_rules! ready {
 }
 
 /// The store v3 table over this store. The store never touches [`Op`]; the host runs it on its
+/// bounded disk lane. The base op set is the [`RecordStore`] impl, one body each.
 impl StoreSlots for SqliteStore {
     const RECORD_TRANSACTION: bool = true;
     const USAGE_CORRECTION: bool = true;
@@ -523,9 +550,12 @@ fn settings_str(settings: &[u8]) -> Result<&str, String> {
         .map_err(|e| format!("invalid sqlite plugin config: not UTF-8: {e}"))
 }
 
-/// A stored record's bytes as the contract's bounded record.
-fn record_bytes(v: Vec<u8>) -> Result<RecordBytes, String> {
-    RecordBytes::new(v).map_err(|n| format!("a stored record of {n} bytes is over the ceiling"))
+/// A stored record's bytes as the contract's bounded record. The refusal names the schema and the
+/// size, which find the row (`length(value)`) without echoing its key or value.
+fn record_bytes(schema: &str, v: Vec<u8>) -> Result<RecordBytes, String> {
+    RecordBytes::new(v).map_err(|n| {
+        format!("sqlite: a stored record of {n} bytes in schema '{schema}' is over the ceiling")
+    })
 }
 
 #[cfg(test)]

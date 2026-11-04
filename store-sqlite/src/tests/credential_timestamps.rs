@@ -370,3 +370,68 @@ fn future_schema_refusal_keeps_unsigned_rows_unchanged() {
     assert_eq!(after.2, before.2);
     assert!(after.3 == before.3);
 }
+
+/// THE UPGRADE DESTROYS THE SECRET A REVOKED LEGACY ROW KEPT, ON DISK TOO. The credentials rebuild
+/// copies the revoked row without its secret, then drops the old table; under the store's
+/// `secure_delete=FAST` a dropped table's pages would reach the freelist byte for byte, so the
+/// "destroyed" secret would still be readable from the file (and from its WAL) after the upgrade.
+#[test]
+fn the_upgrade_leaves_no_copy_of_a_revoked_legacy_secret_in_the_file() {
+    const KEPT: &str = "v1:plain:KEPT-AFTER-REVOKE-3f9c";
+    let dir = tempdir();
+    let path = dir.join("scrub.db");
+    let wal = dir.join("scrub.db-wal");
+    let on_disk = || {
+        [&path, &wal].iter().any(|p| {
+            std::fs::read(p).is_ok_and(|bytes| {
+                bytes
+                    .windows(KEPT.len())
+                    .any(|window| window == KEPT.as_bytes())
+            })
+        })
+    };
+    {
+        let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+        store.put_key(&sample_key("owner", "hash")).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&V13_CREDENTIALS.replace("credentials_v13", "credentials_legacy"))
+            .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER keys_cascade_credentials;
+             DROP TABLE credentials;
+             ALTER TABLE credentials_legacy RENAME TO credentials;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form,
+                 created_at, updated_at, expires_at, revoked_at, revoke_reason, revision)
+             VALUES ('cred_kept', 'owner', 'sigv4', 0, 'AKIA_KEPT', ?1, 'recoverable',
+                 1, 1, NULL, 5, 'old', 1)",
+            params![KEPT],
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", FIRST_RELEASED_SCHEMA)
+            .unwrap();
+    }
+    assert!(
+        on_disk(),
+        "the legacy file holds the revoked row's kept secret"
+    );
+
+    let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    let upgraded = store
+        .lookup_credential_secret("sigv4", "AKIA_KEPT")
+        .unwrap()
+        .expect("the revoked row survives the upgrade");
+    assert_eq!(
+        (upgraded.secret.as_str(), upgraded.meta.revoked_at),
+        ("", Some(5))
+    );
+    assert!(
+        !on_disk(),
+        "the upgrade left the destroyed secret readable in the database file or its WAL"
+    );
+}

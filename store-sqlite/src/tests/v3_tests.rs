@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! Tests for `store-sqlite/src/v3.rs`: the store v3 slots' dedupe (S1-S4) and its DURABILITY across
+//! a reopen of the file, the count batches and the schema records. The behavioural cases
+//! are the in-tree memory store's (`crates/store-memory/src/tests/v3_tests.rs` at the pin), held to
+//! this backend; the durability cases are this backend's own.
 
 use super::*;
 use busbar_contract::records::{ModelTokensDelta, RecordStore};
@@ -200,7 +203,7 @@ fn an_op_id_is_forgotten_after_its_retention() {
     s.v3_add_usage_batch(op(1), &[("k", 60, delta(1, 1))])
         .expect("a");
 
-    let old = now_secs() - OP_ID_RETENTION_SECS as i64;
+    let old = now_secs() - OP_ID_RETENTION_SECS as i64 - 1;
     s.lock_writer()
         .execute(
             "UPDATE store_ops SET recorded_at=?1 WHERE op_id=?2",
@@ -218,7 +221,40 @@ fn an_op_id_is_forgotten_after_its_retention() {
     );
 }
 
+/// A receipt stamped exactly at the retention cutoff is still honoured: whole-second stamps would
+/// otherwise forget an `op_id` up to a second before [`OP_ID_RETENTION_SECS`] has passed (S4 says
+/// AT LEAST). Retried until the stamp and the replay fall in the same second.
+#[test]
+fn an_op_id_stamped_at_the_cutoff_is_still_remembered() {
+    let s = fresh();
+    for n in 1..=50 {
+        let bucket = format!("edge-{n}");
+        let cells = [(bucket.as_str(), 60, delta(1, 1))];
+        s.v3_add_usage_batch(op(n), &cells).expect("apply");
+        let stamped = now_secs();
+        s.lock_writer()
+            .execute(
+                "UPDATE store_ops SET recorded_at=?1 WHERE op_id=?2",
+                params![stamped - OP_ID_RETENTION_SECS as i64, op(n).0.as_slice()],
+            )
+            .expect("age to the cutoff");
+        s.v3_add_usage_batch(op(n), &cells).expect("replay");
+        if now_secs() == stamped {
+            assert_eq!(
+                RecordStore::get_usage(&s, &bucket, 60)
+                    .expect("read")
+                    .requests,
+                1,
+                "a receipt stamped at the cutoff replayed as new"
+            );
+            return;
+        }
+    }
+    panic!("no attempt kept the stamp and the replay within one second");
+}
+
 /// An expired row is not honoured when no sweep has run: the sweep fires on op 0 and every 256th,
+/// so after op 0 the aged row below is still in the table when its op_id returns.
 #[test]
 fn an_expired_op_id_is_not_honoured_before_any_sweep() {
     let s = fresh();
@@ -226,7 +262,7 @@ fn an_expired_op_id_is_not_honoured_before_any_sweep() {
         .expect("a");
     s.v3_add_usage_batch(op(2), &[("j", 60, delta(1, 1))])
         .expect("b");
-    let old = now_secs() - OP_ID_RETENTION_SECS as i64;
+    let old = now_secs() - OP_ID_RETENTION_SECS as i64 - 1;
     s.lock_writer()
         .execute(
             "UPDATE store_ops SET recorded_at=?1 WHERE op_id=?2",
@@ -363,6 +399,7 @@ fn a_prefix_scan_returns_exactly_the_keys_the_prefix_starts() {
 }
 
 /// S4: dedupe is DURABLE. Every write below is replayed on a REOPENED file: the replays apply
+/// nothing and answer the originals, and a reused id with another body is still a conflict.
 #[test]
 fn dedupe_survives_a_reopen_of_the_file() {
     let (s, path, _dir) = on_file("durable");
@@ -427,6 +464,7 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
 }
 
 /// A body an older build recorded (`slot:{:?}`) still dedupes after the upgrade, inside the
+/// retention window: the same op replays and applies nothing, a different op conflicts.
 #[test]
 fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     let s = fresh();
@@ -439,8 +477,15 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
             )
             .expect("record");
     };
+    // The bodies are the frozen spellings, not this build's `{:?}`: a contract change to a type's
+    // Debug output would otherwise move the fixture and the comparator together and hide that
+    // receipts already on disk no longer replay.
     let cells = [("k", 60, delta(1, 1))];
-    recorded(1, format!("add_usage_batch:{cells:?}"));
+    recorded(
+        1,
+        r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta { model: "m", usage_units: {"input": 1} }] })]"#
+            .to_string(),
+    );
     s.v3_add_usage_batch(op(1), &cells).expect("replay");
     assert_eq!(
         RecordStore::get_usage(&s, "k", 60).expect("read").requests,
@@ -469,7 +514,11 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
         usage_units: Default::default(),
     };
     let deltas = std::slice::from_ref(&d);
-    recorded(2, format!("add_metering_batch:{deltas:?}"));
+    recorded(
+        2,
+        r#"add_metering_batch:[MeteringDelta { key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
+            .to_string(),
+    );
     s.v3_add_metering_batch(op(2), deltas).expect("replay");
     assert!(RecordStore::list_metering(&s, 86_400)
         .expect("list")
@@ -488,7 +537,11 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
         disposition: busbar_contract::records::PlaneDisposition::Active,
         body,
     };
-    recorded(3, format!("append_plane_record:{:?}", rec(b"{}")));
+    recorded(
+        3,
+        r#"append_plane_record:PlaneRecordRef { kind: "task_event", id: "e1", parent: Some("t1"), seq: 1, ts: 5, disposition: Active, body: [123, 125] }"#
+            .to_string(),
+    );
     s.v3_append_plane_record_op(op(3), rec(b"{}"))
         .expect("replay");
     assert_eq!(
@@ -505,6 +558,7 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
 }
 
 /// A value the columns cannot hold is REFUSED (the host may re-send), not Failed (replayed forever),
+/// and nothing is applied or recorded.
 #[test]
 fn values_the_columns_cannot_hold_are_refused_not_failed() {
     let s = fresh();
@@ -604,6 +658,7 @@ fn ops_recorded(s: &SqliteStore) -> i64 {
 }
 
 /// A failed op (a fork) records nothing, so the same `op_id` retried with a record that does not
+/// fork applies instead of conflicting.
 #[test]
 fn a_failed_op_records_nothing_and_its_op_id_can_be_retried() {
     let s = fresh();
@@ -621,7 +676,7 @@ fn a_failed_op_records_nothing_and_its_op_id_can_be_retried() {
         s.v3_append_plane_record_op(op(2), rec(1, b"{\"x\":1}")),
         Err(OpRefused::Failed(_))
     ));
-    assert_eq!(ops_recorded(&s), 1, "the fork recorded its op_id");
+    assert_eq!(ops_recorded(&s), 1, "the failed fork recorded nothing");
     s.v3_append_plane_record_op(op(2), rec(2, b"{}"))
         .expect("the retry of the failed op_id applies");
     assert_eq!(ops_recorded(&s), 2);
@@ -699,4 +754,28 @@ fn the_retention_sweep_deletes_aged_rows_every_sweep_every_ops() {
         SWEEP_EVERY as i64 + 1,
         "fresh rows were swept"
     );
+}
+
+/// A stored record past the contract's ceiling is refused naming its schema and size (enough to find
+/// the row with `length(value)`), never echoing its key or value.
+#[test]
+fn an_oversized_stored_record_names_its_schema() {
+    let s = fresh();
+    let value = vec![b'v'; busbar_contract::bounded::MAX_RECORD_BYTES + 1];
+    s.lock_writer()
+        .execute(
+            "INSERT INTO schema_records (schema, record_key, value) VALUES ('big', x'6b', ?1)",
+            params![value],
+        )
+        .expect("seed");
+    let error = s.v3_record_get("big", b"k").expect_err("over the ceiling");
+    assert!(
+        error.contains("schema 'big'")
+            && error.contains(&(busbar_contract::bounded::MAX_RECORD_BYTES + 1).to_string()),
+        "{error}"
+    );
+    let scanned = s
+        .v3_record_scan("big", b"", 10)
+        .expect_err("over the ceiling");
+    assert!(scanned.contains("schema 'big'"), "{scanned}");
 }

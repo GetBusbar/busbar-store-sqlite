@@ -21,6 +21,9 @@ const IGNORE_REWRAP_TRIGGER: &str =
      BEGIN SELECT RAISE(IGNORE); END;";
 
 /// The executable and cdylib each bundle SQLite. Their process-local VFS lock tables are
+/// independent, while POSIX locks belong to the process. Keep raw observers in another process
+/// so closing one engine's connection cannot interfere with the live dropped provider's WAL.
+/// The parent keeps its Store open: this still witnesses the commit immediately after READY.
 fn raw_sqlite(path: &std::path::Path, operation: &str) -> Option<i64> {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", RAW_SQLITE_TEST, "--nocapture", "--color=never"])
@@ -63,6 +66,7 @@ fn raw_sqlite(path: &std::path::Path, operation: &str) -> Option<i64> {
 }
 
 /// Entered only by raw_sqlite's scoped child environment, before either scenario opens a Store.
+/// No new ignored test or external SQL interpreter is needed; SQL failures fail the child test.
 fn raw_sqlite_helper_mode() -> bool {
     let Some(operation) = std::env::var_os(RAW_SQLITE_OPERATION) else {
         return false;

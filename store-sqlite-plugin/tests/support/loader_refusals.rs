@@ -30,7 +30,7 @@ fn restate(parts: DoorParts) {
 
 #[test]
 fn incompatible_abi_layout_and_statement_metadata_are_refused() {
-    let _lock = METADATA.lock().unwrap();
+    let _lock = METADATA.lock().unwrap_or_else(|p| p.into_inner());
     let d = Dispatcher::new(DispatchConfig::default());
     let honest = rendering_of_macro(MACRO_DOOR).unwrap();
     for by in [Door::Linked, Door::Dropped] {
@@ -206,7 +206,7 @@ extern "C" fn ready_fails(
 }
 #[test]
 fn failed_ready_closes_the_real_opened_store_once() {
-    let _lock = METADATA.lock().unwrap();
+    let _lock = METADATA.lock().unwrap_or_else(|p| p.into_inner());
     let original = real();
     // SAFETY: the actual SQLite door owns the complete current store operation table.
     let mut ops = unsafe {
@@ -261,7 +261,7 @@ fn failed_ready_closes_the_real_opened_store_once() {
 #[test]
 fn a_network_need_requires_a_connection_table_except_in_probe_mode() {
     use busbar_contract::abi::host::conn::connector::{Need, DIRECTION_OUTBOUND, KEEP_NAMED};
-    let _lock = METADATA.lock().unwrap();
+    let _lock = METADATA.lock().unwrap_or_else(|p| p.into_inner());
     let real = real();
     const NONE: AbiStr = AbiStr {
         ptr: std::ptr::null(),

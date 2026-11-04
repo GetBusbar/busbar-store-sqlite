@@ -253,7 +253,7 @@ fn close_stream(
 
 #[test]
 fn actual_sqlite_contexts_refuse_undeclared_needs_and_foreign_connections() {
-    let _lock = METADATA.lock().unwrap();
+    let _lock = METADATA.lock().unwrap_or_else(|p| p.into_inner());
     restate(with_an_outbound_need(real()));
     let d = Dispatcher::new(DispatchConfig::default());
     let table: Arc<dyn DeclaredConns> = Arc::new(OwnershipValues::default());
