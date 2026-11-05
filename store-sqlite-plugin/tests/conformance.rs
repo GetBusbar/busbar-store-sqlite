@@ -458,6 +458,7 @@ fn cleanup_ledger() -> busbar_contract::records::UsageLedger {
         models: ["a", "b"]
             .into_iter()
             .map(|model| busbar_contract::records::ModelTokens {
+                scale: 6,
                 model: model.into(),
                 usage_units: [("input".into(), 11), ("tool_calls".into(), 3)].into(),
             })
@@ -510,6 +511,7 @@ fn usage_cleanup_is_strict_and_durable_through_either_door() {
         s.upsert_plane_record(record("task", "keep", None, 0, "keep").view())
             .unwrap();
         let billing = MeteringDelta {
+            scale: 6,
             key_id: "keep".into(),
             bucket: 100,
             model: "a".into(),
@@ -655,7 +657,10 @@ fn a_failed_usage_cleanup_rolls_back_both_tables_through_either_door() {
 
 #[test]
 fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
+    use busbar_contract::count::MAX_ACROSS_A_64_BIT_COLUMN;
     use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
+
+    let max_quantity = u64::try_from(MAX_ACROSS_A_64_BIT_COLUMN.micros()).unwrap();
 
     for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
         let dir = scratch(&format!("sparse-exact-usage-{tag}"));
@@ -666,15 +671,27 @@ fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
             requests: u64::MAX,
             billable_requests: u64::MAX,
             models: vec![ModelTokens {
+                scale: 6,
                 model: model.into(),
                 usage_units: [
-                    ("input".into(), u64::MAX),
+                    ("input".into(), max_quantity),
                     ("tool_calls".into(), 17),
                     ("idle".into(), 0),
                 ]
                 .into(),
             }],
         };
+        // Quantity mantissas use the signed 64-bit store range; request counters stay unscaled.
+        let mut out_of_range = offered.clone();
+        out_of_range.models[0]
+            .usage_units
+            .insert("input".into(), max_quantity + 1);
+        assert!(store.put_usage("opaque", 60, &out_of_range).is_err());
+        assert_eq!(
+            store.get_usage("opaque", 60).unwrap(),
+            UsageLedger::default(),
+            "an out-of-range quantity leaves the ledger unchanged"
+        );
         store.put_usage("opaque", 60, &offered).unwrap();
         offered.models[0].usage_units.remove("idle");
         assert_eq!(store.get_usage("opaque", 60).unwrap(), offered);
@@ -685,6 +702,7 @@ fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
                 requests: -1,
                 billable_requests: -1,
                 models: vec![ModelTokensDelta {
+                    scale: 6,
                     model: model.into(),
                     usage_units: [
                         ("input".into(), -1),
@@ -700,7 +718,7 @@ fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
         offered.billable_requests -= 1;
         offered.models[0]
             .usage_units
-            .insert("input".into(), u64::MAX - 1);
+            .insert("input".into(), max_quantity - 1);
         offered.models[0]
             .usage_units
             .insert("tool_calls".into(), 16);

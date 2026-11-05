@@ -207,7 +207,7 @@ deny = [
 # explicit dependency-policy exceptions do not pre-authorize absent versions.
 skip = [
     { crate = "cpufeatures@0.2.17", reason = "busbar's own lock holds this duplicate" },
-    { crate = "cpufeatures@0.3.0", reason = "busbar's own lock holds this duplicate" },
+    { crate = "cpufeatures@0.3.1", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
     { crate = "getrandom@0.2.17", reason = "busbar's own lock holds this duplicate" },
     { crate = "getrandom@0.3.4", reason = "busbar's own lock holds this duplicate" },
     { crate = "getrandom@0.4.3", reason = "busbar's own lock holds this duplicate" },
@@ -217,8 +217,8 @@ skip = [
     { crate = "r-efi@6.0.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.10.1", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.6.4", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@2.0.117", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@3.0.3", reason = "busbar's own lock holds this duplicate" },
+    { crate = "syn@2.0.119", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
+    { crate = "syn@3.0.9", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
     { crate = "windows-sys@0.52.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "windows-sys@0.61.2", reason = "busbar's own lock holds this duplicate" },
 ]

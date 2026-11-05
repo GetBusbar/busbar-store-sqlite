@@ -20,6 +20,7 @@ const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
     &[busbar_contract::abi::sdk::door::abi_str("license_key")];
 
 busbar_contract::statement_extensions!(EXTENSIONS: [
+    ("busbar.store.count-scale", b"6"),
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
@@ -30,13 +31,18 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
 /// on the host's bounded disk lane, so this only caps the queue it feeds.
 pub const MAX_INFLIGHT: u32 = 64;
 
+/// The settings accepted by this plugin's lifecycle parser.
+const SETTINGS_SCHEMA: busbar_contract::abi::mechanism::call::Blob =
+    busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("settings.schema.json"));
+
 busbar_contract::store_door!(
     SqliteStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     MAX_INFLIGHT,
     extensions: EXTENSIONS,
-    secret_refs: SECRET_REFS
+    secret_refs: SECRET_REFS,
+    settings_schema: SETTINGS_SCHEMA
 );
 
 /// Construct a SQLite store from the settings the host passes through `open`:
@@ -110,14 +116,14 @@ impl Settings {
                 return Err(format!(
                     "{BAD}: `db_path` must not be empty or blank (omit it for the default \
                      `busbar-governance.db`, or name a file, or `:memory:`)"
-                ))
+                ));
             }
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) => {
                 return Err(format!(
                     "{BAD}: `db_path` must be a string, got {}",
                     json_type(other)
-                ))
+                ));
             }
         };
         let busy_timeout_ms = match v.get("busy_timeout_ms") {
@@ -144,13 +150,13 @@ impl Settings {
                 return Err(format!(
                     "{BAD}: `busy_timeout_ms` must be a whole number of milliseconds, got a \
                      fractional or exponent number"
-                ))
+                ));
             }
             Some(other) => {
                 return Err(format!(
                     "{BAD}: `busy_timeout_ms` must be an integer, got {}",
                     json_type(other)
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -175,3 +181,7 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 #[path = "door/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settings_schema_tests.rs"]
+mod settings_schema_tests;

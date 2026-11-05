@@ -106,6 +106,7 @@ fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
         requests,
         billable_requests: requests,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: model.to_string(),
             usage_units: [
                 (UNIT_INPUT.to_string(), input),
@@ -393,6 +394,7 @@ fn hard_delete_blocked_when_metering_rows_exist() {
     let s = SqliteStore::open_in_memory().unwrap();
     s.put_key(&sample_key("vk_billed", "g")).unwrap();
     s.add_metering(&MeteringDelta {
+        scale: 6,
         key_id: "vk_billed".to_string(),
         bucket: 20260101,
         model: "m".to_string(),
@@ -646,70 +648,47 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
     );
 }
 
-/// The public u64 counter range survives SQLite's signed-column mirror.
+/// Request counters keep their public u64 domain while quantities reject overflow.
 #[test]
-fn add_usage_saturates_at_u64_max_instead_of_erroring() {
+fn add_usage_preserves_full_width_requests_and_refuses_quantity_overflow() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut d = delta(i64::MAX, "m", i64::MAX, i64::MAX);
-    d.models[0]
-        .usage_units
-        .insert("custom".to_string(), i64::MAX);
+    d.models[0].usage_units.insert("custom".into(), i64::MAX);
     s.add_usage("vk_sat", 1, &d).unwrap();
+    let before = s.get_usage("vk_sat", 1).unwrap();
+    assert!(s.add_usage("vk_sat", 1, &d).is_err());
+    assert_eq!(s.get_usage("vk_sat", 1).unwrap(), before);
+    d.models.clear();
     s.add_usage("vk_sat", 1, &d).unwrap();
     s.add_usage("vk_sat", 1, &d).unwrap();
     let ledger = s.get_usage("vk_sat", 1).unwrap();
-    assert_eq!(ledger.requests, u64::MAX);
-    assert_eq!(ledger.billable_requests, u64::MAX);
-    let m = &ledger.models[0];
-    assert_eq!(m.tier(UNIT_INPUT), u64::MAX);
-    assert_eq!(m.tier(UNIT_OUTPUT), u64::MAX);
-    assert_eq!(m.tier("custom"), u64::MAX);
+    assert_eq!(
+        (ledger.requests, ledger.billable_requests),
+        (u64::MAX, u64::MAX)
+    );
+    assert_eq!(ledger.models[0].tier(UNIT_INPUT), i64::MAX as u64);
+    assert_eq!(ledger.models[0].tier("custom"), i64::MAX as u64);
 }
 
 #[test]
-fn add_metering_saturates_at_u64_max_instead_of_erroring() {
-    for v in [i64::MAX as u64, u64::MAX] {
-        let s = SqliteStore::open_in_memory().unwrap();
-        let d = MeteringDelta {
-            key_id: "vk_sat".to_string(),
-            bucket: 1,
-            model: "m".to_string(),
-            provider: "p".to_string(),
-            tokens_input: v,
-            tokens_output: v,
-            tokens_cache_read: v,
-            tokens_cache_write: v,
-            requests: v,
-            billable_requests: v,
-            key_group_at_use: String::new(),
-            pricing_version: String::new(),
-            priced_from_ms: 0,
-            usage_units: [("custom".to_string(), v)].into_iter().collect(),
-        };
-        s.add_metering(&d).unwrap();
-        s.add_metering(&d).unwrap();
-        s.add_metering(&d).unwrap();
-        let r = &s.list_metering(1).unwrap()[0];
-        let max = u64::MAX;
-        assert_eq!(
-            [
-                r.tokens_input,
-                r.tokens_output,
-                r.tokens_cache_read,
-                r.tokens_cache_write,
-                r.requests,
-                r.billable_requests
-            ],
-            [max; 6]
-        );
-        assert_eq!(r.usage_units["custom"], max);
-    }
+fn add_metering_refuses_quantity_overflow_without_changing_requests() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    let mut d = full_width_metering_delta();
+    d.tokens_input = i64::MAX as u64;
+    s.add_metering(&d).unwrap();
+    let before = s.list_metering(d.bucket).unwrap();
+    assert!(s.add_metering(&d).is_err());
+    assert_eq!(s.list_metering(d.bucket).unwrap(), before);
+    d.tokens_input = u64::MAX;
+    assert!(s.add_metering(&d).is_err());
+    assert_eq!(s.list_metering(d.bucket).unwrap(), before);
 }
 
 #[test]
 fn metering_accumulates_and_carries_group_and_pricing_attribution() {
     let s = SqliteStore::open_in_memory().unwrap();
     let d = MeteringDelta {
+        scale: 6,
         key_id: "vk_m".to_string(),
         bucket: 20260101,
         model: "gpt".to_string(),
@@ -745,6 +724,7 @@ fn metering_bucket_keys_preserve_the_full_unsigned_range_across_reopen() {
         let store = SqliteStore::open(path, 5000).unwrap();
         for bucket in buckets {
             let delta = MeteringDelta {
+                scale: 6,
                 key_id: format!("key-{bucket}"),
                 bucket,
                 model: "model".into(),
@@ -1228,6 +1208,7 @@ fn list_metering_reads_one_snapshot_while_a_writer_commits() {
         let (s, stop) = (s.clone(), stop.clone());
         std::thread::spawn(move || {
             let d = MeteringDelta {
+                scale: 6,
                 key_id: "k".into(),
                 bucket: 1,
                 model: "m".into(),
@@ -2896,6 +2877,7 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
                 requests: 1,
                 billable_requests: 1,
                 models: vec![ModelTokensDelta {
+                    scale: 6,
                     model: "rerank".into(),
                     usage_units: units(d),
                 }],
@@ -2918,6 +2900,7 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     assert_eq!(ledger.requests, 2);
 
     let mut model = ModelTokens {
+        scale: 6,
         model: "rerank".into(),
         ..Default::default()
     };
@@ -2943,6 +2926,7 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
 fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
     let s = SqliteStore::open_in_memory().unwrap();
     let d = |priced_from_ms: u64, tool_calls: u64| MeteringDelta {
+        scale: 6,
         key_id: "vk_m".into(),
         bucket: 20260101,
         model: "gpt".into(),
@@ -3077,6 +3061,7 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
     assert!(r.usage_units.is_empty());
 
     s.add_metering(&MeteringDelta {
+        scale: 6,
         key_id: "vk_live".into(),
         bucket: 1_699_920_000,
         model: "gpt-x".into(),
@@ -3966,6 +3951,7 @@ fn get_usage_omits_zero_count_open_units() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "rerank".into(),
             usage_units: [
                 ("search_units".to_string(), d),
@@ -4220,6 +4206,7 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
     let bucket = u64::MAX;
 
     let make = |group: &str, version: &str, n| MeteringDelta {
+        scale: 6,
         key_id: "history|key%".into(),
         bucket,
         model: "m|%".into(),
@@ -4357,6 +4344,7 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
     }
     let s = SqliteStore::open(path, 5000).unwrap();
     let d = MeteringDelta {
+        scale: 6,
         key_id: "history".into(),
         bucket: u64::MAX,
         model: "m".into(),
@@ -4780,10 +4768,8 @@ fn full_width_usage_and_first_seen_models_survive_reopen() {
     let expected = {
         let store = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
         for model in ["zeta", "alpha", "mid", "zeta"] {
-            let mut change = delta(i64::MAX, model, i64::MAX, i64::MAX);
-            change.models[0]
-                .usage_units
-                .insert("custom".into(), i64::MAX);
+            let mut change = delta(i64::MAX, model, 10, 10);
+            change.models[0].usage_units.insert("custom".into(), 11);
             store.add_usage("key", 1, &change).unwrap();
         }
         store.add_usage("key", 1, &delta(1, "zeta", 1, 1)).unwrap();
@@ -4798,14 +4784,14 @@ fn full_width_usage_and_first_seen_models_survive_reopen() {
                 .collect::<Vec<_>>(),
             ["zeta", "alpha", "mid"]
         );
-        assert_eq!(ledger.models[0].tier(UNIT_INPUT), u64::MAX);
-        assert_eq!(ledger.models[0].tier("custom"), u64::MAX - 1);
+        assert_eq!(ledger.models[0].tier(UNIT_INPUT), 21);
+        assert_eq!(ledger.models[0].tier("custom"), 22);
         store
             .add_usage("key", 1, &delta(i64::MIN, "zeta", i64::MIN, i64::MIN))
             .unwrap();
         let ledger = store.get_usage("key", 1).unwrap();
         assert_eq!(ledger.requests, i64::MAX as u64);
-        assert_eq!(ledger.models[0].tier(UNIT_INPUT), i64::MAX as u64);
+        assert_eq!(ledger.models[0].tier(UNIT_INPUT), 0);
         ledger
     };
     let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
@@ -4814,20 +4800,21 @@ fn full_width_usage_and_first_seen_models_survive_reopen() {
 
 fn full_width_metering_delta() -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: "key".into(),
         bucket: 1,
         model: "model".into(),
         provider: "provider".into(),
-        tokens_input: u64::MAX,
-        tokens_output: u64::MAX,
-        tokens_cache_read: u64::MAX,
-        tokens_cache_write: u64::MAX,
+        tokens_input: 10,
+        tokens_output: 10,
+        tokens_cache_read: 10,
+        tokens_cache_write: 10,
         requests: u64::MAX,
         billable_requests: u64::MAX,
         key_group_at_use: "group".into(),
         pricing_version: "version".into(),
         priced_from_ms: 17,
-        usage_units: [("custom".into(), u64::MAX)].into_iter().collect(),
+        usage_units: [("custom".into(), 11)].into_iter().collect(),
     }
 }
 
@@ -4860,9 +4847,9 @@ fn full_width_metering_promotes_legacy_cells_and_survives_reopen() {
                 row.tokens_cache_read,
                 row.tokens_cache_write
             ],
-            [u64::MAX; 6]
+            [u64::MAX, u64::MAX, 7_000_020, 20, 20, 20]
         );
-        assert_eq!(row.usage_units["custom"], u64::MAX);
+        assert_eq!(row.usage_units["custom"], 22);
         assert_eq!(
             (
                 &row.key_group_at_use,
@@ -5018,6 +5005,7 @@ fn the_record_store_states_and_serves_its_deduped_batches() {
     assert!(s.supports_metering_batch_deduped());
     let op = busbar_contract::abi::store::OpId::from_parts(9, 1);
     let d = MeteringDelta {
+        scale: 6,
         key_id: "vk_batch".into(),
         bucket: 86_400,
         model: "m".into(),
@@ -5183,3 +5171,6 @@ fn multi_statement_reads_begin_their_snapshot_before_the_first_read() {
         );
     }
 }
+
+#[path = "tests/exact_counts.rs"]
+mod exact_counts;

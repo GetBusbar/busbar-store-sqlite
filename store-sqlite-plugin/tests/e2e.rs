@@ -531,6 +531,7 @@ fn load_and_exercise_sqlite_plugin_via_file_drop() {
         requests: 5,
         billable_requests: 5,
         models: vec![ModelTokens {
+            scale: 6,
             model: "gpt-5".into(),
             usage_units: [(UNIT_INPUT.to_string(), 20), (UNIT_OUTPUT.to_string(), 8)]
                 .into_iter()

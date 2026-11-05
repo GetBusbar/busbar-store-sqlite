@@ -35,7 +35,11 @@ use crate::{
 };
 
 fn failed(e: RecordStoreError) -> OpRefused {
-    OpRefused::Failed(e.0)
+    if e.0.starts_with("exact count: ") {
+        OpRefused::Refused(e.0)
+    } else {
+        OpRefused::Failed(e.0)
+    }
 }
 
 /// A value the columns cannot hold: nothing applied, the host may split or re-send.
@@ -414,8 +418,25 @@ impl SqliteStore {
         request
             .validate()
             .map_err(|reason| OpRefused::Refused(reason.into()))?;
+        let dedupe = Dedupe::usage_correction(request);
+        let mut normalized_request = request.clone();
+        for row in &mut normalized_request.metering {
+            row.normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+        }
+        for change in &mut normalized_request.usage {
+            change
+                .expected
+                .normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+            change
+                .replacement
+                .normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+        }
+        let request = &normalized_request;
         let mut conflict = false;
-        let result = self.op(request.op_id, Dedupe::usage_correction(request), |tx| {
+        let result = self.op(request.op_id, dedupe, |tx| {
             let live = query_one(
                 tx,
                 "SELECT EXISTS(SELECT 1 FROM keys WHERE id=?1 AND deleted_at IS NULL)",

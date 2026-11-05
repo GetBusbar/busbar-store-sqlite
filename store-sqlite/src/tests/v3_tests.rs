@@ -30,6 +30,7 @@ fn delta(requests: i64, input: i64) -> UsageDelta {
         requests,
         billable_requests: requests,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".to_string(),
             usage_units: [("input".to_string(), input)].into_iter().collect(),
         }],
@@ -174,6 +175,7 @@ fn a_usage_batch_applies_its_cells_in_order() {
 fn a_metering_batch_replay_applies_once() {
     let s = fresh();
     let d = MeteringDelta {
+        scale: 6,
         key_id: "k".into(),
         bucket: 86_400,
         model: "m".into(),
@@ -483,7 +485,8 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     let cells = [("k", 60, delta(1, 1))];
     recorded(
         1,
-        r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta { model: "m", usage_units: {"input": 1} }] })]"#
+        r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta {
+            scale: 6, model: "m", usage_units: {"input": 1} }] })]"#
             .to_string(),
     );
     s.v3_add_usage_batch(op(1), &cells).expect("replay");
@@ -498,6 +501,7 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     );
 
     let d = MeteringDelta {
+        scale: 6,
         key_id: "k".into(),
         bucket: 86_400,
         model: "m".into(),
@@ -516,7 +520,8 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     let deltas = std::slice::from_ref(&d);
     recorded(
         2,
-        r#"add_metering_batch:[MeteringDelta { key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
+        r#"add_metering_batch:[MeteringDelta {
+            scale: 6, key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
             .to_string(),
     );
     s.v3_add_metering_batch(op(2), deltas).expect("replay");
@@ -578,6 +583,7 @@ fn values_the_columns_cannot_hold_are_refused_not_failed() {
         ));
     }
     let m = MeteringDelta {
+        scale: 6,
         key_id: "k".into(),
         bucket: 1,
         model: "m".into(),
@@ -693,6 +699,7 @@ fn a_usage_batch_whose_second_cell_fails_rolls_back_the_first() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".to_string(),
             usage_units: [("custom".to_string(), 1)].into_iter().collect(),
         }],
