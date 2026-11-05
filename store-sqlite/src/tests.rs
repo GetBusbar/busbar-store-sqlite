@@ -3896,7 +3896,7 @@ fn list_credentials_since_lists_an_unstamped_revision_zero_row() {
             .list_credentials_since(since)
             .unwrap()
             .into_iter()
-            .map(|c| c.meta.id)
+            .map(|c| c.meta.id.clone())
             .collect();
         assert_eq!(ids, vec!["cred_AKIA_R9".to_string()], "since {since}");
     }
@@ -4158,7 +4158,7 @@ fn unsigned_revision_cursors_never_wrap_and_unstamped_rows_remain_visible() {
             s.list_credentials_since(since)
                 .unwrap()
                 .into_iter()
-                .map(|c| c.meta.key_id)
+                .map(|c| c.meta.key_id.clone())
                 .collect::<Vec<_>>(),
             ["unstamped"]
         );
