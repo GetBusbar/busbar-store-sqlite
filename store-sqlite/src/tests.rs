@@ -3032,16 +3032,18 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
     let ledger = s.get_usage("vk_live", 1_700_000_000).unwrap();
     assert_eq!((ledger.requests, ledger.billable_requests), (7, 6));
     let gpt = ledger.models.iter().find(|m| m.model == "gpt-x").unwrap();
+    assert_eq!(gpt.scale, 6);
     assert_eq!(
         [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE].map(|u| gpt.tier(u)),
-        [100, 50, 10, 5],
-        "the reserved four stay in their columns and read back under their unit names"
+        [100_000_000, 50_000_000, 10_000_000, 5_000_000],
+        "the reserved four migrate from whole units to scale-6 mantissas"
     );
     assert_eq!(ledger.models.len(), 2);
 
     let rows = s.list_metering(1_699_920_000).unwrap();
     assert_eq!(rows.len(), 1);
     let r = &rows[0];
+    assert_eq!(r.scale, 6);
     assert_eq!(
         (
             r.tokens_input,
@@ -3049,7 +3051,7 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
             r.tokens_cache_read,
             r.tokens_cache_write
         ),
-        (100, 50, 10, 5)
+        (100_000_000, 50_000_000, 10_000_000, 5_000_000)
     );
     assert_eq!((r.requests, r.billable_requests), (7, 6));
     assert_eq!(r.key_group_at_use, "eng");
@@ -3078,7 +3080,13 @@ fn assert_the_common_fixture_rows_survived(s: &SqliteStore) {
         usage_units: Default::default(),
     })
     .unwrap();
-    assert_eq!(s.list_metering(1_699_920_000).unwrap()[0].tokens_input, 101);
+    let updated = s.list_metering(1_699_920_000).unwrap().remove(0);
+    assert_eq!(updated.scale, 6);
+    assert_eq!(
+        updated.tokens_input, 100_000_001,
+        "the scale-6 delta adds one micro-unit"
+    );
+    assert_eq!((updated.requests, updated.billable_requests), (8, 7));
     assert!(
         s.lock_writer()
             .execute("DELETE FROM keys WHERE id='vk_live'", [])
@@ -3233,6 +3241,7 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
                 ),
                 "{key_id}/{model}: requests"
             );
+            assert_eq!(r.scale, 6, "{key_id}/{model}: migrated scale");
             assert_eq!(
                 [
                     r.tokens_input,
@@ -3241,10 +3250,10 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
                     r.tokens_cache_write
                 ],
                 [
-                    recorded_u64(&w["tokens_input"]),
-                    recorded_u64(&w["tokens_output"]),
-                    recorded_u64(&w["tokens_cache_read"]),
-                    recorded_u64(&w["tokens_cache_write"]),
+                    recorded_u64(&w["tokens_input"]) * 1_000_000,
+                    recorded_u64(&w["tokens_output"]) * 1_000_000,
+                    recorded_u64(&w["tokens_cache_read"]) * 1_000_000,
+                    recorded_u64(&w["tokens_cache_write"]) * 1_000_000,
                 ],
                 "{key_id}/{model}: the four token columns"
             );
@@ -3327,15 +3336,19 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
                 .iter()
                 .find(|m| m.model == model)
                 .unwrap_or_else(|| panic!("{bucket_id}@{window_start}: no model {model}"));
+            assert_eq!(
+                m.scale, 6,
+                "{bucket_id}@{window_start}/{model}: migrated scale"
+            );
             let got =
                 [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE].map(|u| m.tier(u));
             assert_eq!(
                 got,
                 [
-                    recorded_u64(&w["tokens_input"]),
-                    recorded_u64(&w["tokens_output"]),
-                    recorded_u64(&w["tokens_cache_read"]),
-                    recorded_u64(&w["tokens_cache_write"]),
+                    recorded_u64(&w["tokens_input"]) * 1_000_000,
+                    recorded_u64(&w["tokens_output"]) * 1_000_000,
+                    recorded_u64(&w["tokens_cache_read"]) * 1_000_000,
+                    recorded_u64(&w["tokens_cache_write"]) * 1_000_000,
                 ],
                 "{bucket_id}@{window_start}/{model}: the reserved four read back under their unit names"
             );

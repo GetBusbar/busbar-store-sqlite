@@ -482,11 +482,15 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     // The bodies are the frozen spellings, not this build's `{:?}`: a contract change to a type's
     // Debug output would otherwise move the fixture and the comparator together and hide that
     // receipts already on disk no longer replay.
-    let cells = [("k", 60, delta(1, 1))];
+    let historical_delta = |requests, input| {
+        let mut d = delta(requests, input);
+        d.models[0].scale = 0;
+        d
+    };
+    let cells = [("k", 60, historical_delta(1, 1))];
     recorded(
         1,
-        r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta {
-            scale: 6, model: "m", usage_units: {"input": 1} }] })]"#
+        r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta { model: "m", usage_units: {"input": 1} }] })]"#
             .to_string(),
     );
     s.v3_add_usage_batch(op(1), &cells).expect("replay");
@@ -496,12 +500,12 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
         "the replay applied nothing"
     );
     assert_eq!(
-        s.v3_add_usage_batch(op(1), &[("k", 60, delta(2, 2))]),
+        s.v3_add_usage_batch(op(1), &[("k", 60, historical_delta(2, 2))]),
         Err(OpRefused::Conflict)
     );
 
     let d = MeteringDelta {
-        scale: 6,
+        scale: 0,
         key_id: "k".into(),
         bucket: 86_400,
         model: "m".into(),
@@ -520,8 +524,7 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     let deltas = std::slice::from_ref(&d);
     recorded(
         2,
-        r#"add_metering_batch:[MeteringDelta {
-            scale: 6, key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
+        r#"add_metering_batch:[MeteringDelta { key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
             .to_string(),
     );
     s.v3_add_metering_batch(op(2), deltas).expect("replay");
