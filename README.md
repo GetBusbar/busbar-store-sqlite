@@ -57,7 +57,7 @@ candidates leave the replay ledger unchanged. Generic multi-use token checks ret
 
 Opening a database written by an earlier release upgrades it in place,
 forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-v7 to the current schema v8). Keys and credentials retain their full-width unsigned
+v7/v8 to the current schema v9). Keys and credentials retain their full-width unsigned
 timestamps. An older signed expiry check could admit an expiry that
 precedes creation in unsigned order; such a row refuses the upgrade with
 its identity and decoded timestamps. The transaction leaves the schema,
@@ -66,12 +66,15 @@ reviewed before retrying.
 
 Schema v7 preserves each metering row’s recorded group and price version in its identity, including open units. Existing rows keep their recorded attribution; history already combined by an older writer cannot be reconstructed. An open-unit row without its parent refuses the transaction rather than guessing attribution. Stop older writers before upgrading; they cannot safely write the new metering keys.
 
-Schema v8 converts legacy whole-unit quantities to exact scale-6 micro-unit
-mantissas in both the quantity columns and JSON ledgers. Request counters
-remain unscaled. Quantities outside the supported range refuse the entire
-upgrade without changing the database. Reopening an upgraded database does
-not scale its quantities again. Older writers cannot safely write these
-quantity representations.
+Schema v9 stores nonnegative quantity mantissas through `i128::MAX` in exact
+scale-6 JSON ledgers. Signed SQLite INTEGER columns are bounded mirrors rebuilt
+from the exact post-state; they never limit the quantity or authorize a later
+accrual. Migration converts pre-v8 whole units in Rust before writing the exact
+ledger and its mirror, avoiding SQLite floating-point promotion. Existing v8
+micro-units are not scaled again. Request and billable-request counters remain
+unscaled `u64` values. Invalid or overflowing quantities refuse the entire
+transaction. Schema v9 prevents older SQLite plugin builds from opening a wide
+quantity database; there is no downgrade path.
 
 On a successful upgrade, keys, credentials, tombstones, usage and metering
 counts, the audit log and the denylist retain their data. A credential
@@ -132,9 +135,10 @@ below) in production.
 
 Any other setting is refused, naming the accepted ones, so a typo such as
 `dbpath` cannot quietly open the default file; a settings value that is not
-a JSON object (other than empty or `null`) is refused too. `license_key`, the
-secret-valued key a 1.5.5 sqlite config carried, is the one exception: it is
-accepted and ignored.
+a JSON object (other than empty or `null`) is refused too. The former ignored
+`license_key` setting has no SQLite behavior and is no longer accepted.
+Existing configurations must pass through the coordinated upgrade migration,
+which removes this obsolete setting before runtime settings validation.
 
 A `db_path`/`busy_timeout_ms` key that is *present* in the config but
 the wrong JSON type (a number for `db_path`, a string for

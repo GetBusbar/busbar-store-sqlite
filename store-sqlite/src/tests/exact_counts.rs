@@ -8,7 +8,7 @@ use busbar_contract::records::{
 };
 use std::collections::BTreeMap;
 
-fn delta(scale: u32, amount: i64, requests: i64) -> UsageDelta {
+fn delta(scale: u32, amount: i128, requests: i64) -> UsageDelta {
     UsageDelta {
         requests,
         billable_requests: requests,
@@ -23,7 +23,7 @@ fn delta(scale: u32, amount: i64, requests: i64) -> UsageDelta {
     }
 }
 
-fn meter(key: &str, scale: u32, amount: u64, requests: u64) -> MeteringDelta {
+fn meter(key: &str, scale: u32, amount: i128, requests: u64) -> MeteringDelta {
     MeteringDelta {
         scale,
         key_id: key.into(),
@@ -82,10 +82,7 @@ fn exercise(store: &dyn RecordStore, key: &str) {
     assert_eq!(got.usage_units["audio_seconds"], 2_123_456);
     let op = OpId::from_parts(0xe81, 3);
     assert!(store
-        .add_metering_batch_deduped(
-            op,
-            &[meter(key, 6, 1, 1), meter(key, 6, i64::MAX as u64, 1)]
-        )
+        .add_metering_batch_deduped(op, &[meter(key, 6, 1, 1), meter(key, 6, i128::MAX, 1)])
         .is_err());
     assert_eq!(
         store.list_metering(0).unwrap(),
@@ -102,7 +99,7 @@ fn exercise(store: &dyn RecordStore, key: &str) {
         models: vec![ModelTokens {
             scale: 6,
             model: "exact-model".into(),
-            usage_units: BTreeMap::from([("input".into(), i64::MAX as u64)]),
+            usage_units: BTreeMap::from([("input".into(), i128::MAX)]),
         }],
     };
     store.put_usage(key, 0, &max).unwrap();
@@ -163,7 +160,7 @@ fn exact_counts_legacy_migration_preflight_reopen_idempotent() {
     raw.execute_batch("PRAGMA user_version=7;
         INSERT INTO usage_windows(bucket_id,window_start,model,requests,billable_requests) VALUES('legacy',0,'',7,5);
         INSERT INTO usage_windows(bucket_id,window_start,model,tokens_input) VALUES('legacy',0,'exact-model',2);
-        INSERT INTO usage_window_units(bucket_id,window_start,model,unit,count) VALUES('legacy',0,'exact-model','audio_seconds',9223372036855);
+        INSERT INTO usage_window_units(bucket_id,window_start,model,unit,count) VALUES('legacy',0,'exact-model','audio_seconds',-1);
         INSERT INTO usage_metering(key_id,bucket,model,provider,tokens_input,requests) VALUES('legacy',0,'exact-model','provider',4,9);
         INSERT INTO usage_metering_units(key_id,bucket,model,provider,unit,count) VALUES('legacy',0,'exact-model','provider','audio_seconds',5);").unwrap();
     let legacy = serde_json::to_vec(&serde_json::json!({"requests":7,"billable_requests":5,"models":[{"model":"exact-model","usage_units":{"input":2,"audio_seconds":3}}]})).unwrap();
@@ -195,8 +192,8 @@ fn exact_counts_legacy_migration_preflight_reopen_idempotent() {
     raw.execute("UPDATE usage_window_units SET count=3", [])
         .unwrap();
     // The JSON authority is also checked before any SQL mirror is converted.
-    let too_large = serde_json::to_vec(&serde_json::json!({"requests":7,"billable_requests":5,
-        "models":[{"model":"exact-model","usage_units":{"input":9223372036855u64,"audio_seconds":3}}]})).unwrap();
+    // Whole-unit source JSON that cannot scale into i128 must fail before any effect.
+    let too_large = format!(r#"{{"requests":7,"billable_requests":5,"models":[{{"model":"exact-model","usage_units":{{"input":{},"audio_seconds":3}}}}]}}"#, i128::MAX).into_bytes();
     raw.execute(
         "UPDATE usage_window_exact SET ledger=?1",
         params![too_large],

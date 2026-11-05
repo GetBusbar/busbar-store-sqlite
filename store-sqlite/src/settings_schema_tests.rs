@@ -16,7 +16,8 @@ fn settings_schema_matches_lifecycle_shapes() {
         (r#"null"#, true),
         (r#"{"db_path":null,"busy_timeout_ms":null}"#, true),
         (r#"{"db_path":":memory:","busy_timeout_ms":0}"#, true),
-        (r#"{"busy_timeout_ms":2147483647,"license_key":[]}"#, true),
+        (r#"{"busy_timeout_ms":2147483647}"#, true),
+        (r#"{"license_key":[]}"#, false),
         (r#"{"db_path":" "}"#, false),
         (r#"{"db_path":1}"#, false),
         (r#"{"busy_timeout_ms":-1}"#, false),
@@ -55,13 +56,10 @@ fn settings_schema_defaults_match_parser() {
 }
 
 #[test]
-fn settings_schema_marks_secret_fields_without_defaults() {
+fn settings_schema_has_no_unused_license_setting() {
     let schema: serde_json::Value =
         serde_json::from_slice(include_bytes!("settings.schema.json")).unwrap();
-    let field = &schema["properties"]["license_key"];
-    assert_eq!(field["writeOnly"], true);
-    assert_eq!(field["x-busbar-secret"], true);
-    assert!(field.get("default").is_none());
+    assert!(schema["properties"].get("license_key").is_none());
 }
 
 #[test]

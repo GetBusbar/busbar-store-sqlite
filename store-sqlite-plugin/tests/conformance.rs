@@ -436,19 +436,15 @@ fn a_store_holding_a_foreign_row_does_not_compare_equal() {
     );
 }
 
-/// The store's Statement declares exactly its secret fields (`secret_refs`), never `*`: busbar
-/// resolves a secret reference only at a position the Statement declares secret and refuses one
-/// anywhere else (busbar #1699, ORACLE-SIGNOFF G14: each plugin declares its secret fields). The one
-/// secret-valued key a 1.5.5 sqlite config carried is `license_key` (busbar oracle BOOT-170: its
-/// unresolved reference refuses the boot with the 1.5.5 text); `db_path` and `busy_timeout_ms` are
-/// not secrets. The dropped-in library states the same Statement (the test above).
+/// SQLite uses no secret setting. The path can resolve a reference through its separate
+/// reference-field declaration, and the dropped-in door states the same metadata.
 #[test]
 fn the_statement_declares_exactly_its_secret_fields() {
     let stated = busbar_contract::abi::mechanism::rendering::read(
         &rendering_of_macro(MACRO_DOOR).expect("the door renders"),
     )
     .expect("the rendering reads back");
-    assert_eq!(stated.secret_refs, ["license_key".to_string()]);
+    assert!(stated.secret_refs.is_empty());
 }
 
 fn cleanup_ledger() -> busbar_contract::records::UsageLedger {
@@ -657,10 +653,9 @@ fn a_failed_usage_cleanup_rolls_back_both_tables_through_either_door() {
 
 #[test]
 fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
-    use busbar_contract::count::MAX_ACROSS_A_64_BIT_COLUMN;
     use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
 
-    let max_quantity = u64::try_from(MAX_ACROSS_A_64_BIT_COLUMN.micros()).unwrap();
+    let max_quantity = i128::MAX;
 
     for (by, tag) in [(Door::Linked, "linked"), (Door::Dropped, "dropped")] {
         let dir = scratch(&format!("sparse-exact-usage-{tag}"));
@@ -681,11 +676,11 @@ fn exact_usage_keeps_opaque_models_and_sparse_open_units_through_either_door() {
                 .into(),
             }],
         };
-        // Quantity mantissas use the signed 64-bit store range; request counters stay unscaled.
+        // Persisted quantities are nonnegative i128 mantissas; request counters stay unscaled.
         let mut out_of_range = offered.clone();
         out_of_range.models[0]
             .usage_units
-            .insert("input".into(), max_quantity + 1);
+            .insert("input".into(), -1);
         assert!(store.put_usage("opaque", 60, &out_of_range).is_err());
         assert_eq!(
             store.get_usage("opaque", 60).unwrap(),

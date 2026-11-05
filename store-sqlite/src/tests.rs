@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
+#[path = "tests/wide_counts.rs"]
+mod wide_counts;
+
 use super::*;
 use busbar_contract::records::{
     AuditRecord, ModelTokensDelta, PlaneRecord, RecordStore, ScopeRef, VirtualKey,
@@ -101,7 +104,7 @@ fn credential_updated_at_round_trips_as_its_own_value() {
     );
 }
 
-fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
+fn delta(requests: i64, model: &str, input: i128, output: i128) -> UsageDelta {
     UsageDelta {
         requests,
         billable_requests: requests,
@@ -652,8 +655,8 @@ fn add_usage_requests_stay_consistent_across_empty_then_populated_calls() {
 #[test]
 fn add_usage_preserves_full_width_requests_and_refuses_quantity_overflow() {
     let s = SqliteStore::open_in_memory().unwrap();
-    let mut d = delta(i64::MAX, "m", i64::MAX, i64::MAX);
-    d.models[0].usage_units.insert("custom".into(), i64::MAX);
+    let mut d = delta(i64::MAX, "m", i128::MAX, i128::MAX);
+    d.models[0].usage_units.insert("custom".into(), i128::MAX);
     s.add_usage("vk_sat", 1, &d).unwrap();
     let before = s.get_usage("vk_sat", 1).unwrap();
     assert!(s.add_usage("vk_sat", 1, &d).is_err());
@@ -666,20 +669,20 @@ fn add_usage_preserves_full_width_requests_and_refuses_quantity_overflow() {
         (ledger.requests, ledger.billable_requests),
         (u64::MAX, u64::MAX)
     );
-    assert_eq!(ledger.models[0].tier(UNIT_INPUT), i64::MAX as u64);
-    assert_eq!(ledger.models[0].tier("custom"), i64::MAX as u64);
+    assert_eq!(ledger.models[0].tier(UNIT_INPUT), i128::MAX);
+    assert_eq!(ledger.models[0].tier("custom"), i128::MAX);
 }
 
 #[test]
 fn add_metering_refuses_quantity_overflow_without_changing_requests() {
     let s = SqliteStore::open_in_memory().unwrap();
     let mut d = full_width_metering_delta();
-    d.tokens_input = i64::MAX as u64;
+    d.tokens_input = i128::MAX;
     s.add_metering(&d).unwrap();
     let before = s.list_metering(d.bucket).unwrap();
     assert!(s.add_metering(&d).is_err());
     assert_eq!(s.list_metering(d.bucket).unwrap(), before);
-    d.tokens_input = u64::MAX;
+    d.tokens_input = 1;
     assert!(s.add_metering(&d).is_err());
     assert_eq!(s.list_metering(d.bucket).unwrap(), before);
 }
@@ -1186,7 +1189,7 @@ fn get_usage_reads_one_snapshot_while_a_writer_commits() {
     while torn.is_none() && std::time::Instant::now() < deadline {
         let l = s.get_usage("vk_snap", 1).unwrap();
         let tokens = l.models.first().map_or(0, |m| m.tier(UNIT_INPUT));
-        if l.requests != tokens {
+        if i128::from(l.requests) != tokens {
             torn = Some((l.requests, tokens));
         }
     }
@@ -2866,10 +2869,10 @@ fn the_1_6_attribution_fields_round_trip() {
 #[test]
 fn open_usage_units_accumulate_and_overwrite_with_their_window() {
     let s = SqliteStore::open_in_memory().unwrap();
-    let units = |pairs: &[(&str, i64)]| -> std::collections::BTreeMap<String, i64> {
+    let units = |pairs: &[(&str, i128)]| -> std::collections::BTreeMap<String, i128> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     };
-    let add = |d: &[(&str, i64)]| {
+    let add = |d: &[(&str, i128)]| {
         s.add_usage(
             "vk_u",
             100,
@@ -2925,7 +2928,7 @@ fn open_usage_units_accumulate_and_overwrite_with_their_window() {
 #[test]
 fn metering_cells_split_on_priced_from_and_carry_their_open_classes() {
     let s = SqliteStore::open_in_memory().unwrap();
-    let d = |priced_from_ms: u64, tool_calls: u64| MeteringDelta {
+    let d = |priced_from_ms: u64, tool_calls: i128| MeteringDelta {
         scale: 6,
         key_id: "vk_m".into(),
         bucket: 20260101,
@@ -3250,10 +3253,10 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
                     r.tokens_cache_write
                 ],
                 [
-                    recorded_u64(&w["tokens_input"]) * 1_000_000,
-                    recorded_u64(&w["tokens_output"]) * 1_000_000,
-                    recorded_u64(&w["tokens_cache_read"]) * 1_000_000,
-                    recorded_u64(&w["tokens_cache_write"]) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_input"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_output"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_cache_read"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_cache_write"])) * 1_000_000,
                 ],
                 "{key_id}/{model}: the four token columns"
             );
@@ -3345,10 +3348,10 @@ fn assert_the_1_5_5_rows_read_back(s: &SqliteStore, rows: &serde_json::Value) ->
             assert_eq!(
                 got,
                 [
-                    recorded_u64(&w["tokens_input"]) * 1_000_000,
-                    recorded_u64(&w["tokens_output"]) * 1_000_000,
-                    recorded_u64(&w["tokens_cache_read"]) * 1_000_000,
-                    recorded_u64(&w["tokens_cache_write"]) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_input"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_output"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_cache_read"])) * 1_000_000,
+                    i128::from(recorded_u64(&w["tokens_cache_write"])) * 1_000_000,
                 ],
                 "{bucket_id}@{window_start}/{model}: the reserved four read back under their unit names"
             );
@@ -3960,7 +3963,7 @@ fn deleting_a_task_deletes_its_event_chain() {
 #[test]
 fn get_usage_omits_zero_count_open_units() {
     let s = SqliteStore::open_in_memory().unwrap();
-    let delta = |d: i64| UsageDelta {
+    let delta = |d: i128| UsageDelta {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
@@ -4285,7 +4288,13 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
                 (n + 3) * repeats
             )
         );
-        assert_eq!((r.requests, r.billable_requests), (repeats, repeats));
+        assert_eq!(
+            (r.requests, r.billable_requests),
+            (
+                u64::try_from(repeats).unwrap(),
+                u64::try_from(repeats).unwrap()
+            )
+        );
         assert_eq!(r.usage_units.get("tool_calls"), Some(&((n + 4) * repeats)));
     }
 }
@@ -4345,15 +4354,15 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
         );
         assert_eq!(
             (old.tokens_input, old.priced_from_ms),
-            (7, 9007199254740993)
+            (7_000_000, 9007199254740993)
         );
-        assert_eq!(old.usage_units.get("tool_calls"), Some(&11));
+        assert_eq!(old.usage_units.get("tool_calls"), Some(&11_000_000));
         let unknown = rows.iter().find(|r| r.key_id == "unknown").unwrap();
         assert_eq!(
             (&*unknown.key_group_at_use, &*unknown.pricing_version),
             ("", "")
         );
-        assert_eq!(unknown.usage_units.get("tool_calls"), Some(&5));
+        assert_eq!(unknown.usage_units.get("tool_calls"), Some(&5_000_000));
     }
     let s = SqliteStore::open(path, 5000).unwrap();
     let d = MeteringDelta {
@@ -4380,8 +4389,8 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
         .iter()
         .find(|r| r.key_group_at_use == "old|group")
         .unwrap();
-    assert_eq!(old.tokens_input, 7);
-    assert_eq!(old.usage_units.get("tool_calls"), Some(&11));
+    assert_eq!(old.tokens_input, 7_000_000);
+    assert_eq!(old.usage_units.get("tool_calls"), Some(&11_000_000));
 }
 
 #[test]
@@ -4800,7 +4809,11 @@ fn full_width_usage_and_first_seen_models_survive_reopen() {
         assert_eq!(ledger.models[0].tier(UNIT_INPUT), 21);
         assert_eq!(ledger.models[0].tier("custom"), 22);
         store
-            .add_usage("key", 1, &delta(i64::MIN, "zeta", i64::MIN, i64::MIN))
+            .add_usage(
+                "key",
+                1,
+                &delta(i64::MIN, "zeta", i128::from(i64::MIN), i128::from(i64::MIN)),
+            )
             .unwrap();
         let ledger = store.get_usage("key", 1).unwrap();
         assert_eq!(ledger.requests, i64::MAX as u64);
@@ -4852,15 +4865,15 @@ fn full_width_metering_promotes_legacy_cells_and_survives_reopen() {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(
-            [
+            (
                 row.requests,
                 row.billable_requests,
                 row.tokens_input,
                 row.tokens_output,
                 row.tokens_cache_read,
                 row.tokens_cache_write
-            ],
-            [u64::MAX, u64::MAX, 7_000_020, 20, 20, 20]
+            ),
+            (u64::MAX, u64::MAX, 7_000_020, 20, 20, 20)
         );
         assert_eq!(row.usage_units["custom"], 22);
         assert_eq!(
@@ -5187,3 +5200,90 @@ fn multi_statement_reads_begin_their_snapshot_before_the_first_read() {
 
 #[path = "tests/exact_counts.rs"]
 mod exact_counts;
+
+/// SQLite decodes query keys and values before acting on them. Store-side safety and
+/// precreation decisions must use the same options, including when only part is escaped.
+#[test]
+fn encoded_uri_options_preserve_locking_and_missing_file_refusals() {
+    let dir = tempdir();
+    for (index, param) in [
+        "%63ache=shared",
+        "cache=%73hared",
+        "%6eolock=1",
+        "nolock=%31",
+        "%69mmutable=1",
+        "immutable=%31",
+        "%76fs=unix-none",
+        "vfs=unix%2dnone",
+        "cache%00ignored=shared",
+        "cache=shared%00ignored",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let missing = dir.join(format!("unsafe-{index}.db"));
+        let result = SqliteStore::open(&format!("file:{}?{param}", missing.display()), 5000);
+        assert!(result.is_err(), "{param}: unsafe URI must fail before open");
+        assert!(!missing.exists(), "{param}: refused URI created a file");
+    }
+    for (index, param) in ["%6dode=rw", "mode=%72w", "%6dode=ro", "mode=%72o"]
+        .iter()
+        .enumerate()
+    {
+        let missing = dir.join(format!("missing-{index}.db"));
+        assert!(
+            SqliteStore::open(&format!("file:{}?{param}", missing.display()), 5000).is_err(),
+            "{param}: SQLite must refuse the missing file"
+        );
+        assert!(!missing.exists(), "{param}: the store precreated the file");
+    }
+}
+
+#[test]
+fn encoded_uri_options_keep_memory_routing_and_private_file_creation() {
+    for uri in [
+        "file:%3amemory%3a",
+        "file:test?%6dode=memory",
+        "file:test?mode=%6demory",
+        "file:test?%6dode=%6demory&cache=shared",
+    ] {
+        let store = SqliteStore::open(uri, 5000).expect("decoded memory URI");
+        assert!(store.readers.is_empty(), "{uri}: one memory connection");
+        assert_eq!(store.path(), ":memory:");
+        store.put_key(&sample_key("encoded-memory", "g")).unwrap();
+        assert!(store.get_key("encoded-memory").unwrap().is_some());
+    }
+    let dir = tempdir();
+    let path = dir.join("encoded-private.db");
+    let store = SqliteStore::open(
+        &format!(
+            "file:{}?%6dode=%72wc&cache=%70rivate&nolock=%30",
+            path.display()
+        ),
+        5000,
+    )
+    .expect("safe decoded options");
+    store.put_key(&sample_key("encoded-file", "g")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    drop(store);
+    let reopened = SqliteStore::open(path.to_str().unwrap(), 5000).unwrap();
+    assert!(reopened.get_key("encoded-file").unwrap().is_some());
+}
+
+#[test]
+fn uri_query_components_decode_without_reinterpreting_separators_or_plus() {
+    assert_eq!(
+        uri_parameters("file:test?custom=a%26cache%3dshared%2b+&mode=rwc#ignored").unwrap(),
+        vec![
+            ("custom".into(), "a&cache=shared++".into()),
+            ("mode".into(), "rwc".into()),
+        ]
+    );
+}

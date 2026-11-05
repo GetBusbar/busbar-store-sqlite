@@ -25,7 +25,7 @@ fn op(n: u64) -> OpId {
     OpId::from_parts(7, n)
 }
 
-fn delta(requests: i64, input: i64) -> UsageDelta {
+fn delta(requests: i64, input: i128) -> UsageDelta {
     UsageDelta {
         requests,
         billable_requests: requests,
@@ -465,10 +465,10 @@ fn a_replayed_plane_record_append_applies_once_and_a_fork_fails_unrecorded() {
     );
 }
 
-/// A body an older build recorded (`slot:{:?}`) still dedupes after the upgrade, inside the
-/// retention window: the same op replays and applies nothing, a different op conflicts.
+/// Superseded development Debug receipts are not current hash receipts: they conflict
+/// without changing usage, metering, plane records or the recorded receipt.
 #[test]
-fn an_older_builds_recorded_body_replays_across_the_upgrade() {
+fn debug_receipts_conflict_without_writes() {
     let s = fresh();
     let recorded = |n: u64, body: String| {
         s.lock_writer()
@@ -478,26 +478,40 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
                 params![op(n).0.as_slice(), body, now_secs()],
             )
             .expect("record");
+        s.lock_writer()
+            .query_row(
+                "SELECT body, answer, recorded_at FROM store_ops WHERE op_id=?1",
+                params![op(n).0.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
     };
-    // The bodies are the frozen spellings, not this build's `{:?}`: a contract change to a type's
-    // Debug output would otherwise move the fixture and the comparator together and hide that
-    // receipts already on disk no longer replay.
+    // Retain the historical spellings as rejection cases; never regenerate them from Debug.
     let historical_delta = |requests, input| {
         let mut d = delta(requests, input);
         d.models[0].scale = 0;
         d
     };
     let cells = [("k", 60, historical_delta(1, 1))];
-    recorded(
+    let receipt_1 = recorded(
         1,
         r#"add_usage_batch:[("k", 60, UsageDelta { requests: 1, billable_requests: 1, models: [ModelTokensDelta { model: "m", usage_units: {"input": 1} }] })]"#
             .to_string(),
     );
-    s.v3_add_usage_batch(op(1), &cells).expect("replay");
+    assert_eq!(
+        s.v3_add_usage_batch(op(1), &cells),
+        Err(OpRefused::Conflict)
+    );
     assert_eq!(
         RecordStore::get_usage(&s, "k", 60).expect("read").requests,
         0,
-        "the replay applied nothing"
+        "the conflict applied nothing"
     );
     assert_eq!(
         s.v3_add_usage_batch(op(1), &[("k", 60, historical_delta(2, 2))]),
@@ -522,12 +536,15 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
         usage_units: Default::default(),
     };
     let deltas = std::slice::from_ref(&d);
-    recorded(
+    let receipt_2 = recorded(
         2,
         r#"add_metering_batch:[MeteringDelta { key_id: "k", bucket: 86400, model: "m", provider: "p", tokens_input: 3, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 2, billable_requests: 2, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {} }]"#
             .to_string(),
     );
-    s.v3_add_metering_batch(op(2), deltas).expect("replay");
+    assert_eq!(
+        s.v3_add_metering_batch(op(2), deltas),
+        Err(OpRefused::Conflict)
+    );
     assert!(RecordStore::list_metering(&s, 86_400)
         .expect("list")
         .is_empty());
@@ -545,13 +562,15 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
         disposition: busbar_contract::records::PlaneDisposition::Active,
         body,
     };
-    recorded(
+    let receipt_3 = recorded(
         3,
         r#"append_plane_record:PlaneRecordRef { kind: "task_event", id: "e1", parent: Some("t1"), seq: 1, ts: 5, disposition: Active, body: [123, 125] }"#
             .to_string(),
     );
-    s.v3_append_plane_record_op(op(3), rec(b"{}"))
-        .expect("replay");
+    assert_eq!(
+        s.v3_append_plane_record_op(op(3), rec(b"{}")),
+        Err(OpRefused::Conflict)
+    );
     assert_eq!(
         s.v3_append_plane_record_op(op(3), rec(b"{\"x\":1}")),
         Err(OpRefused::Conflict)
@@ -563,6 +582,14 @@ fn an_older_builds_recorded_body_replays_across_the_upgrade() {
     )
     .expect("list")
     .is_empty());
+    let receipts: Vec<(String, String, i64)> = query_all(
+        &s.lock_writer(),
+        "SELECT body, answer, recorded_at FROM store_ops ORDER BY op_id",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap();
+    assert_eq!(receipts, vec![receipt_1, receipt_2, receipt_3]);
 }
 
 /// A value the columns cannot hold is REFUSED (the host may re-send), not Failed (replayed forever),

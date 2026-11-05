@@ -58,11 +58,11 @@ fn on_file() -> (SqliteStore, String, crate::tests::TempDir) {
 }
 
 fn ledger(count: u64) -> UsageLedger {
-    ledger_parts(count, count)
+    ledger_parts(count, i128::from(count))
 }
 
 /// Request width and quantity width are independent: these fixtures state both explicitly.
-fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
+fn ledger_parts(requests: u64, quantity: i128) -> UsageLedger {
     UsageLedger {
         requests,
         billable_requests: requests,
@@ -173,7 +173,7 @@ fn absent_insert_all_rows_high_u64_and_receipt_replay_survive_restart() {
     let (store, path, _dir) = on_file();
     store.add_metering(&metering(KEY)).unwrap();
     let mut request = candidate(&store, 1);
-    request.usage[0].replacement = ledger_parts(u64::MAX, i64::MAX as u64);
+    request.usage[0].replacement = ledger_parts(u64::MAX, i128::from(i64::MAX));
     request.usage.push(UsageChange {
         address: UsageAddress {
             bucket_id: correction::ADJUST_UP_BUCKET.into(),
@@ -321,13 +321,13 @@ fn ordinary_put_add_and_unsigned_purge_share_the_exact_row_authority() {
         .put_usage(
             BUCKET,
             high_window,
-            &ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1),
+            &ledger_parts(u64::MAX - 1, i128::from(i64::MAX) - 1),
         )
         .unwrap();
     store.add_usage(BUCKET, high_window, &delta()).unwrap();
     assert_eq!(
         store.get_usage(BUCKET, high_window).unwrap(),
-        ledger_parts(u64::MAX, i64::MAX as u64)
+        ledger_parts(u64::MAX, i128::from(i64::MAX))
     );
     let mut refund = delta();
     refund.requests = -1;
@@ -340,7 +340,7 @@ fn ordinary_put_add_and_unsigned_purge_share_the_exact_row_authority() {
         .unwrap();
     assert_eq!(
         store.get_usage(BUCKET, high_window).unwrap(),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::from(i64::MAX) - 1)
     );
     store.put_usage(BUCKET, high_window, &ledger(31)).unwrap();
     assert_eq!(store.get_usage(BUCKET, high_window).unwrap(), ledger(31));
@@ -619,14 +619,14 @@ fn two_correction_writers_compare_under_the_same_sqlite_authority() {
 #[test]
 fn empty_model_totals_and_units_roundtrip_through_put_add_and_correction() {
     let (store, path, _dir) = on_file();
-    let mut expected = ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1);
+    let mut expected = ledger_parts(u64::MAX - 1, i128::from(i64::MAX) - 1);
     expected.models[0].model.clear();
     store.put_usage(BUCKET, WINDOW, &expected).unwrap();
     assert_eq!(store.get_usage(BUCKET, WINDOW).unwrap(), expected);
     let mut increment = delta();
     increment.models[0].model.clear();
     store.add_usage(BUCKET, WINDOW, &increment).unwrap();
-    expected = ledger_parts(u64::MAX, i64::MAX as u64);
+    expected = ledger_parts(u64::MAX, i128::from(i64::MAX));
     expected.models[0].model.clear();
     assert_eq!(store.get_usage(BUCKET, WINDOW).unwrap(), expected);
     let mut request = candidate(&store, 1);
@@ -687,7 +687,7 @@ fn legacy_sentinel_empty_model_units_survive_read_and_first_exact_add() {
 #[test]
 fn zero_open_units_stay_sparse_in_exact_rows_and_correction_replays() {
     let (store, path, _dir) = on_file();
-    let mut offered = ledger_parts(u64::MAX, i64::MAX as u64);
+    let mut offered = ledger_parts(u64::MAX, i128::from(i64::MAX));
     offered.models[0].model = "future.model/v7:\u{1e}opaque%|空".into();
     offered.models[0].usage_units.insert("idle".into(), 0);
     offered.models[0].usage_units.insert(UNIT_OUTPUT.into(), 0);

@@ -63,8 +63,10 @@ const TASK_EVENT_RECORD_KIND: &str = "task_event";
 /// - Metering cells and their units are keyed by the recorded group and price version.
 ///
 /// v8 converts quantity columns and exact JSON ledgers to checked micro-units in one
-/// transaction. Request counters remain unscaled. A file stamped by a later build is refused.
-const SCHEMA_VERSION: i64 = 8;
+/// transaction. Request counters remain unscaled. v9 promotes every row into exact i128 JSON
+/// authority and rebuilds signed INTEGER mirrors from that authority. The version fences older
+/// writers/readers from wide quantities. A file stamped by a later build is refused.
+const SCHEMA_VERSION: i64 = 9;
 
 macro_rules! unsigned_expiry_order {
     () => {
@@ -388,22 +390,59 @@ fn file_path_of(path: &str) -> Option<String> {
     String::from_utf8(decoded).ok().filter(|p| !p.is_empty())
 }
 
+/// Decode URI query components before interpreting options, just as SQLite does. Split the
+/// raw query first so escaped `&` and `=` remain inside their component; `+` stays literal.
+/// NUL cannot be safely represented in SQLite's zero-terminated option list, so refuse it.
+fn uri_parameters(path: &str) -> RecordStoreResult<Vec<(String, String)>> {
+    let Some(uri) = path.strip_prefix("file:") else {
+        return Ok(Vec::new());
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let Some((_, query)) = uri.split_once('?') else {
+        return Ok(Vec::new());
+    };
+    let decode = |part: &str| -> RecordStoreResult<String> {
+        let bytes = part.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let hex = |offset| bytes.get(offset).and_then(|b| char::from(*b).to_digit(16));
+            match (bytes[i], hex(i + 1), hex(i + 2)) {
+                (b'%', Some(high), Some(low)) => {
+                    decoded.push((high * 16 + low) as u8);
+                    i += 3;
+                }
+                (byte, _, _) => {
+                    decoded.push(byte);
+                    i += 1;
+                }
+            }
+        }
+        if decoded.contains(&0) {
+            return Err(RecordStoreError(
+                "sqlite: db_path URI query contains a NUL byte".into(),
+            ));
+        }
+        String::from_utf8(decoded)
+            .map_err(|_| RecordStoreError("sqlite: db_path URI query is not valid UTF-8".into()))
+    };
+    query
+        .split('&')
+        .map(|param| {
+            let (key, value) = param.split_once('=').unwrap_or((param, ""));
+            Ok((decode(key)?, decode(value)?))
+        })
+        .collect()
+}
+
 /// Refuse a file-backed `file:` URI parameter that breaks the one-writer + reader-pool design:
 /// `cache=shared` puts every connection in one table-locked cache (readers fail `SQLITE_LOCKED`
 /// under the writer, which no busy timeout covers), `nolock` (and `vfs=unix-none`, the same thing as
 /// a VFS) drops the file locks that keep two processes from interleaving writes, and `immutable`
 /// lets a reader miss committed writes.
 fn refuse_unsafe_uri(path: &str) -> RecordStoreResult<()> {
-    let Some(uri) = path.strip_prefix("file:") else {
-        return Ok(());
-    };
-    let uri = uri.split('#').next().unwrap_or_default();
-    let Some((_, query)) = uri.split_once('?') else {
-        return Ok(());
-    };
-    for param in query.split('&') {
-        let (key, value) = param.split_once('=').unwrap_or((param, ""));
-        let unsafe_param = match key {
+    for (key, value) in uri_parameters(path)? {
+        let unsafe_param = match key.as_str() {
             "cache" => value.eq_ignore_ascii_case("shared"),
             "vfs" => value == "unix-none",
             "nolock" | "immutable" => !matches!(
@@ -414,7 +453,7 @@ fn refuse_unsafe_uri(path: &str) -> RecordStoreResult<()> {
         };
         if unsafe_param {
             return Err(RecordStoreError(format!(
-                "sqlite: db_path URI parameter `{param}` is not supported: it breaks the store's \
+                "sqlite: db_path URI parameter `{key}={value}` is not supported: it breaks the store's \
                  single-writer locking; use a plain file path"
             )));
         }
@@ -430,12 +469,16 @@ fn is_memory_path(path: &str) -> bool {
     if path == ":memory:" {
         return true;
     }
-    let Some(uri) = path.strip_prefix("file:") else {
+    if !path.starts_with("file:") {
+        return false;
+    }
+    let Ok(parameters) = uri_parameters(path) else {
         return false;
     };
-    let uri = uri.split('#').next().unwrap_or_default();
-    let (file, query) = uri.split_once('?').unwrap_or((uri, ""));
-    file == ":memory:" || query.split('&').any(|param| param == "mode=memory")
+    file_path_of(path).as_deref() == Some(":memory:")
+        || parameters
+            .iter()
+            .any(|(key, value)| key == "mode" && value == "memory")
 }
 
 /// Apply the fixed pragma set, `busy_timeout` FIRST (switching a file into WAL itself briefly
@@ -564,16 +607,13 @@ pub struct SqliteStore {
 #[cfg(unix)]
 fn create_private(path: &str) {
     use std::os::unix::fs::OpenOptionsExt;
-    let mode = path
-        .strip_prefix("file:")
-        .and_then(|uri| uri.split('#').next())
-        .and_then(|uri| uri.split_once('?'))
-        .and_then(|(_, query)| {
-            query
-                .split('&')
-                .rev()
-                .find_map(|param| param.strip_prefix("mode="))
-        });
+    let Ok(parameters) = uri_parameters(path) else {
+        return;
+    };
+    let mode = parameters
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == "mode").then_some(value.as_str()));
     if mode.is_some_and(|mode| mode != "rwc") {
         return;
     }
@@ -844,8 +884,8 @@ impl SqliteStore {
                 "sqlite: schema migration left a foreign key violation in '{table}'; refusing to open"
             )));
         }
-        if version < 8 {
-            migrate_exact_counts(&tx)?;
+        if version < 9 {
+            migrate_exact_counts(&tx, version)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .store()?;
@@ -866,23 +906,15 @@ impl SqliteStore {
     }
 }
 
-/// `col + delta` in SQL, saturating at `i64::MAX` (a REAL result would be refused by STRICT INTEGER).
-macro_rules! sat_add {
-    ($col:literal, $delta:literal) => {
-        concat!(
-            "CASE WHEN ",
-            $delta,
-            " > 0 AND ",
-            $col,
-            " > 9223372036854775807 - ",
-            $delta,
-            " THEN 9223372036854775807 ELSE ",
-            $col,
-            " + ",
-            $delta,
-            " END"
-        )
-    };
+/// A nonnegative exact quantity projected into its signed INTEGER mirror. The JSON row is
+/// authoritative; this lossy projection must never be used as the next accrual's pre-state.
+fn quantity_mirror(value: i128) -> i64 {
+    value.clamp(0, i128::from(i64::MAX)) as i64
+}
+
+/// Existing signed mirrors contain nonnegative quantities; request counters use their own codec.
+fn quantity_column(value: i64) -> i128 {
+    i128::from(column::read_u64(value))
 }
 
 /// The four RESERVED usage units, in the order of the `usage_windows` token columns that hold them.
@@ -1221,10 +1253,13 @@ const CRED_SECRET_COLS: &str = "id,key_id,kind,slot,public_id,secret_form,create
 const RESERVED_USAGE_REFUSAL: &str =
     "sqlite: reserved adjustment rows require atomic usage correction";
 
-/// Convert both physical representations only after every legacy quantity has passed
-/// the signed micro-unit range check. The enclosing transaction includes user_version.
-fn migrate_exact_counts(tx: &Connection) -> RecordStoreResult<()> {
-    let tables = [
+/// Promote all old quantities into exact JSON authority before projecting signed mirrors.
+/// Old SQL quantities are whole units before v8; v8 mirrors already hold micro-units. JSON
+/// authority carries its own scale discriminator. No multiplication runs in SQLite INTEGER
+/// arithmetic, which could promote an overflow to an imprecise REAL. The enclosing transaction
+/// includes every promotion and the v9 fence, so any invalid source row rolls back the upgrade.
+fn migrate_exact_counts(tx: &Connection, source_version: i64) -> RecordStoreResult<()> {
+    for (table, columns) in [
         (
             "usage_windows",
             &[
@@ -1245,11 +1280,10 @@ fn migrate_exact_counts(tx: &Connection) -> RecordStoreResult<()> {
             ][..],
         ),
         ("usage_metering_units", &["count"][..]),
-    ];
-    for (table, columns) in tables {
+    ] {
         let predicate = columns
             .iter()
-            .map(|column| format!("{column} < 0 OR {column} > 9223372036854"))
+            .map(|column| format!("{column} < 0"))
             .collect::<Vec<_>>()
             .join(" OR ");
         let invalid: bool = tx
@@ -1261,86 +1295,58 @@ fn migrate_exact_counts(tx: &Connection) -> RecordStoreResult<()> {
             .store()?;
         if invalid {
             return Err(RecordStoreError(format!(
-                "exact count migration: {table} contains a quantity outside the scale-6 range; nothing converted"
+                "exact count migration: {table} contains a negative quantity; nothing converted"
             )));
         }
     }
-    let mut usage = Vec::new();
-    for (window, bucket, bytes) in query_all(
+    let windows: Vec<(i64, String)> = query_all(
         tx,
-        "SELECT window_start,bucket_id,ledger FROM usage_window_exact",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        },
-    )? {
-        let mut ledger: UsageLedger =
-            serde_json::from_slice(&bytes).map_err(|e| RecordStoreError(e.to_string()))?;
+        "SELECT window_start,bucket_id FROM usage_windows UNION          SELECT window_start,bucket_id FROM usage_window_units UNION          SELECT window_start,bucket_id FROM usage_window_exact",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    for (window, bucket) in windows {
+        let bytes: Option<Vec<u8>> = query_one(
+            tx,
+            "SELECT ledger FROM usage_window_exact WHERE window_start=?1 AND bucket_id=?2",
+            params![window, bucket],
+            |row| row.get(0),
+        )?;
+        let mut ledger: UsageLedger = if let Some(bytes) = bytes {
+            serde_json::from_slice(&bytes).map_err(|e| RecordStoreError(e.to_string()))?
+        } else {
+            let mut ledger = usage_columns_in(tx, &bucket, window as u64)?;
+            if source_version < 8 {
+                for model in &mut ledger.models {
+                    model.scale = 0;
+                }
+            }
+            ledger
+        };
         ledger
             .normalize_scale6()
             .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
-        usage.push((
-            window,
-            bucket,
-            serde_json::to_vec(&ledger).map_err(|e| RecordStoreError(e.to_string()))?,
-        ));
+        put_usage_in(tx, &bucket, window as u64, &ledger)?;
     }
-    let mut metering = Vec::new();
-    for (bucket, key, provider, model, priced, group, version, bytes) in query_all(
+    let buckets: Vec<String> = query_all(
         tx,
-        "SELECT bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,ledger FROM usage_metering_exact",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-            ))
-        },
-    )? {
-        let mut ledger: MeteringRow =
-            serde_json::from_slice(&bytes).map_err(|e| RecordStoreError(e.to_string()))?;
-        ledger
-            .normalize_scale6()
-            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
-        metering.push((
-            bucket,
-            key,
-            provider,
-            model,
-            priced,
-            group,
-            version,
-            serde_json::to_vec(&ledger).map_err(|e| RecordStoreError(e.to_string()))?,
-        ));
-    }
-    for (table, columns) in tables {
-        let assignments = columns
-            .iter()
-            .map(|column| format!("{column} = {column} * 1000000"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tx.execute_batch(&format!("UPDATE {table} SET {assignments}"))
-            .store()?;
-    }
-    for (window, bucket, bytes) in usage {
-        tx.execute(
-            "UPDATE usage_window_exact SET ledger=?3 WHERE window_start=?1 AND bucket_id=?2",
-            params![window, bucket, bytes],
-        )
-        .store()?;
-    }
-    for (bucket, key, provider, model, priced, group, version, bytes) in metering {
-        tx.execute("UPDATE usage_metering_exact SET ledger=?8 WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7", params![bucket,key,provider,model,priced,group,version,bytes]).store()?;
+        "SELECT bucket FROM usage_metering UNION SELECT bucket FROM usage_metering_units          UNION SELECT bucket FROM usage_metering_exact",
+        [], |row| row.get(0),
+    )?;
+    for bucket in buckets {
+        let bucket = bucket.parse::<i64>().map_err(|_| {
+            RecordStoreError(
+                "exact count migration: invalid metering bucket; nothing converted".into(),
+            )
+        })? as u64;
+        let rows = metering_in(tx, bucket)?;
+        for mut row in rows {
+            if source_version < 8 && metering_exact_bytes(tx, bucket, &row)?.is_none() {
+                row.scale = 0;
+            }
+            row.normalize_scale6()
+                .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+            put_metering_in(tx, bucket, &row)?;
+        }
     }
     Ok(())
 }
@@ -1364,12 +1370,15 @@ fn usage_in(
         params![window_start as i64, bucket_id],
         |row| row.get::<_, Vec<u8>>(0),
     )? {
-        let mut ledger = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut ledger: UsageLedger = serde_json::from_slice(&bytes).map_err(|error| {
             RecordStoreError(format!(
                 "sqlite: exact usage ledger of bucket '{bucket_id}' window {window_start} is \
                  unreadable: {error}"
             ))
         })?;
+        ledger
+            .normalize_scale6()
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
         omit_zero_open_units(&mut ledger);
         return Ok(ledger);
     }
@@ -1400,7 +1409,7 @@ fn usage_columns_in(
         |r| {
             let mut units = BTreeMap::new();
             for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                let v = column::read_u64(r.get(i + 1)?);
+                let v = quantity_column(r.get(i + 1)?);
 
                 if v != 0 {
                     units.insert(unit.to_string(), v);
@@ -1422,7 +1431,7 @@ fn usage_columns_in(
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                column::read_u64(r.get(2)?),
+                quantity_column(r.get(2)?),
             ))
         },
     )?;
@@ -1505,10 +1514,10 @@ fn put_usage_in(
                 window_start as i64,
                 bucket_id,
                 m.model,
-                column::clamp(m.tier(UNIT_INPUT)),
-                column::clamp(m.tier(UNIT_OUTPUT)),
-                column::clamp(m.tier(UNIT_CACHE_READ)),
-                column::clamp(m.tier(UNIT_CACHE_WRITE)),
+                quantity_mirror(m.tier(UNIT_INPUT)),
+                quantity_mirror(m.tier(UNIT_OUTPUT)),
+                quantity_mirror(m.tier(UNIT_CACHE_READ)),
+                quantity_mirror(m.tier(UNIT_CACHE_WRITE)),
             ],
         )?;
         for (unit, count) in open_units(&m.usage_units) {
@@ -1521,7 +1530,7 @@ fn put_usage_in(
                     bucket_id,
                     m.model,
                     unit,
-                    column::clamp(*count)
+                    quantity_mirror(*count)
                 ],
             )?;
         }
@@ -1574,7 +1583,7 @@ fn verify_usage_in(
         .sort_by(|left, right| left.model.cmp(&right.model));
     for model in &mut mirror.models {
         for count in model.usage_units.values_mut() {
-            *count = column::clamp(*count) as u64;
+            *count = i128::from(quantity_mirror(*count));
         }
         model.usage_units.retain(|_, count| *count != 0);
     }
@@ -1617,11 +1626,14 @@ fn metering_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<Metering
         params![(bucket as i64).to_string()],
         |row| row.get::<_, Vec<u8>>(0),
     )? {
-        let exact: MeteringRow = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut exact: MeteringRow = serde_json::from_slice(&bytes).map_err(|error| {
             RecordStoreError(format!(
                 "sqlite: an exact metering cell of bucket {bucket} is unreadable: {error}"
             ))
         })?;
+        exact
+            .normalize_scale6()
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
         let Some(&i) = index.get(&cell_key(&exact)) else {
             return Err(RecordStoreError(format!(
                 "sqlite: exact metering cell of key '{}' model '{}' in bucket {bucket} has no \
@@ -1649,10 +1661,10 @@ fn metering_columns_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<
                 key_id: r.get(0)?,
                 model: r.get(1)?,
                 provider: r.get(2)?,
-                tokens_input: u(r.get(3)?),
-                tokens_output: u(r.get(4)?),
-                tokens_cache_read: u(r.get(5)?),
-                tokens_cache_write: u(r.get(6)?),
+                tokens_input: quantity_column(r.get(3)?),
+                tokens_output: quantity_column(r.get(4)?),
+                tokens_cache_read: quantity_column(r.get(5)?),
+                tokens_cache_write: quantity_column(r.get(6)?),
                 requests: u(r.get(7)?),
                 billable_requests: u(r.get(8)?),
                 key_group_at_use: r.get(9)?,
@@ -1678,7 +1690,7 @@ fn metering_columns_in(conn: &Connection, bucket: u64) -> RecordStoreResult<Vec<
                     r.get::<_, String>(5)?,
                 ),
                 r.get::<_, String>(6)?,
-                u(r.get(7)?),
+                quantity_column(r.get(7)?),
             ))
         },
     )?;
@@ -1731,10 +1743,10 @@ fn metering_cell_in(
         |r| {
             Ok(MeteringRow {
                 scale: 6,
-                tokens_input: u(r.get(0)?),
-                tokens_output: u(r.get(1)?),
-                tokens_cache_read: u(r.get(2)?),
-                tokens_cache_write: u(r.get(3)?),
+                tokens_input: quantity_column(r.get(0)?),
+                tokens_output: quantity_column(r.get(1)?),
+                tokens_cache_read: quantity_column(r.get(2)?),
+                tokens_cache_write: quantity_column(r.get(3)?),
                 requests: u(r.get(4)?),
                 billable_requests: u(r.get(5)?),
                 ..cell.clone()
@@ -1749,7 +1761,7 @@ fn metering_cell_in(
         "SELECT unit, count FROM usage_metering_units WHERE bucket=?1 AND key_id=?2 AND provider=?3
              AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
         at,
-        |r| Ok((r.get::<_, String>(0)?, u(r.get(1)?))),
+        |r| Ok((r.get::<_, String>(0)?, quantity_column(r.get(1)?))),
     )? {
         row.usage_units.insert(unit, count);
     }
@@ -1804,21 +1816,7 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
         priced_from_ms: d.priced_from_ms,
         usage_units: Default::default(),
     };
-    let persisted: Option<Vec<u8>> = query_one(
-        tx,
-        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1 AND key_id=?2 AND provider=?3
-         AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
-        params![
-            (d.bucket as i64).to_string(),
-            d.key_id,
-            d.provider,
-            d.model,
-            priced_from,
-            d.key_group_at_use,
-            d.pricing_version
-        ],
-        |row| row.get(0),
-    )?;
+    let persisted = metering_exact_bytes(tx, d.bucket, &exact)?;
     if let Some(bytes) = persisted {
         exact = serde_json::from_slice(&bytes).map_err(|error| {
             RecordStoreError(format!(
@@ -1833,76 +1831,90 @@ fn add_metering_in(tx: &Connection, d: &MeteringDelta) -> RecordStoreResult<()> 
     exact
         .checked_add_delta(d)
         .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+    put_metering_in(tx, d.bucket, &exact)
+}
+
+fn metering_exact_bytes(
+    conn: &Connection,
+    bucket: u64,
+    cell: &MeteringRow,
+) -> RecordStoreResult<Option<Vec<u8>>> {
+    query_one(
+        conn,
+        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1 AND key_id=?2 AND provider=?3          AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        params![(bucket as i64).to_string(), cell.key_id, cell.provider, cell.model,
+            column::storable_i64("metering", "priced_from_ms", cell.priced_from_ms)?,
+            cell.key_group_at_use, cell.pricing_version],
+        |row| row.get(0),
+    )
+}
+
+/// Replace the exact cell and every mirror from the same checked post-state. Re-adding a
+/// delta to an already clamped mirror would produce the wrong value after a later refund.
+fn put_metering_in(tx: &Connection, bucket: u64, row: &MeteringRow) -> RecordStoreResult<()> {
+    let mut exact = row.clone();
+    exact
+        .normalize_scale6()
+        .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+    let priced_from = column::storable_i64("metering", "priced_from_ms", exact.priced_from_ms)?;
     exec(
         tx,
-        concat!("INSERT INTO usage_metering (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version,
-             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, requests, billable_requests)
+        "INSERT INTO usage_metering (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,
+         tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,requests,billable_requests)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-         ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version) DO UPDATE SET
-             tokens_input       = ", sat_add!("tokens_input", "excluded.tokens_input"), ",
-             tokens_output      = ", sat_add!("tokens_output", "excluded.tokens_output"), ",
-             tokens_cache_read  = ", sat_add!("tokens_cache_read", "excluded.tokens_cache_read"), ",
-             tokens_cache_write = ", sat_add!("tokens_cache_write", "excluded.tokens_cache_write"), ",
-             requests           = ", sat_add!("requests", "excluded.requests"), ",
-             billable_requests  = ", sat_add!("billable_requests", "excluded.billable_requests")),
-        params![
-            d.bucket as i64,
-            d.key_id,
-            d.provider,
-            d.model,
-            priced_from,
-            d.key_group_at_use,
-            d.pricing_version,
-            column::clamp(d.tokens_input),
-            column::clamp(d.tokens_output),
-            column::clamp(d.tokens_cache_read),
-            column::clamp(d.tokens_cache_write),
-            column::clamp(d.requests),
-            column::clamp(d.billable_requests),
-        ],
+         ON CONFLICT(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version) DO UPDATE SET
+         tokens_input=excluded.tokens_input,tokens_output=excluded.tokens_output,
+         tokens_cache_read=excluded.tokens_cache_read,tokens_cache_write=excluded.tokens_cache_write,
+         requests=excluded.requests,billable_requests=excluded.billable_requests",
+        params![(bucket as i64).to_string(), exact.key_id, exact.provider, exact.model, priced_from,
+            exact.key_group_at_use, exact.pricing_version,
+            quantity_mirror(exact.tokens_input), quantity_mirror(exact.tokens_output),
+            quantity_mirror(exact.tokens_cache_read), quantity_mirror(exact.tokens_cache_write),
+            column::clamp(exact.requests), column::clamp(exact.billable_requests)],
     )?;
-    for (unit, count) in &d.usage_units {
-        exec(
-            tx,
-            concat!("INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit) DO UPDATE SET
-                 count = ", sat_add!("count", "excluded.count")),
-            params![
-                d.bucket as i64,
-                d.key_id,
-                d.provider,
-                d.model,
-                priced_from,
-                d.key_group_at_use,
-                d.pricing_version,
-                unit,
-                column::clamp(*count),
-            ],
+    exec(tx,
+        "DELETE FROM usage_metering_units WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4          AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        params![(bucket as i64).to_string(), exact.key_id, exact.provider, exact.model, priced_from,
+            exact.key_group_at_use, exact.pricing_version],
+    )?;
+    for (unit, count) in &exact.usage_units {
+        exec(tx,
+            "INSERT INTO usage_metering_units (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,unit,count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![(bucket as i64).to_string(), exact.key_id, exact.provider, exact.model, priced_from,
+                exact.key_group_at_use, exact.pricing_version, unit, quantity_mirror(*count)],
         )?;
     }
     let bytes = serde_json::to_vec(&exact).map_err(|error| RecordStoreError(error.to_string()))?;
-    if exec(
-        tx,
-        "INSERT INTO usage_metering_exact
-        (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,ledger)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-        ON CONFLICT(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version)
-        DO UPDATE SET ledger=excluded.ledger",
-        params![
-            (d.bucket as i64).to_string(),
-            d.key_id,
-            d.provider,
-            d.model,
-            priced_from,
-            d.key_group_at_use,
-            d.pricing_version,
-            bytes
-        ],
-    )? != 1
+    if exec(tx,
+        "INSERT INTO usage_metering_exact (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,ledger)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version)
+         DO UPDATE SET ledger=excluded.ledger",
+        params![(bucket as i64).to_string(), exact.key_id, exact.provider, exact.model, priced_from,
+            exact.key_group_at_use, exact.pricing_version, bytes],
+    )? != 1 {
+        return Err(RecordStoreError("sqlite: exact metering cell was not written".into()));
+    }
+    let mut mirror = exact.clone();
+    mirror.tokens_input = i128::from(quantity_mirror(exact.tokens_input));
+    mirror.tokens_output = i128::from(quantity_mirror(exact.tokens_output));
+    mirror.tokens_cache_read = i128::from(quantity_mirror(exact.tokens_cache_read));
+    mirror.tokens_cache_write = i128::from(quantity_mirror(exact.tokens_cache_write));
+    mirror.requests = column::clamp(exact.requests) as u64;
+    mirror.billable_requests = column::clamp(exact.billable_requests) as u64;
+    for count in mirror.usage_units.values_mut() {
+        *count = i128::from(quantity_mirror(*count));
+    }
+    // The column reader starts with the supplied identity and its open map. Clear that map
+    // so only persisted unit rows determine the verification result.
+    let mut identity = mirror.clone();
+    identity.usage_units.clear();
+    if metering_exact_bytes(tx, bucket, &exact)?.as_ref() != Some(&bytes)
+        || metering_cell_in(tx, bucket, priced_from, &identity)? != Some(mirror)
     {
         return Err(RecordStoreError(
-            "sqlite: exact metering cell was not written".into(),
+            "sqlite: exact metering replacement was not applied".into(),
         ));
     }
     Ok(())

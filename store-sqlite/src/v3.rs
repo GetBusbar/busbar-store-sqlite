@@ -526,7 +526,11 @@ impl StoreSlots for SqliteStore {
         crate::door::Settings::parse(settings_str(settings)?).map(drop)
     }
 
-    fn open(settings: &[u8], _host: Option<Host>) -> Result<Self, String> {
+    fn open_with_secrets(
+        settings: &[u8],
+        _secrets: &[&[u8]],
+        _host: Option<Host>,
+    ) -> Result<Self, String> {
         crate::door::open(settings_str(settings)?)
     }
 

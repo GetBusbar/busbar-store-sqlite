@@ -11,16 +11,9 @@ use crate::SqliteStore;
 /// The store's name, as its Statement states it and its signed manifest names it.
 pub const NAME: &str = "busbar-store-sqlite";
 
-/// The settings paths this store declares may hold a secret reference (`secret_refs`): `license_key`,
-/// the one secret-valued key a 1.5.5 sqlite config carried (busbar oracle BOOT-170). `db_path` and
-/// `busy_timeout_ms` are not secrets. busbar resolves a reference only where the Statement declares
-/// one and refuses it anywhere else (G14: each plugin declares its secret fields), so the store names
-/// its field rather than `*`.
-const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
-    &[busbar_contract::abi::sdk::door::abi_str("license_key")];
-
 busbar_contract::statement_extensions!(EXTENSIONS: [
     ("busbar.store.count-scale", b"6"),
+    ("busbar.store.count-range", b"i128"),
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
@@ -41,9 +34,30 @@ busbar_contract::store_door!(
     env!("CARGO_PKG_VERSION"),
     MAX_INFLIGHT,
     extensions: EXTENSIONS,
-    secret_refs: SECRET_REFS,
-    settings_schema: SETTINGS_SCHEMA
+    settings_schema: SETTINGS_SCHEMA,
+    migrate: busbar_contract::abi::sdk::migrate::Migrator<SettingsMigration>
 );
+
+/// One-shot settings conversion runs before secret resolution, without opening a store.
+struct SettingsMigration;
+
+impl busbar_contract::abi::sdk::migrate::Migrate for SettingsMigration {
+    fn migrate(
+        mut settings: serde_json::Value,
+        _from: &str,
+    ) -> busbar_contract::abi::sdk::migrate::Migrated {
+        let removed = settings
+            .as_object_mut()
+            .is_some_and(|object| object.remove("license_key").is_some());
+        let mut migrated = busbar_contract::abi::sdk::migrate::Migrated::unchanged(settings);
+        if removed {
+            migrated
+                .report
+                .push("Removed obsolete license_key; SQLite does not use this setting.".into());
+        }
+        migrated
+    }
+}
 
 /// Construct a SQLite store from the settings the host passes through `open`:
 ///
@@ -74,7 +88,7 @@ pub struct Settings {
 }
 
 /// Every top-level setting the parser accepts; any other key is refused, naming these.
-const ACCEPTED: [&str; 3] = ["db_path", "busy_timeout_ms", "license_key"];
+const ACCEPTED: [&str; 2] = ["db_path", "busy_timeout_ms"];
 
 impl Settings {
     /// Parse the section's JSON exactly as [`open`] reads it.

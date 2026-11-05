@@ -26,11 +26,6 @@
       "default": 5000,
       "description": "Busy timeout in milliseconds. Omitted or null uses 5000. Fractional or exponent JSON number spellings are refused by the parser.",
       "x-busbar-integer-token": "signed"
-    },
-    "license_key": {
-      "writeOnly": true,
-      "description": "Accepted and ignored for compatibility, with any JSON value. Secret references may be supplied here. This describes lifecycle parsing; the host validates secret-reference syntax and resolves material separately.",
-      "x-busbar-secret": true
     }
   },
   "x-busbar-settings-profile": "integer-token-v1"

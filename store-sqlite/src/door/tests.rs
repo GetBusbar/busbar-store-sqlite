@@ -295,7 +295,7 @@ fn an_unknown_setting_is_refused() {
     let err = expect_err(open(r#"{"db_path": ":memory:", "dbpath": "x"}"#));
     assert_eq!(
         err,
-        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms, license_key)"
+        "invalid sqlite plugin config: unknown setting `dbpath` (accepted: db_path, busy_timeout_ms)"
     );
 }
 
@@ -334,16 +334,14 @@ fn a_non_object_top_level_is_refused_naming_only_its_type() {
     assert!(Settings::parse("  ").is_ok());
 }
 
-/// The Statement declares `license_key` a secret ref, so the parser accepts and ignores it.
+/// The runtime accepts only settings it uses; old ignored fields belong to config migration.
 #[test]
-fn license_key_is_accepted_and_ignored() {
+fn license_key_is_rejected_as_an_unknown_setting() {
     use super::Settings;
-    let s = Settings::parse(r#"{"db_path":":memory:","license_key":"x"}"#).unwrap();
-    assert_eq!(s.db_path, ":memory:");
-    let err = Settings::parse(r#"{"x":1}"#).unwrap_err();
-    assert!(
-        err.contains("(accepted: db_path, busy_timeout_ms, license_key)"),
-        "{err}"
+    let err = Settings::parse(r#"{"db_path":":memory:","license_key":"x"}"#).unwrap_err();
+    assert_eq!(
+        err,
+        "invalid sqlite plugin config: unknown setting `license_key` (accepted: db_path, busy_timeout_ms)"
     );
 }
 
