@@ -1237,7 +1237,7 @@ fn list_metering_reads_one_snapshot_while_a_writer_commits() {
     while torn.is_none() && std::time::Instant::now() < deadline {
         if let Some(r) = s.list_metering(1).unwrap().first() {
             let u = r.usage_units.get("u").copied().unwrap_or(0);
-            if r.requests != u {
+            if i128::from(r.requests) != u {
                 torn = Some((r.requests, u));
             }
         }

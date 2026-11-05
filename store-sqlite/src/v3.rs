@@ -110,7 +110,7 @@ impl SqliteStore {
     fn op(
         &self,
         op: OpId,
-        dedupe: Dedupe<'_>,
+        dedupe: Dedupe,
         apply: impl FnOnce(&Transaction<'_>) -> RecordStoreResult<()>,
     ) -> OpResult<()> {
         let mut refusal = None;
