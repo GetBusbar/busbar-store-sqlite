@@ -7,7 +7,6 @@ First-party signed kind:store plugin cdylib: the SQLite governance store package
 |---|---|---|---|---|
 | `store` | `sqlite` | `busbar-store-sqlite-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
-[![ci](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-sqlite/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
 ## What it is for
