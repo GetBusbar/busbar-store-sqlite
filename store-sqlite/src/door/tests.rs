@@ -350,13 +350,20 @@ fn license_key_is_rejected_as_an_unknown_setting() {
 #[test]
 fn a_wrongly_typed_setting_names_types_never_the_value() {
     use super::Settings;
-    for cfg in [
-        r#"{"db_path": 987654321}"#,
-        r#"{"db_path": ["s3cr3t-value"]}"#,
-        r#"{"busy_timeout_ms": "s3cr3t-value"}"#,
-        r#"{"busy_timeout_ms": 1.5}"#,
+    for (cfg, named) in [
+        (r#"{"db_path": 987654321}"#, "`db_path` must be a string, got a number"),
+        (r#"{"db_path": ["s3cr3t-value"]}"#, "`db_path` must be a string, got an array"),
+        (
+            r#"{"busy_timeout_ms": "s3cr3t-value"}"#,
+            "`busy_timeout_ms` must be an integer, got a string",
+        ),
+        (
+            r#"{"busy_timeout_ms": 1.5}"#,
+            "`busy_timeout_ms` must be a whole number of milliseconds, got a fractional or exponent number",
+        ),
     ] {
         let err = Settings::parse(cfg).unwrap_err();
+        assert_eq!(err, format!("invalid sqlite plugin config: {named}"), "{cfg}");
         assert!(
             !err.contains("987654321") && !err.contains("s3cr3t-value") && !err.contains("1.5"),
             "{err}"

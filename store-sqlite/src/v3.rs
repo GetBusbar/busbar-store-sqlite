@@ -234,7 +234,7 @@ impl SqliteStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
-        self.write(false, |tx| put_record_in(tx, schema, key, value))
+        self.write(true, |tx| put_record_in(tx, schema, key, value))
             .map_err(|e| e.0)
     }
 

@@ -151,6 +151,55 @@ macro_rules! keys_ddl {
     };
 }
 
+/// The `usage_metering` table, under `$head` (`IF NOT EXISTS usage_metering` in [`SCHEMA`], the
+/// scratch name in the v17 rebuild), so the two cannot drift.
+macro_rules! metering_ddl {
+    ($head:literal) => {
+        concat!(
+            "CREATE TABLE ",
+            $head,
+            " (
+    bucket             TEXT NOT NULL,
+    key_id             TEXT NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    key_group_at_use   TEXT NOT NULL DEFAULT '',
+    pricing_version    TEXT NOT NULL DEFAULT '',
+    requests           INTEGER NOT NULL DEFAULT 0,
+    billable_requests  INTEGER NOT NULL DEFAULT 0,
+    tokens_input       INTEGER NOT NULL DEFAULT 0,
+    tokens_output      INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
+) STRICT, WITHOUT ROWID;"
+        )
+    };
+}
+
+/// The `usage_metering_units` table, under `$head`, shared by [`SCHEMA`] and the v17 rebuild.
+macro_rules! metering_units_ddl {
+    ($head:literal) => {
+        concat!(
+            "CREATE TABLE ",
+            $head,
+            " (
+    bucket         TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    priced_from_ms INTEGER NOT NULL DEFAULT 0,
+    key_group_at_use TEXT NOT NULL DEFAULT '',
+    pricing_version TEXT NOT NULL DEFAULT '',
+    unit           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)
+) STRICT, WITHOUT ROWID;"
+        )
+    };
+}
+
 const SCHEMA: &str = concat!("
 CREATE TABLE IF NOT EXISTS store_meta (
     k TEXT NOT NULL PRIMARY KEY,
@@ -166,7 +215,6 @@ CREATE TABLE IF NOT EXISTS store_revision (
     keys_ddl!("IF NOT EXISTS keys"),
     "
 CREATE INDEX IF NOT EXISTS keys_revision_idx ON keys (revision);
-CREATE INDEX IF NOT EXISTS keys_group_live_idx ON keys (key_group) WHERE deleted_at IS NULL;
 
 -- Only for auth verified by ROW LOOKUP from a wire-supplied public identifier (today: sigv4).
 ",
@@ -199,22 +247,9 @@ CREATE TABLE IF NOT EXISTS usage_windows (
 
 -- Durable billing ledger. `priced_from_ms` is the start of the rate-card entry the cell accrued
 -- under (0 = the opening card): a card edit mid-day splits the day's cell.
-CREATE TABLE IF NOT EXISTS usage_metering (
-    bucket             TEXT NOT NULL,
-    key_id             TEXT NOT NULL,
-    provider           TEXT NOT NULL,
-    model              TEXT NOT NULL,
-    key_group_at_use   TEXT NOT NULL DEFAULT '',
-    pricing_version    TEXT NOT NULL DEFAULT '',
-    requests           INTEGER NOT NULL DEFAULT 0,
-    billable_requests  INTEGER NOT NULL DEFAULT 0,
-    tokens_input       INTEGER NOT NULL DEFAULT 0,
-    tokens_output      INTEGER NOT NULL DEFAULT 0,
-    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
-    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
-    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
-) STRICT, WITHOUT ROWID;
+",
+    metering_ddl!("IF NOT EXISTS usage_metering"),
+    "
 CREATE INDEX IF NOT EXISTS um_key_bucket_idx ON usage_metering (key_id, bucket);
 
 -- Whole exact raw rows. The legacy INTEGER tables remain the low-count mirror; every writer
@@ -251,18 +286,9 @@ CREATE TABLE IF NOT EXISTS usage_window_units (
     PRIMARY KEY (window_start, bucket_id, model, unit)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS usage_metering_units (
-    bucket         TEXT NOT NULL,
-    key_id         TEXT NOT NULL,
-    provider       TEXT NOT NULL,
-    model          TEXT NOT NULL,
-    priced_from_ms INTEGER NOT NULL DEFAULT 0,
-    key_group_at_use TEXT NOT NULL DEFAULT '',
-    pricing_version TEXT NOT NULL DEFAULT '',
-    unit           TEXT NOT NULL,
-    count          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)
-) STRICT, WITHOUT ROWID;
+",
+    metering_units_ddl!("IF NOT EXISTS usage_metering_units"),
+    "
 
 CREATE TABLE IF NOT EXISTS audit_log (
     seq       INTEGER PRIMARY KEY,
@@ -274,7 +300,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_hash TEXT NOT NULL,
     hash      TEXT NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS audit_resource_seq_idx ON audit_log (resource, seq);
 
 -- Every plane's durable records, tagged by `kind`. The store never decodes `body`; everything it
 -- keys, orders or sweeps on is a typed sidecar column. `identity` is the record's `parent` when it
@@ -352,12 +377,13 @@ fn sqlite_unixepoch(conn: &Connection) -> RecordStoreResult<i64> {
         .store()
 }
 
-/// The filesystem path a file-backed `db_path` names: the path itself, or the percent-decoded path
-/// of a `file:` URI (whose authority, as SQLite requires, is empty or `localhost`). `None` for a URI
-/// SQLite itself refuses or that names no file; SQLite then reports it on open.
-fn file_path_of(path: &str) -> Option<String> {
+/// The filesystem path a file-backed `db_path` names, as bytes: the path itself, or the
+/// percent-decoded path of a `file:` URI (whose authority, as SQLite requires, is empty or
+/// `localhost`). Like SQLite, a decoded `%00` ends the path and the decoded bytes need not be UTF-8.
+/// `None` for a URI SQLite itself refuses or that names no file; SQLite then reports it on open.
+fn file_path_of(path: &str) -> Option<Vec<u8>> {
     let Some(uri) = path.strip_prefix("file:") else {
-        return Some(path.to_string());
+        return Some(path.as_bytes().to_vec());
     };
     let uri = uri.split('#').next().unwrap_or_default();
     let file = uri.split_once('?').map_or(uri, |(file, _)| file);
@@ -377,6 +403,7 @@ fn file_path_of(path: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(0), Some(0)) => break,
             (b'%', Some(high), Some(low)) => {
                 decoded.push((high * 16 + low) as u8);
                 i += 3;
@@ -387,7 +414,7 @@ fn file_path_of(path: &str) -> Option<String> {
             }
         }
     }
-    String::from_utf8(decoded).ok().filter(|p| !p.is_empty())
+    Some(decoded).filter(|p| !p.is_empty())
 }
 
 /// Decode URI query components before interpreting options, just as SQLite does. Split the
@@ -462,9 +489,10 @@ fn refuse_unsafe_uri(path: &str) -> RecordStoreResult<()> {
 }
 
 /// True for any SQLite path spelling that opens a private in-memory database: `:memory:`, or a
-/// `file:` URI whose path is `:memory:` or whose query carries `mode=memory`. A path that merely
-/// contains those characters elsewhere is a real file. Pragma selection and `SqliteStore::open`'s
-/// single-connection routing both use this one check.
+/// `file:` URI whose path is `:memory:` or whose last `mode` is `memory` (SQLite applies options in
+/// order, so a later `mode` overrides an earlier one). A path that merely contains those characters
+/// elsewhere is a real file. Pragma selection and `SqliteStore::open`'s single-connection routing
+/// both use this one check.
 fn is_memory_path(path: &str) -> bool {
     if path == ":memory:" {
         return true;
@@ -475,10 +503,16 @@ fn is_memory_path(path: &str) -> bool {
     let Ok(parameters) = uri_parameters(path) else {
         return false;
     };
-    file_path_of(path).as_deref() == Some(":memory:")
-        || parameters
-            .iter()
-            .any(|(key, value)| key == "mode" && value == "memory")
+    file_path_of(path).as_deref() == Some(":memory:".as_bytes())
+        || uri_mode(&parameters) == Some("memory")
+}
+
+/// The `mode` a `file:` URI's decoded options leave in force: the last one, as SQLite reads them.
+fn uri_mode(parameters: &[(String, String)]) -> Option<&str> {
+    parameters
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == "mode").then_some(value.as_str()))
 }
 
 /// Apply the fixed pragma set, `busy_timeout` FIRST (switching a file into WAL itself briefly
@@ -524,8 +558,8 @@ fn apply_pragmas(
 
     // No mmap on a path that looks like a network filesystem (best effort, not an fs-type probe);
     // a `file:` URI is judged by the file it names, so `file:///var/x.db` keeps mmap.
-    let file = file_path_of(path).unwrap_or_else(|| path.to_string());
-    let mmap = if file.contains("//") && !file.starts_with(':') {
+    let file = file_path_of(path).unwrap_or_else(|| path.as_bytes().to_vec());
+    let mmap = if file.windows(2).any(|pair| pair == b"//") && !file.starts_with(b":") {
         0
     } else {
         268_435_456
@@ -610,14 +644,12 @@ fn create_private(path: &str) {
     let Ok(parameters) = uri_parameters(path) else {
         return;
     };
-    let mode = parameters
-        .iter()
-        .rev()
-        .find_map(|(key, value)| (key == "mode").then_some(value.as_str()));
-    if mode.is_some_and(|mode| mode != "rwc") {
+    if uri_mode(&parameters).is_some_and(|mode| mode != "rwc") {
         return;
     }
     if let Some(file) = file_path_of(path) {
+        use std::os::unix::ffi::OsStrExt;
+        let file = std::ffi::OsStr::from_bytes(&file);
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -868,8 +900,13 @@ impl SqliteStore {
             rebuild_keys_for_v16(&tx)?;
         }
 
-        tx.execute_batch("DROP TRIGGER IF EXISTS plane_records_chain_no_update;")
-            .store()?;
+        // Indexes no query reads (keys by group, audit by resource), written by earlier builds.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS plane_records_chain_no_update;
+             DROP INDEX IF EXISTS keys_group_live_idx;
+             DROP INDEX IF EXISTS audit_resource_seq_idx;",
+        )
+        .store()?;
         tx.execute_batch(SCHEMA).store()?;
         tx.execute(
             "INSERT INTO store_revision (id, revision) VALUES (0, 0) ON CONFLICT(id) DO NOTHING",
@@ -990,6 +1027,52 @@ fn rebuild_usage_metering_for_v10(tx: &rusqlite::Connection) -> RecordStoreResul
          ALTER TABLE usage_metering_v10 RENAME TO usage_metering;",
     )
     .store()
+}
+
+/// Preserve each old cell's recorded attribution; already-collapsed history cannot be recovered.
+fn rebuild_metering_for_v17(tx: &Connection) -> RecordStoreResult<()> {
+    let has_units = table_exists(tx, "usage_metering_units")?;
+    if has_units {
+        let orphan: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_metering_units u WHERE NOT EXISTS (
+                SELECT 1 FROM usage_metering m WHERE m.bucket=u.bucket AND m.key_id=u.key_id
+                AND m.provider=u.provider AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms))",
+            [], |r| r.get(0)).store()?;
+        if orphan {
+            return Err(RecordStoreError(
+                "sqlite: metering unit has no attribution parent; refusing migration".into(),
+            ));
+        }
+    }
+    tx.execute_batch(concat!(
+        "DROP TRIGGER IF EXISTS keys_guard_hard_delete;\n",
+        metering_ddl!("usage_metering_v17"),
+        "\n",
+        metering_units_ddl!("usage_metering_units_v17"),
+        "
+        INSERT INTO usage_metering_v17 (bucket,key_id,provider,model,key_group_at_use,pricing_version,
+            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms)
+        SELECT bucket,key_id,provider,model,key_group_at_use,pricing_version,
+            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms
+        FROM usage_metering;"
+    ))
+    .store()?;
+    if has_units {
+        tx.execute_batch("INSERT INTO usage_metering_units_v17
+            (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,unit,count)
+            SELECT u.bucket,u.key_id,u.provider,u.model,u.priced_from_ms,m.key_group_at_use,m.pricing_version,u.unit,u.count
+            FROM usage_metering_units u JOIN usage_metering m
+            ON m.bucket=u.bucket AND m.key_id=u.key_id AND m.provider=u.provider
+            AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms;
+            DROP TABLE usage_metering_units;").store()?;
+    }
+    tx.execute_batch(
+        "DROP TABLE usage_metering;
+        ALTER TABLE usage_metering_v17 RENAME TO usage_metering;
+        ALTER TABLE usage_metering_units_v17 RENAME TO usage_metering_units;",
+    )
+    .store()?;
+    Ok(())
 }
 
 /// Rebuild a v6 `credentials` with unsigned expiry order, copying every row; a row revoked under
@@ -1301,7 +1384,7 @@ fn migrate_exact_counts(tx: &Connection, source_version: i64) -> RecordStoreResu
     }
     let windows: Vec<(i64, String)> = query_all(
         tx,
-        "SELECT window_start,bucket_id FROM usage_windows UNION          SELECT window_start,bucket_id FROM usage_window_units UNION          SELECT window_start,bucket_id FROM usage_window_exact",
+        "SELECT window_start,bucket_id FROM usage_windows UNION SELECT window_start,bucket_id FROM usage_window_units UNION SELECT window_start,bucket_id FROM usage_window_exact",
         [], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     for (window, bucket) in windows {
@@ -1329,7 +1412,7 @@ fn migrate_exact_counts(tx: &Connection, source_version: i64) -> RecordStoreResu
     }
     let buckets: Vec<String> = query_all(
         tx,
-        "SELECT bucket FROM usage_metering UNION SELECT bucket FROM usage_metering_units          UNION SELECT bucket FROM usage_metering_exact",
+        "SELECT bucket FROM usage_metering UNION SELECT bucket FROM usage_metering_units UNION SELECT bucket FROM usage_metering_exact",
         [], |row| row.get(0),
     )?;
     for bucket in buckets {
@@ -1841,7 +1924,7 @@ fn metering_exact_bytes(
 ) -> RecordStoreResult<Option<Vec<u8>>> {
     query_one(
         conn,
-        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1 AND key_id=?2 AND provider=?3          AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        "SELECT ledger FROM usage_metering_exact WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
         params![(bucket as i64).to_string(), cell.key_id, cell.provider, cell.model,
             column::storable_i64("metering", "priced_from_ms", cell.priced_from_ms)?,
             cell.key_group_at_use, cell.pricing_version],
@@ -1873,7 +1956,7 @@ fn put_metering_in(tx: &Connection, bucket: u64, row: &MeteringRow) -> RecordSto
             column::clamp(exact.requests), column::clamp(exact.billable_requests)],
     )?;
     exec(tx,
-        "DELETE FROM usage_metering_units WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4          AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
+        "DELETE FROM usage_metering_units WHERE bucket=?1 AND key_id=?2 AND provider=?3 AND model=?4 AND priced_from_ms=?5 AND key_group_at_use=?6 AND pricing_version=?7",
         params![(bucket as i64).to_string(), exact.key_id, exact.provider, exact.model, priced_from,
             exact.key_group_at_use, exact.pricing_version],
     )?;
@@ -2067,7 +2150,11 @@ impl RecordStore for SqliteStore {
     }
 
     fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = concat!("SELECT ", key_cols!(), " FROM keys ORDER BY created_at, id");
+        let sql = concat!(
+            "SELECT ",
+            key_cols!(),
+            " FROM keys ORDER BY created_at < 0, created_at, id"
+        );
         query_all(&self.lock_reader(), sql, [], row_to_key)
     }
 
@@ -2744,77 +2831,6 @@ fn now_secs() -> i64 {
 /// The settings parser and the store v3 table over [`SqliteStore`] (`door::door`).
 pub mod door;
 mod v3;
-
-/// Preserve each old cell's recorded attribution; already-collapsed history cannot be recovered.
-fn rebuild_metering_for_v17(tx: &Connection) -> RecordStoreResult<()> {
-    let has_units = table_exists(tx, "usage_metering_units")?;
-    if has_units {
-        let orphan: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage_metering_units u WHERE NOT EXISTS (
-                SELECT 1 FROM usage_metering m WHERE m.bucket=u.bucket AND m.key_id=u.key_id
-                AND m.provider=u.provider AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms))",
-            [], |r| r.get(0)).store()?;
-        if orphan {
-            return Err(RecordStoreError(
-                "sqlite: metering unit has no attribution parent; refusing migration".into(),
-            ));
-        }
-    }
-    tx.execute_batch(r#"
-        DROP TRIGGER IF EXISTS keys_guard_hard_delete;
-CREATE TABLE usage_metering_v17 (
-    bucket             TEXT NOT NULL,
-    key_id             TEXT NOT NULL,
-    provider           TEXT NOT NULL,
-    model              TEXT NOT NULL,
-    key_group_at_use   TEXT NOT NULL DEFAULT '',
-    pricing_version    TEXT NOT NULL DEFAULT '',
-    requests           INTEGER NOT NULL DEFAULT 0,
-    billable_requests  INTEGER NOT NULL DEFAULT 0,
-    tokens_input       INTEGER NOT NULL DEFAULT 0,
-    tokens_output      INTEGER NOT NULL DEFAULT 0,
-    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
-    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
-    priced_from_ms     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)
-) STRICT, WITHOUT ROWID;
-CREATE TABLE usage_metering_units_v17 (
-    bucket         TEXT NOT NULL,
-    key_id         TEXT NOT NULL,
-    provider       TEXT NOT NULL,
-    model          TEXT NOT NULL,
-    priced_from_ms INTEGER NOT NULL DEFAULT 0,
-    key_group_at_use TEXT NOT NULL DEFAULT '',
-    pricing_version TEXT NOT NULL DEFAULT '',
-    unit           TEXT NOT NULL,
-    count          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)
-) STRICT, WITHOUT ROWID;
-
-
-        INSERT INTO usage_metering_v17 (bucket,key_id,provider,model,key_group_at_use,pricing_version,
-            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms)
-        SELECT bucket,key_id,provider,model,key_group_at_use,pricing_version,
-            requests,billable_requests,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,priced_from_ms
-        FROM usage_metering;
-    "#).store()?;
-    if has_units {
-        tx.execute_batch("INSERT INTO usage_metering_units_v17
-            (bucket,key_id,provider,model,priced_from_ms,key_group_at_use,pricing_version,unit,count)
-            SELECT u.bucket,u.key_id,u.provider,u.model,u.priced_from_ms,m.key_group_at_use,m.pricing_version,u.unit,u.count
-            FROM usage_metering_units u JOIN usage_metering m
-            ON m.bucket=u.bucket AND m.key_id=u.key_id AND m.provider=u.provider
-            AND m.model=u.model AND m.priced_from_ms=u.priced_from_ms;
-            DROP TABLE usage_metering_units;").store()?;
-    }
-    tx.execute_batch(
-        "DROP TABLE usage_metering;
-        ALTER TABLE usage_metering_v17 RENAME TO usage_metering;
-        ALTER TABLE usage_metering_units_v17 RENAME TO usage_metering_units;",
-    )
-    .store()?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests;

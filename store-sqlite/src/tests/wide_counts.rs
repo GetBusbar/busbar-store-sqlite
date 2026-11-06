@@ -256,3 +256,50 @@ fn wide_migration_keeps_v8_micro_units_and_full_width_request_counters() {
         );
     }
 }
+
+/// A real v8 file may hold a row that only its signed mirror carries (exact authority promoted
+/// lazily). Its v8 mirror already holds micro-units, so the v9 promotion must read it at scale 6
+/// and never scale it again, unlike a pre-v8 whole-unit mirror.
+#[test]
+fn v8_mirror_only_rows_are_promoted_without_rescaling() {
+    let usage = UsageLedger {
+        requests: 3,
+        billable_requests: 2,
+        ..ledger(7)
+    };
+    let metering = MeteringDelta {
+        requests: 5,
+        billable_requests: 4,
+        ..meter(11, "wide")
+    };
+    let dir = tempdir();
+    let path = dir.join("mirror-v8.db");
+    let path = path.to_str().unwrap();
+    {
+        let store = SqliteStore::open(path, 5000).unwrap();
+        store.put_usage("wide-key", 0, &usage).unwrap();
+        store.add_metering(&metering).unwrap();
+        store
+            .lock_writer()
+            .execute_batch(
+                "DELETE FROM usage_window_exact; DELETE FROM usage_metering_exact;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+    }
+    let store = SqliteStore::open(path, 5000).unwrap();
+    assert_eq!(store.get_usage("wide-key", 0).unwrap(), usage);
+    let rows = store.list_metering(0).unwrap();
+    assert_eq!(rows[0].tokens_input, 11);
+    assert_eq!(rows[0].usage_units["custom"], 11);
+    assert_eq!((rows[0].requests, rows[0].billable_requests), (5, 4));
+    let promoted: i64 = store
+        .lock_reader()
+        .query_row(
+            "SELECT (SELECT count(*) FROM usage_window_exact) + (SELECT count(*) FROM usage_metering_exact)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(promoted, 2, "both mirror-only rows gained exact authority");
+}

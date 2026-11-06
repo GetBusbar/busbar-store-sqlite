@@ -445,6 +445,15 @@ fn the_statement_declares_exactly_its_secret_fields() {
     )
     .expect("the rendering reads back");
     assert!(stated.secret_refs.is_empty());
+    assert_eq!(stated.reference_fields().unwrap(), ["db_path"]);
+    let dropped = busbar_contract::abi::mechanism::rendering::read(
+        &rendering_of_library(&cdylib())
+            .expect("the cdylib loads")
+            .expect("the cdylib states a door"),
+    )
+    .expect("the dropped-in rendering reads back");
+    assert_eq!(dropped.secret_refs, stated.secret_refs);
+    assert_eq!(dropped.reference_fields(), stated.reference_fields());
 }
 
 fn cleanup_ledger() -> busbar_contract::records::UsageLedger {

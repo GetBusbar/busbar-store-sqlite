@@ -116,7 +116,7 @@ store:
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file, or a `file:` URI naming one (created `0600` like a plain path; the URI parameters `cache=shared`, `nolock`, `immutable` and `vfs=unix-none` break the store's single-writer locking and are refused; `mode=rw`/`mode=ro` keep SQLite's rule that a missing file is an open error). `:memory:` (or a `file:` URI with `mode=memory`) opens an in-process, non-durable database: everything, including `op_id` dedupe receipts and redeemed single-use tokens, is lost on restart, and busbar's boot-time ephemeral-store warning does not fire for it (the plugin states one durability for every `db_path`). |
+| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file, or a `file:` URI naming one (created `0600` like a plain path; the URI parameters `cache=shared`, `nolock`, `immutable` and `vfs=unix-none` break the store's single-writer locking and are refused; `mode=rw`/`mode=ro` keep SQLite's rule that a missing file is an open error). `:memory:` (or a `file:` URI with `mode=memory`) opens an in-process, non-durable database: everything, including `op_id` dedupe receipts and redeemed single-use tokens, is lost on restart. The opened store reports itself ephemeral, so busbar's boot-time ephemeral-store warning fires for it. |
 | `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value, or one above 2147483647 (SQLite's 32-bit limit; larger silently disables the timeout), is rejected as a config error. |
 
 **`db_path` must be an explicit absolute path in any real deployment.** The

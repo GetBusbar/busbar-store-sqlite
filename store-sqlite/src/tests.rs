@@ -4938,10 +4938,16 @@ fn a_file_uri_names_its_decoded_file() {
         ),
         ("file:relative.db", Some("relative.db")),
         ("file:/srv/100%.db", Some("/srv/100%.db")),
+        ("file:/srv/gov.db%00junk", Some("/srv/gov.db")),
         ("file://elsewhere/x.db", None),
         ("file:", None),
+        ("file:%00x.db", None),
     ] {
-        assert_eq!(file_path_of(db_path).as_deref(), file, "{db_path}");
+        assert_eq!(
+            file_path_of(db_path).as_deref(),
+            file.map(str::as_bytes),
+            "{db_path}"
+        );
     }
 }
 
@@ -5287,3 +5293,9 @@ fn uri_query_components_decode_without_reinterpreting_separators_or_plus() {
         ]
     );
 }
+
+#[path = "tests/audit_fixes.rs"]
+mod audit_fixes;
+
+#[path = "tests/damaged_rows.rs"]
+mod damaged_rows;
