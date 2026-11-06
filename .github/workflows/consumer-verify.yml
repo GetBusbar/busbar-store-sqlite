@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@409a8a585a33f85608c96606cb5ad108c3216e6f
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@947ff1f347d1c5b6e118419363376b9da90d4087
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-sqlite
