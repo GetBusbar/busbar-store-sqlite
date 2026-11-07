@@ -1,0 +1,182 @@
+[
+  {
+    "kind": "index",
+    "name": "cred_public_id_uq",
+    "table": "credentials",
+    "sql": "CREATE UNIQUE INDEX cred_public_id_uq ON credentials (kind, public_id)"
+  },
+  {
+    "kind": "index",
+    "name": "cred_revision_idx",
+    "table": "credentials",
+    "sql": "CREATE INDEX cred_revision_idx ON credentials (revision)"
+  },
+  {
+    "kind": "index",
+    "name": "cred_slot_uq",
+    "table": "credentials",
+    "sql": "CREATE UNIQUE INDEX cred_slot_uq ON credentials (key_id, kind, slot)"
+  },
+  {
+    "kind": "index",
+    "name": "keys_revision_idx",
+    "table": "keys",
+    "sql": "CREATE INDEX keys_revision_idx ON keys (revision)"
+  },
+  {
+    "kind": "index",
+    "name": "plane_records_kind_parent_idx",
+    "table": "plane_records",
+    "sql": "CREATE INDEX plane_records_kind_parent_idx ON plane_records (kind, parent, seq)"
+  },
+  {
+    "kind": "index",
+    "name": "plane_records_kind_ts_idx",
+    "table": "plane_records",
+    "sql": "CREATE INDEX plane_records_kind_ts_idx ON plane_records (kind, ts)"
+  },
+  {
+    "kind": "index",
+    "name": "plane_tokens_expires_idx",
+    "table": "plane_tokens",
+    "sql": "CREATE INDEX plane_tokens_expires_idx ON plane_tokens (expires_at)"
+  },
+  {
+    "kind": "index",
+    "name": "store_ops_recorded_idx",
+    "table": "store_ops",
+    "sql": "CREATE INDEX store_ops_recorded_idx ON store_ops (recorded_at)"
+  },
+  {
+    "kind": "index",
+    "name": "um_key_bucket_idx",
+    "table": "usage_metering",
+    "sql": "CREATE INDEX um_key_bucket_idx ON usage_metering (key_id, bucket)"
+  },
+  {
+    "kind": "table",
+    "name": "audit_log",
+    "table": "audit_log",
+    "sql": "CREATE TABLE audit_log (\n    seq       INTEGER PRIMARY KEY,\n    ts        INTEGER NOT NULL,\n    action    TEXT NOT NULL,\n    resource  TEXT NOT NULL,\n    outcome   TEXT NOT NULL,\n    principal TEXT NOT NULL,\n    prev_hash TEXT NOT NULL,\n    hash      TEXT NOT NULL\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "credentials",
+    "table": "credentials",
+    "sql": "CREATE TABLE credentials (\n    id            TEXT NOT NULL PRIMARY KEY,\n    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,\n    kind          TEXT NOT NULL,\n    -- 0 or 1: two rows per (key_id, kind) allow overlap-window rotation.\n    slot          INTEGER NOT NULL,\n    public_id     TEXT NOT NULL,\n    secret        TEXT,\n    secret_form   TEXT NOT NULL,\n    created_at    INTEGER NOT NULL,\n    updated_at    INTEGER NOT NULL,\n    expires_at    INTEGER,\n    revoked_at    INTEGER,\n    revoke_reason TEXT,\n    revision      INTEGER NOT NULL DEFAULT 0,\n    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),\n    CONSTRAINT cred_slot CHECK (slot IN (0,1)),\n    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),\n    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),\n    -- A revoked row has had its secret destroyed.\n    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable' OR revoked_at IS NOT NULL),\n    CONSTRAINT cred_revoked_bare CHECK (revoked_at IS NULL OR secret IS NULL),\n    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),\n    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),\n    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR (created_at >= 0 AND expires_at < 0) OR (((created_at < 0) = (expires_at < 0)) AND expires_at > created_at))\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "denylist",
+    "table": "denylist",
+    "sql": "CREATE TABLE denylist (\n    sub        TEXT NOT NULL PRIMARY KEY,\n    reason     TEXT NOT NULL DEFAULT '',\n    created_at INTEGER NOT NULL DEFAULT 0\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "keys",
+    "table": "keys",
+    "sql": "CREATE TABLE keys (\n    id              TEXT NOT NULL PRIMARY KEY,\n    name            TEXT NOT NULL,\n    key_group       TEXT,\n    -- NULL = the pool grant was omitted at mint = all pools; a JSON array (even '[]') = exhaustive.\n    allowed_pools   TEXT,\n    labels          TEXT NOT NULL DEFAULT '{}',\n    enabled         INTEGER NOT NULL DEFAULT 1,\n    -- Rotation fingerprint, compared post-resolution, never looked up by: deliberately not UNIQUE.\n    generation_hash TEXT NOT NULL,\n    created_at      INTEGER NOT NULL,\n    updated_at      INTEGER NOT NULL,\n    expires_at      INTEGER,\n    deleted_at      INTEGER,\n    revision        INTEGER NOT NULL DEFAULT 0, scope_grants TEXT CONSTRAINT keys_scope_grants_json CHECK (scope_grants IS NULL OR (json_valid(scope_grants) AND json_type(scope_grants)='object')), idp_subject TEXT, binding_mode TEXT, minted_by TEXT, idp_provider TEXT,\n    CONSTRAINT keys_enabled_bool CHECK (enabled IN (0,1)),\n    CONSTRAINT keys_pools_json CHECK (allowed_pools IS NULL OR (json_valid(allowed_pools) AND json_type(allowed_pools)='array')),\n    CONSTRAINT keys_labels_json CHECK (json_valid(labels) AND json_type(labels)='object' AND length(labels)<=4096),\n    -- Both tombstone flags must change in the SAME UPDATE (SQLite has no deferred CHECK).\n    CONSTRAINT keys_tombstone_off CHECK (deleted_at IS NULL OR enabled = 0),\n    CONSTRAINT keys_expiry_after CHECK (expires_at IS NULL OR (created_at >= 0 AND expires_at < 0) OR (((created_at < 0) = (expires_at < 0)) AND expires_at > created_at))\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "plane_records",
+    "table": "plane_records",
+    "sql": "CREATE TABLE plane_records (\n    kind        TEXT NOT NULL,\n    identity    TEXT NOT NULL,\n    seq         INTEGER NOT NULL,\n    id          TEXT NOT NULL,\n    parent      TEXT,\n    ts          INTEGER NOT NULL,\n    disposition TEXT NOT NULL,\n    body        BLOB NOT NULL,\n    CONSTRAINT plane_disposition CHECK (disposition IN ('active','terminal')),\n    PRIMARY KEY (kind, identity, seq)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "plane_tokens",
+    "table": "plane_tokens",
+    "sql": "CREATE TABLE plane_tokens (\n    kind       TEXT NOT NULL,\n    token      TEXT NOT NULL,\n    expires_at INTEGER NOT NULL,\n    PRIMARY KEY (kind, token)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "schema_records",
+    "table": "schema_records",
+    "sql": "CREATE TABLE schema_records (\n    schema     TEXT NOT NULL,\n    record_key BLOB NOT NULL,\n    value      BLOB NOT NULL,\n    PRIMARY KEY (schema, record_key)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "store_meta",
+    "table": "store_meta",
+    "sql": "CREATE TABLE store_meta (\n    k TEXT NOT NULL PRIMARY KEY,\n    v TEXT NOT NULL\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "store_ops",
+    "table": "store_ops",
+    "sql": "CREATE TABLE store_ops (\n    op_id       BLOB NOT NULL PRIMARY KEY,\n    body        TEXT NOT NULL,\n    answer      TEXT NOT NULL,\n    recorded_at INTEGER NOT NULL\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "store_revision",
+    "table": "store_revision",
+    "sql": "CREATE TABLE store_revision (\n    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),\n    revision INTEGER NOT NULL DEFAULT 0\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "usage_metering",
+    "table": "usage_metering",
+    "sql": "CREATE TABLE usage_metering (\n    bucket             TEXT NOT NULL,\n    key_id             TEXT NOT NULL,\n    provider           TEXT NOT NULL,\n    model              TEXT NOT NULL,\n    key_group_at_use   TEXT NOT NULL DEFAULT '',\n    pricing_version    TEXT NOT NULL DEFAULT '',\n    requests           INTEGER NOT NULL DEFAULT 0,\n    billable_requests  INTEGER NOT NULL DEFAULT 0,\n    tokens_input       INTEGER NOT NULL DEFAULT 0,\n    tokens_output      INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_write INTEGER NOT NULL DEFAULT 0,\n    priced_from_ms     INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_metering_exact",
+    "table": "usage_metering_exact",
+    "sql": "CREATE TABLE usage_metering_exact (\n    bucket TEXT NOT NULL,\n    key_id TEXT NOT NULL,\n    provider TEXT NOT NULL,\n    model TEXT NOT NULL,\n    priced_from_ms INTEGER NOT NULL,\n    key_group_at_use TEXT NOT NULL,\n    pricing_version TEXT NOT NULL,\n    ledger BLOB NOT NULL,\n    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_metering_units",
+    "table": "usage_metering_units",
+    "sql": "CREATE TABLE usage_metering_units (\n    bucket         TEXT NOT NULL,\n    key_id         TEXT NOT NULL,\n    provider       TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    priced_from_ms INTEGER NOT NULL DEFAULT 0,\n    key_group_at_use TEXT NOT NULL DEFAULT '',\n    pricing_version TEXT NOT NULL DEFAULT '',\n    unit           TEXT NOT NULL,\n    count          INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_window_exact",
+    "table": "usage_window_exact",
+    "sql": "CREATE TABLE usage_window_exact (\n    window_start INTEGER NOT NULL,\n    bucket_id TEXT NOT NULL,\n    ledger BLOB NOT NULL,\n    PRIMARY KEY (window_start, bucket_id)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_window_units",
+    "table": "usage_window_units",
+    "sql": "CREATE TABLE usage_window_units (\n    window_start INTEGER NOT NULL,\n    bucket_id    TEXT NOT NULL,\n    model        TEXT NOT NULL,\n    unit         TEXT NOT NULL,\n    count        INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (window_start, bucket_id, model, unit)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_windows",
+    "table": "usage_windows",
+    "sql": "CREATE TABLE usage_windows (\n    window_start       INTEGER NOT NULL,\n    bucket_id          TEXT NOT NULL,\n    model              TEXT NOT NULL,\n    requests           INTEGER NOT NULL DEFAULT 0,\n    billable_requests  INTEGER NOT NULL DEFAULT 0,\n    tokens_input       INTEGER NOT NULL DEFAULT 0,\n    tokens_output      INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_write INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (window_start, bucket_id, model)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "trigger",
+    "name": "audit_log_no_delete",
+    "table": "audit_log",
+    "sql": "CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log\n  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "audit_log_no_update",
+    "table": "audit_log",
+    "sql": "CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log\n  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "keys_cascade_credentials",
+    "table": "keys",
+    "sql": "CREATE TRIGGER keys_cascade_credentials AFTER DELETE ON keys FOR EACH ROW\n  BEGIN DELETE FROM credentials WHERE key_id = OLD.id; END"
+  },
+  {
+    "kind": "trigger",
+    "name": "keys_guard_hard_delete",
+    "table": "keys",
+    "sql": "CREATE TRIGGER keys_guard_hard_delete BEFORE DELETE ON keys FOR EACH ROW\n  WHEN EXISTS (SELECT 1 FROM usage_metering WHERE key_id = OLD.id)\n  BEGIN SELECT RAISE(ABORT, 'keys: hard DELETE would orphan usage_metering rows; use the tombstone path (Store::delete_key)'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "plane_records_chain_no_update",
+    "table": "plane_records",
+    "sql": "CREATE TRIGGER plane_records_chain_no_update BEFORE UPDATE ON plane_records\n  WHEN OLD.parent IS NOT NULL AND OLD.identity = OLD.parent\n  BEGIN SELECT RAISE(ABORT, 'plane_records: an appended chain record is never rewritten'); END"
+  }
+]

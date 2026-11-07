@@ -5,14 +5,14 @@
 
 use std::sync::Arc;
 
-use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink, Plugin,
 };
 
 const DB_PATH: &str = "/var/lib/busbar/busbar.db";
 
-fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
+fn linked() -> (Plugin<StoreV4>, Arc<Dispatcher>) {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let bind = Bind {
         instance: Arc::from("reference-db-path"),
@@ -21,8 +21,14 @@ fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
         dispatcher: d.adopter(),
         conns: ConnTable::Probe,
     };
-    let row = LinkedRow::of_macro(busbar_store_sqlite::door::MACRO_DOOR).expect("the row renders");
-    (load_linked::<Store>(&row, bind).expect("the door loads"), d)
+    let row = LinkedRow::of_kind::<StoreV4>(
+        busbar_store_sqlite::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .expect("the row renders");
+    (
+        load_linked::<StoreV4>(&row, bind).expect("the door loads"),
+        d,
+    )
 }
 
 #[test]

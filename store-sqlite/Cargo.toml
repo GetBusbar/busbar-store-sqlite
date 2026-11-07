@@ -5,7 +5,7 @@ version = "1.6.0"
 publish.workspace = true   # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition.workspace = true
 rust-version.workspace = true
-description = "The SQLite backend for busbar's durable governance store: implements busbar_contract::records::RecordStore on rusqlite (bundled)."
+description = "The SQLite backend for busbar's durable governance store: implements the primitive persistence contract on rusqlite (bundled)."
 license.workspace = true
 repository.workspace = true
 
@@ -13,10 +13,7 @@ repository.workspace = true
 workspace = true
 
 [lib]
-# rlib: THE LOGIC and its one door (`store_door!`, `door::door`, the store v3 table), which exports
-# no symbol. A busbar build that links this crate registers `door`; the sibling
-# `busbar-store-sqlite-plugin` cdylib exports the same `door` as `busbar_plugin_door`. One source,
-# both doors (DECISIONS #2 rule (1)).
+# Native primitive persistence door; the sibling cdylib exports the same implementation.
 crate-type = ["rlib"]
 
 [dependencies]
@@ -29,11 +26,13 @@ busbar-contract = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 jsonschema = { workspace = true }
-# `hooks`: the scan test counts SQLite VM steps through `progress_handler`.
+# Native regression injects a commit failure to verify Unknown custody.
 rusqlite = { workspace = true, features = ["hooks"] }
 
-# `derive` for the tests' legacy row encoders and the conformance suite's stand-in bodies.
-serde = { workspace = true }
+# Safe handle metadata for native migration coordination; no Linux dependency.
+[target.'cfg(windows)'.dependencies]
+winapi-util = "=0.1.11"

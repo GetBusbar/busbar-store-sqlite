@@ -14,24 +14,20 @@ workspace = true
 
 [lib]
 # cdylib: the DROPPED-IN door (a signed tarball in `plugins/`), exporting `busbar_plugin_door`.
-# rlib: REQUIRED for `cargo test` to emit the cdylib artifact the conformance and e2e tests load.
+# rlib: REQUIRED for `cargo test` to emit the cdylib artifact native conformance and migration tests load.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE LOGIC, same repo: its `door::door` is the door this image exports.
+# THE LOGIC, same repo: its `v4::door` is the door this image exports.
 busbar-store-sqlite = { path = "../store-sqlite" }
 busbar-contract = { workspace = true }
 
 [dev-dependencies]
-# The conformance and e2e tests load the built cdylib and the linked door over the REAL loader (the
-# one dispatcher, the store v3 table) — dev-only, never in the shipped artifact. Same pinned rev as
+# The native conformance tests load the built cdylib and the linked door over the REAL loader (the
+# one dispatcher, the primitive Store table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.
 busbar-plugin-loader = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
-# Dev-only: the conformance test awaits the store v3 calls (`StoreCalls`), which are futures.
+# Dev-only: native persistence calls are asynchronous.
 tokio = { workspace = true, features = ["rt"] }
-# Dev-only: the admin-API install e2e test drives a REAL running busbar process's admin HTTP API
-# (POST /api/v1/admin/plugins, POST /api/v1/admin/keys) — the actual operator install path.
-reqwest = { workspace = true, features = ["json", "blocking"] }
-base64 = { workspace = true }

@@ -1,84 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Busbar Inc and contributors
+//! SQLite connection settings; validation never opens a database.
 
-//! The door: [`door`], the store v3 table over [`SqliteStore`] (`store_door!`), and [`open`], the
-//! settings parser its `open` slot runs. A build that links this crate registers `door`; the
-//! `busbar-store-sqlite-plugin` cdylib exports the same one as `busbar_plugin_door`. The store
-//! answers every call Ready: it is local-disk-bound and runs on the host's bounded disk lane.
-
-use crate::SqliteStore;
-
-/// The store's name, as its Statement states it and its signed manifest names it.
-pub const NAME: &str = "busbar-store-sqlite";
-
-busbar_contract::statement_extensions!(EXTENSIONS: [
-    ("busbar.store.count-scale", b"6"),
-    ("busbar.store.count-range", b"i128"),
-    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["db_path"]"#),
-    (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
-    (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
-    (busbar_contract::abi::sdk::store::correction::CAPABILITY, busbar_contract::abi::sdk::store::correction::CAPABILITY_VALUE),
-]);
-
-/// The most ops the host may have in flight against this store at once. Every slot answers Ready
-/// on the host's bounded disk lane, so this only caps the queue it feeds.
-pub const MAX_INFLIGHT: u32 = 64;
-
-/// The settings accepted by this plugin's lifecycle parser.
-const SETTINGS_SCHEMA: busbar_contract::abi::mechanism::call::Blob =
-    busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("settings.schema.json"));
-
-busbar_contract::store_door!(
-    SqliteStore,
-    NAME,
-    env!("CARGO_PKG_VERSION"),
-    MAX_INFLIGHT,
-    extensions: EXTENSIONS,
-    settings_schema: SETTINGS_SCHEMA,
-    migrate: busbar_contract::abi::sdk::migrate::Migrator<SettingsMigration>
-);
-
-/// One-shot settings conversion runs before secret resolution, without opening a store.
-struct SettingsMigration;
-
-impl busbar_contract::abi::sdk::migrate::Migrate for SettingsMigration {
-    fn migrate(
-        mut settings: serde_json::Value,
-        _from: &str,
-    ) -> busbar_contract::abi::sdk::migrate::Migrated {
-        let removed = settings
-            .as_object_mut()
-            .is_some_and(|object| object.remove("license_key").is_some());
-        let mut migrated = busbar_contract::abi::sdk::migrate::Migrated::unchanged(settings);
-        if removed {
-            migrated
-                .report
-                .push("Removed obsolete license_key; SQLite does not use this setting.".into());
-        }
-        migrated
-    }
-}
-
-/// Construct a SQLite store from the settings the host passes through `open`:
-///
-/// ```json
-/// { "db_path": "busbar-governance.db", "busy_timeout_ms": 5000 }
-/// ```
-///
-/// Both keys are optional, so `{}` works; any other top-level key, and an empty or blank `db_path`,
-/// is refused. An absent key or an explicit `null` takes the default. A key of any other wrong JSON
-/// type is a config error, never defaulted: a template variable resolving to a number for `db_path`
-/// must not quietly open the default path, which reads as a healthy boot on an empty database.
-pub fn open(cfg: &str) -> Result<SqliteStore, String> {
-    let Settings {
-        db_path,
-        busy_timeout_ms,
-    } = Settings::parse(cfg)?;
-    SqliteStore::open(&db_path, busy_timeout_ms).map_err(|e| e.0)
-}
-
-/// The operator's settings, parsed and nothing more: `validate` runs this alone (`--validate` opens
-/// and migrates no store), and [`open`] opens what it read.
+/// The operator's settings, parsed and nothing more: validation runs this alone, before any database is opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// The database file (or an in-memory spelling).
@@ -91,10 +14,10 @@ pub struct Settings {
 const ACCEPTED: [&str; 2] = ["db_path", "busy_timeout_ms"];
 
 impl Settings {
-    /// Parse the section's JSON exactly as [`open`] reads it.
+    /// Parse the section's JSON without opening a database.
     ///
     /// # Errors
-    /// The refusal text [`open`] carries for the same settings.
+    /// The refusal text for invalid settings.
     pub fn parse(cfg: &str) -> Result<Self, String> {
         const BAD: &str = "invalid sqlite plugin config";
         let v: serde_json::Value = if cfg.trim().is_empty() {
@@ -192,10 +115,23 @@ fn json_type(v: &serde_json::Value) -> &'static str {
     }
 }
 
-#[cfg(test)]
-#[path = "door/tests.rs"]
-mod tests;
+/// One-shot settings conversion runs before secret resolution, without opening a store.
+pub(crate) struct SettingsMigration;
 
-#[cfg(test)]
-#[path = "settings_schema_tests.rs"]
-mod settings_schema_tests;
+impl busbar_contract::abi::sdk::migrate::Migrate for SettingsMigration {
+    fn migrate(
+        mut settings: serde_json::Value,
+        _from: &str,
+    ) -> busbar_contract::abi::sdk::migrate::Migrated {
+        let removed = settings
+            .as_object_mut()
+            .is_some_and(|object| object.remove("license_key").is_some());
+        let mut migrated = busbar_contract::abi::sdk::migrate::Migrated::unchanged(settings);
+        if removed {
+            migrated
+                .report
+                .push("Removed obsolete license_key; SQLite does not use this setting.".into());
+        }
+        migrated
+    }
+}

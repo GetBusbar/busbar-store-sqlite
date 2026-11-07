@@ -38,71 +38,26 @@ built library into busbar's plugins folder, set
 
 This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: **requires busbar 1.6.0+** — the release whose store
-interface this crate implements (the kind-tagged plane-record verbs that
-replaced the per-protocol task/MCP methods, and the 1.6.0 key, usage and
-metering record shapes). Pin both versions explicitly in production; do
+stated separately: **requires busbar 1.6.0+** — the release whose primitive persistence interface this crate implements. Pin both versions explicitly in production; do
 not assume they move together.
 
-### Single-use tokens and ticket deadlines
+### Persistence and upgrades
 
-Single-use token redemption uses SQLite's Unix clock inside its write transaction. The caller's
-`now` does not authorize expiry or cleanup. SQLite has no separate server clock: connections to one
-local file must share one host clock. Sharing a database file across hosts with independent clocks
-is not a supported shared-clock deployment; use a server-backed store for that topology. Expired
-candidates leave the replay ledger unchanged. Generic multi-use token checks retain their separate policy. Reserved ticket preflight reads a terminal record with the exact signed deadline against the store clock and never spends the token. The reserved kernel `ticket` record kind stores an absolute deadline in `ts`; its age cleanup is capped at the same store clock. Other record kinds keep their existing retention policy.
+The SQLite backend implements opaque reads, scans, conditional atomic commits and
+store-clock observations. Identity, accounting, retention and token policy belong
+to core. SQLite uses a local host clock; sharing a file across hosts with independent
+clocks is unsupported.
 
-### Upgrading an existing database
+Normal startup inspects SQLite before ordinary opening. Supported historical
+schemas upgrade automatically through Busbar's migration library. SQLite drains
+preceding writers and installs persistent write guards on the retained original
+tables before exposing bounded source pages and an inactive target. Interrupted
+upgrades resume the same durable identities; unknown formats remain closed.
+No export command or manual fencing file is required.
 
-Opening a database written by an earlier release upgrades it in place,
-forward-only, in one transaction (schema v6 — the v1.0.x releases — or
-v7/v8 to the current schema v9). Keys and credentials retain their full-width unsigned
-timestamps. An older signed expiry check could admit an expiry that
-precedes creation in unsigned order; such a row refuses the upgrade with
-its identity and decoded timestamps. The transaction leaves the schema,
-rows and revision counter unchanged on refusal, so the source data can be
-reviewed before retrying.
-
-Schema v7 preserves each metering row’s recorded group and price version in its identity, including open units. Existing rows keep their recorded attribution; history already combined by an older writer cannot be reconstructed. An open-unit row without its parent refuses the transaction rather than guessing attribution. Stop older writers before upgrading; they cannot safely write the new metering keys.
-
-Schema v9 stores nonnegative quantity mantissas through `i128::MAX` in exact
-scale-6 JSON ledgers. Signed SQLite INTEGER columns are bounded mirrors rebuilt
-from the exact post-state; they never limit the quantity or authorize a later
-accrual. Migration converts pre-v8 whole units in Rust before writing the exact
-ledger and its mirror, avoiding SQLite floating-point promotion. Existing v8
-micro-units are not scaled again. Request and billable-request counters remain
-unscaled `u64` values. Invalid or overflowing quantities refuse the entire
-transaction. Schema v9 prevents older SQLite plugin builds from opening a wide
-quantity database; there is no downgrade path.
-
-On a successful upgrade, keys, credentials, tombstones, usage and metering
-counts, the audit log and the denylist retain their data. A credential
-revoked under an older build loses the secret it kept (a revoke now
-destroys the secret, and the row keeps only its metadata); the upgrade
-zeroes the pages of the tables it replaces, so the destroyed secret is not
-left readable in the file. Back the file
-up before the first boot on the new version — there is no downgrade path,
-and an older plugin build must not be pointed at an upgraded file.
-
-All the actual SQLite logic — schema, key/usage/audit persistence, a
-mutex-guarded writer connection plus a small pool of `query_only` reader
-connections (so a long billing report never blocks the hot-path usage
-flush; a retention sweep is a write and takes the writer like any other) —
-lives in the `busbar-store-sqlite` `lib` crate in
-this repository's `store-sqlite/` directory. The
-`store-sqlite-plugin` crate is deliberately tiny: the logic crate also holds
-its one door (`door::door`, the store v3 table over `SqliteStore` through
-`busbar_contract::store_door!`; its `open` slot adapts the operator's settings
-into a `SqliteStore`), and the plugin crate exports that door as
-`busbar_plugin_door` (`export_door!`), so the cdylib answers the loader
-through the same door a busbar build that LINKS `busbar-store-sqlite`
-registers — one source, both doors. The image carries no other export.
-
-A revoke, a credential rewrap, a key delete and a `put_key` that writes a
-tombstone (which also destroys the key's credentials) checkpoint and truncate
-the WAL once they commit, so the destroyed secret does not linger in
-`governance.db-wal`. This never blocks or fails the write: if a reader holds
-a snapshot at that moment, the residue goes with a later checkpoint.
+The logic crate exposes `v4::door`, shared by linked installations and the thin
+`store-sqlite-plugin` cdylib's `busbar_plugin_door` export. There is no typed
+backend business API.
 
 ## Config
 
@@ -116,7 +71,7 @@ store:
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file, or a `file:` URI naming one (created `0600` like a plain path; the URI parameters `cache=shared`, `nolock`, `immutable` and `vfs=unix-none` break the store's single-writer locking and are refused; `mode=rw`/`mode=ro` keep SQLite's rule that a missing file is an open error). `:memory:` (or a `file:` URI with `mode=memory`) opens an in-process, non-durable database: everything, including `op_id` dedupe receipts and redeemed single-use tokens, is lost on restart. The opened store reports itself ephemeral, so busbar's boot-time ephemeral-store warning fires for it. |
+| `db_path` | no | `busbar-governance.db` | Path to the SQLite database file, or a `file:` URI naming one (created `0600` like a plain path; only `mode=rw`, `mode=rwc`, `mode=memory` and `cache=private` are accepted for writable runtime access; locking/VFS overrides and shared-cache aliases are refused; missing `mode=rw` files are an open error, and `mode=ro` can be inspected but cannot acquire writable runtime authority). `:memory:` (or a `file:` URI with `mode=memory`) opens an in-process, non-durable database: everything, including `op_id` dedupe receipts and redeemed single-use tokens, is lost on restart. The opened store reports itself ephemeral, so busbar's boot-time ephemeral-store warning fires for it. |
 | `busy_timeout_ms` | no | `5000` | SQLite's `busy_timeout`, in milliseconds. `0` is accepted (a deliberate "never retry, fail fast on any contention" setting); a negative value, or one above 2147483647 (SQLite's 32-bit limit; larger silently disables the timeout), is rejected as a config error. |
 
 **`db_path` must be an explicit absolute path in any real deployment.** The
@@ -157,7 +112,7 @@ checkout is needed to build or unit-test; only the end-to-end tests need one
 
 ```sh
 cargo build --release      # cdylib: target/release/libbusbar_store_sqlite_plugin.{so,dylib}
-cargo test                 # unit tests + the end-to-end loader test (see tests/e2e.rs)
+cargo test                 # native persistence, historical readers and loader conformance
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -165,18 +120,11 @@ cargo fmt --all -- --check
 ### Dependencies
 
 The only busbar crate this repo names is `busbar-contract` (plus
-`busbar-plugin-loader`, dev-only, for the conformance and end-to-end tests),
+`busbar-plugin-loader`, dev-only, for native conformance and migration tests),
 as a **git dependency** on [busbar](https://github.com/GetBusbar/busbar)
 pinned to the rev in field 1 of `.busbar-ref`. No sibling checkout is needed
-to build or unit-test. The end-to-end tests (`store-sqlite-plugin/tests/e2e.rs`)
-boot a REAL busbar binary, so they need a busbar checkout at that same rev:
-set `BUSBAR_CHECKOUT=/path/to/busbar`, or check it out as a sibling:
-
-```
-some-parent-dir/
-├── busbar/
-└── store-sqlite/
-```
+to build or unit-test. Native conformance tests load the linked door and built cdylib
+through the loader. Build the plugin library before running dropped-in tests.
 
 ### Pack and sign
 
@@ -212,38 +160,10 @@ for the full store config reference.
 
 ## Tests
 
-`cargo test` runs the store's own suite (`store-sqlite/src/tests*`, including
-the config-adapting `open` in `store-sqlite/src/door/tests.rs`), the
-linked == dropped-in conformance test (`store-sqlite-plugin/tests/conformance.rs`:
-the linked `door::door` and the dropped-in cdylib, each opened through the
-loader's store v3 table and driven through one scenario, including the v3
-slots and a restart, and compared, with RED arms),
-and the end-to-end tests in `store-sqlite-plugin/tests/e2e.rs`, which
-loads the *built* cdylib over the real `busbar-plugin-loader` ABI seam
-— the same seam busbar's engine uses — against a real SQLite file on
-disk. It writes a key and a usage ledger through the plugin over the C
-ABI, closes the plugin, then verifies the data actually landed on disk
-two independent ways: re-`dlopen`ing the same cdylib against the same
-file, and opening the same file directly with the plain
-`busbar-store-sqlite::SqliteStore` (a code path that never touches the
-cdylib, the C ABI, or the loader at all). A second test proves a bad
-`open` config (malformed JSON, or a `db_path` under a nonexistent
-directory) fails cleanly across the ABI rather than panicking or
-silently succeeding.
-
-Build under `cargo test` (which builds the cdylib as part of the test
-run) so the e2e test finds the library; it fails, rather than skipping,
-if the cdylib isn't present or is older than the sources.
-
-The end-to-end tests need a busbar checkout at the rev `.busbar-ref` pins:
-set `BUSBAR_CHECKOUT=/path/to/busbar` (or check it out as a sibling). A
-missing checkout is a FAILURE, locally and in CI alike, never a skip: they
-are the only proof the plugin installs through a real busbar's boot and
-admin paths. CI checks that rev out beside this repo.
-
-The upgrade path is tested against real database files the previous
-code wrote (`store-sqlite/tests/fixtures/`, with the programs that wrote
-them beside them).
+`cargo test` runs native primitive regressions, bounded historical reader/export tests,
+settings validation, and linked/dropped loader conformance. The loader tests reopen
+the same dataset and independently inspect the physical schema. Build the plugin
+library first, or set `BUSBAR_PLUGIN_CDYLIB` to the built artifact.
 
 ## License
 

@@ -1,0 +1,116 @@
+[
+  {
+    "kind": "index",
+    "name": "audit_resource_seq_idx",
+    "table": "audit_log",
+    "sql": "CREATE INDEX audit_resource_seq_idx ON audit_log (resource, seq)"
+  },
+  {
+    "kind": "index",
+    "name": "cred_public_id_uq",
+    "table": "credentials",
+    "sql": "CREATE UNIQUE INDEX cred_public_id_uq ON credentials (kind, public_id)"
+  },
+  {
+    "kind": "index",
+    "name": "cred_revision_idx",
+    "table": "credentials",
+    "sql": "CREATE INDEX cred_revision_idx ON credentials (revision)"
+  },
+  {
+    "kind": "index",
+    "name": "cred_slot_uq",
+    "table": "credentials",
+    "sql": "CREATE UNIQUE INDEX cred_slot_uq ON credentials (key_id, kind, slot)"
+  },
+  {
+    "kind": "index",
+    "name": "keys_group_live_idx",
+    "table": "keys",
+    "sql": "CREATE INDEX keys_group_live_idx ON keys (key_group) WHERE deleted_at IS NULL"
+  },
+  {
+    "kind": "index",
+    "name": "keys_revision_idx",
+    "table": "keys",
+    "sql": "CREATE INDEX keys_revision_idx ON keys (revision)"
+  },
+  {
+    "kind": "index",
+    "name": "um_key_bucket_idx",
+    "table": "usage_metering",
+    "sql": "CREATE INDEX um_key_bucket_idx ON usage_metering (key_id, bucket)"
+  },
+  {
+    "kind": "table",
+    "name": "audit_log",
+    "table": "audit_log",
+    "sql": "CREATE TABLE audit_log (\n    seq       INTEGER PRIMARY KEY,\n    ts        INTEGER NOT NULL,\n    action    TEXT NOT NULL,\n    resource  TEXT NOT NULL,\n    outcome   TEXT NOT NULL,\n    principal TEXT NOT NULL,\n    prev_hash TEXT NOT NULL,\n    hash      TEXT NOT NULL\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "credentials",
+    "table": "credentials",
+    "sql": "CREATE TABLE credentials (\n    id            TEXT NOT NULL PRIMARY KEY,\n    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE ON UPDATE RESTRICT,\n    kind          TEXT NOT NULL,\n    -- 0 or 1: bounds cardinality to exactly two rows per (key_id, kind), enabling safe\n    -- overlap-window rotation (mint into the free slot, hand it out, revoke the old one).\n    slot          INTEGER NOT NULL,\n    public_id     TEXT NOT NULL,\n    secret        TEXT,\n    secret_form   TEXT NOT NULL,\n    created_at    INTEGER NOT NULL,\n    updated_at    INTEGER NOT NULL,\n    expires_at    INTEGER,\n    revoked_at    INTEGER,\n    revoke_reason TEXT,\n    revision      INTEGER NOT NULL DEFAULT 0,\n    CONSTRAINT cred_kind CHECK (kind IN ('sigv4')),\n    CONSTRAINT cred_slot CHECK (slot IN (0,1)),\n    CONSTRAINT cred_form CHECK (secret_form IN ('none','recoverable','digest')),\n    CONSTRAINT cred_form_null CHECK ((secret_form='none') = (secret IS NULL)),\n    CONSTRAINT cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),\n    CONSTRAINT cred_secret_fmt CHECK (secret IS NULL OR secret GLOB 'v1:?*:?*'),\n    CONSTRAINT cred_reason_ord CHECK (revoke_reason IS NULL OR revoked_at IS NOT NULL),\n    CONSTRAINT cred_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "denylist",
+    "table": "denylist",
+    "sql": "CREATE TABLE denylist (\n    sub        TEXT NOT NULL PRIMARY KEY,\n    reason     TEXT NOT NULL DEFAULT '',\n    created_at INTEGER NOT NULL DEFAULT 0\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "keys",
+    "table": "keys",
+    "sql": "CREATE TABLE keys (\n    id              TEXT NOT NULL PRIMARY KEY,\n    name            TEXT NOT NULL,\n    -- Bare string, NOT a foreign key: groups are config-defined, not persisted entities.\n    key_group       TEXT,\n    -- NULLABLE JSON array of bare pool-name strings: NULL = the pool grant was OMITTED at mint =\n    -- ALL pools; a JSON array (including '[]') = the exhaustive grant. Matches\n    -- VirtualKey::allowed_scopes: Option<Vec<ScopeRef>> (every entry kind=pool by construction\n    -- today) \u2014 wire/storage shape is unchanged by the ScopeRef generalization, only the in-memory\n    -- Rust type changed (C6: None vs Some([]) must never collapse into each other).\n    allowed_pools   TEXT,\n    labels          TEXT NOT NULL DEFAULT '{}',\n    enabled         INTEGER NOT NULL DEFAULT 1,\n    -- Rotation fingerprint (VirtualKey::generation_hash) \u2014 compared post-resolution against a signed\n    -- token's `generation` claim, never looked up BY. Deliberately no uniqueness constraint: a\n    -- UNIQUE index here would be a load-bearing lie suggesting it's a lookup key.\n    generation_hash TEXT NOT NULL,\n    created_at      INTEGER NOT NULL,\n    updated_at      INTEGER NOT NULL,\n    expires_at      INTEGER,\n    deleted_at      INTEGER,\n    revision        INTEGER NOT NULL DEFAULT 0,\n    CONSTRAINT keys_enabled_bool CHECK (enabled IN (0,1)),\n    CONSTRAINT keys_pools_json CHECK (allowed_pools IS NULL OR (json_valid(allowed_pools) AND json_type(allowed_pools)='array')),\n    CONSTRAINT keys_labels_json CHECK (json_valid(labels) AND json_type(labels)='object' AND length(labels)<=4096),\n    -- Tombstone atomicity: a key can never be deleted-but-still-enabled. Both flags MUST be set in\n    -- the SAME UPDATE statement (SQLite has no deferred CHECK constraints), or this fires mid-flight.\n    CONSTRAINT keys_tombstone_off CHECK (deleted_at IS NULL OR enabled = 0),\n    CONSTRAINT keys_expiry_after CHECK (expires_at IS NULL OR expires_at > created_at)\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "store_meta",
+    "table": "store_meta",
+    "sql": "CREATE TABLE store_meta (\n    k TEXT NOT NULL PRIMARY KEY,\n    v TEXT NOT NULL\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "store_revision",
+    "table": "store_revision",
+    "sql": "CREATE TABLE store_revision (\n    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),\n    revision INTEGER NOT NULL DEFAULT 0\n) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "usage_metering",
+    "table": "usage_metering",
+    "sql": "CREATE TABLE usage_metering (\n    bucket             TEXT NOT NULL,\n    key_id             TEXT NOT NULL,\n    provider           TEXT NOT NULL,\n    model              TEXT NOT NULL,\n    key_group_at_use   TEXT NOT NULL DEFAULT '',\n    pricing_version    TEXT NOT NULL DEFAULT '',\n    requests           INTEGER NOT NULL DEFAULT 0,\n    billable_requests  INTEGER NOT NULL DEFAULT 0,\n    tokens_input       INTEGER NOT NULL DEFAULT 0,\n    tokens_output      INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_write INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (bucket, key_id, provider, model)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "table",
+    "name": "usage_windows",
+    "table": "usage_windows",
+    "sql": "CREATE TABLE usage_windows (\n    window_start       INTEGER NOT NULL,\n    bucket_id          TEXT NOT NULL,\n    model              TEXT NOT NULL,\n    requests           INTEGER NOT NULL DEFAULT 0,\n    billable_requests  INTEGER NOT NULL DEFAULT 0,\n    tokens_input       INTEGER NOT NULL DEFAULT 0,\n    tokens_output      INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,\n    tokens_cache_write INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (window_start, bucket_id, model)\n) STRICT, WITHOUT ROWID"
+  },
+  {
+    "kind": "trigger",
+    "name": "audit_log_no_delete",
+    "table": "audit_log",
+    "sql": "CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log\n  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "audit_log_no_update",
+    "table": "audit_log",
+    "sql": "CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log\n  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "keys_cascade_credentials",
+    "table": "keys",
+    "sql": "CREATE TRIGGER keys_cascade_credentials AFTER DELETE ON keys FOR EACH ROW\n  BEGIN DELETE FROM credentials WHERE key_id = OLD.id; END"
+  },
+  {
+    "kind": "trigger",
+    "name": "keys_guard_hard_delete",
+    "table": "keys",
+    "sql": "CREATE TRIGGER keys_guard_hard_delete BEFORE DELETE ON keys FOR EACH ROW\n  WHEN EXISTS (SELECT 1 FROM usage_metering WHERE key_id = OLD.id)\n  BEGIN SELECT RAISE(ABORT, 'keys: hard DELETE would orphan usage_metering rows; use the tombstone path (Store::delete_key)'); END"
+  }
+]

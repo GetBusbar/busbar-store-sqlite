@@ -52,7 +52,6 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
     );
     assert!(answer.needs.is_empty());
     assert!(!root.exists(), "cold migration must not open a database");
-    busbar_store_sqlite::door::Settings::parse(&answer.settings.to_string()).unwrap();
     let again = migrate(&answer.settings);
     assert_eq!(again, Migrated::unchanged(answer.settings));
 
@@ -80,7 +79,7 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
 fn linked_migration_removes_ignored_license_before_resolution_without_open() {
     assert_migration(
         |settings| {
-            migrate::migrate_door(raw(busbar_store_sqlite::door::door), settings, "1.5.5")
+            migrate::migrate_door(raw(busbar_store_sqlite::v4::door), settings, "1.5.5")
                 .unwrap()
                 .expect("SQLite declares its migration")
         },

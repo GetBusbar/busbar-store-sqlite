@@ -26,6 +26,11 @@
       "default": 5000,
       "description": "Busy timeout in milliseconds. Omitted or null uses 5000. Fractional or exponent JSON number spellings are refused by the parser.",
       "x-busbar-integer-token": "signed"
+    },
+    "input_budget_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional host input admission budget in bytes."
     }
   },
   "x-busbar-settings-profile": "integer-token-v1"
