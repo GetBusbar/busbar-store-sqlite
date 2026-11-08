@@ -11,4 +11,7 @@ mod legacy;
 mod settings;
 
 /// The native primitive Store door, shared by linked and dropped-in installations.
-pub mod v4;
+pub(crate) mod v4;
+
+/// The validated entry and generated registration descriptor.
+pub use v4::{door, MACRO_DOOR};

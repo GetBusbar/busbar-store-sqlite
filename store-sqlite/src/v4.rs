@@ -774,7 +774,11 @@ impl Backend for SqliteV4 {
     fn validate(s: &[u8]) -> Result<(), String> {
         settings(s).map(drop)
     }
-    fn open(s: &[u8], _: &[&[u8]], _: Option<Host>) -> Result<Self, String> {
+    fn open(
+        s: &[u8],
+        _: &[&[u8]],
+        _: Option<Host<busbar_contract::plugin::markers::StoreKind>>,
+    ) -> Result<Self, String> {
         let (settings, budget) = settings(s)?;
         let native = crate::legacy::native::Session::inspect(
             std::path::Path::new(&settings.db_path),

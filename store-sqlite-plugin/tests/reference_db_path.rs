@@ -13,7 +13,10 @@ use busbar_plugin_loader::dispatch::{
 const DB_PATH: &str = "/var/lib/busbar/busbar.db";
 
 fn linked() -> (Plugin<StoreV4>, Arc<Dispatcher>) {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let bind = Bind {
         instance: Arc::from("reference-db-path"),
         max_inflight_cap: 64,
@@ -22,7 +25,7 @@ fn linked() -> (Plugin<StoreV4>, Arc<Dispatcher>) {
         conns: ConnTable::Probe,
     };
     let row = LinkedRow::of_kind::<StoreV4>(
-        busbar_store_sqlite::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_sqlite::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .expect("the row renders");
     (

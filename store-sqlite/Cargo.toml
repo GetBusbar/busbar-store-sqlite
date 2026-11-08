@@ -34,5 +34,6 @@ jsonschema = { workspace = true }
 rusqlite = { workspace = true, features = ["hooks"] }
 
 # Safe handle metadata for native migration coordination; no Linux dependency.
+busbar-contract = { workspace = true, features = ["test-seal"] }
 [target.'cfg(windows)'.dependencies]
 winapi-util = "=0.1.11"

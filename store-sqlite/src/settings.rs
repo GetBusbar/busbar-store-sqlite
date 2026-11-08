@@ -119,6 +119,7 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 pub(crate) struct SettingsMigration;
 
 impl busbar_contract::abi::sdk::migrate::Migrate for SettingsMigration {
+    type Kind = busbar_contract::plugin::markers::StoreKind;
     fn migrate(
         mut settings: serde_json::Value,
         _from: &str,

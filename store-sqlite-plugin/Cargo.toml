@@ -26,8 +26,9 @@ busbar-contract = { workspace = true }
 # The native conformance tests load the built cdylib and the linked door over the REAL loader (the
 # one dispatcher, the primitive Store table) — dev-only, never in the shipped artifact. Same pinned rev as
 # the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
 # Dev-only: native persistence calls are asynchronous.
 tokio = { workspace = true, features = ["rt"] }
+busbar-contract = { workspace = true, features = ["test-seal"] }

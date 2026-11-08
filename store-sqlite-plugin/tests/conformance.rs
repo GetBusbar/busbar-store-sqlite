@@ -47,7 +47,7 @@ fn plugin(dropped: bool, dispatcher: &Arc<Dispatcher>) -> Plugin<StoreV4> {
         load_dropped::<StoreV4>(&path, &stated, bind).unwrap()
     } else {
         let row = LinkedRow::of_kind::<StoreV4>(
-            busbar_store_sqlite::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+            busbar_store_sqlite::door as busbar_contract::abi::mechanism::door::DoorFn,
         )
         .unwrap();
         load_linked::<StoreV4>(&row, bind).unwrap()
@@ -91,7 +91,7 @@ fn exercise(dropped: bool) {
     rt.block_on(async {
         let mut dataset = None;
         for _ in 0..2 {
-            let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+            let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default(), busbar_contract::services::test_caller_binding()));
             let backend = LoadedPersistence::open(plugin(dropped, &dispatcher), dispatcher, &settings, limits()).await.unwrap();
             let info = backend.info();
             if let Some(previous) = dataset { assert_eq!(info.dataset, previous); }
@@ -158,7 +158,7 @@ fn linked_and_dropped_bootstrap_freeze_legacy_without_ordinary_open() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let dispatcher=Arc::new(Dispatcher::new(DispatchConfig::default()));let prepared=LoadedPrepared::new(plugin(dropped,&dispatcher),dispatcher,&settings,limits()).unwrap();
+            let dispatcher=Arc::new(Dispatcher::new(DispatchConfig::default(), busbar_contract::services::test_caller_binding()));let prepared=LoadedPrepared::new(plugin(dropped,&dispatcher),dispatcher,&settings,limits()).unwrap();
             let limit=lifecycle::Bounds {items:128,bytes:1<<20};
             let inspected=prepared.bootstrap(Arc::new(Request::Inspect {bounds:limit})).await.unwrap();
             let Response::Inspected(inspected)=inspected.as_ref() else{panic!("inspection")};assert_eq!(inspected.state,lifecycle::InspectionState::Legacy);assert_eq!(std::fs::read(&path).unwrap(),original);

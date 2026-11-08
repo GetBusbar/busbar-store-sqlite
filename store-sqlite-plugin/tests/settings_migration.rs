@@ -79,7 +79,7 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
 fn linked_migration_removes_ignored_license_before_resolution_without_open() {
     assert_migration(
         |settings| {
-            migrate::migrate_door(raw(busbar_store_sqlite::v4::door), settings, "1.5.5")
+            migrate::migrate_door(raw(busbar_store_sqlite::door), settings, "1.5.5")
                 .unwrap()
                 .expect("SQLite declares its migration")
         },

@@ -15,7 +15,11 @@ pub(super) fn put(key: &[u8], value: &[u8]) -> Mutation<Own> {
         value: Secret::held(value.to_vec()),
     }
 }
-fn opened(settings: &[u8], secrets: &[&[u8]], host: Option<Host>) -> Result<SqliteV4, String> {
+fn opened(
+    settings: &[u8],
+    secrets: &[&[u8]],
+    host: Option<Host<busbar_contract::plugin::markers::StoreKind>>,
+) -> Result<SqliteV4, String> {
     let store = SqliteV4::open(settings, secrets, host)?;
     store.connect_now()?;
     Ok(store)
