@@ -165,7 +165,7 @@ fn linked_and_dropped_bootstrap_freeze_legacy_without_ordinary_open() {
             let begun=prepared.bootstrap(Arc::new(Request::BeginOrResume {expected_source:inspected.source.clone().unwrap(),route_digest:[7;32],target_format:lifecycle::CORE_FORMAT,operation_id:[8;16]})).await.unwrap();
             let Response::Begun(upgrade)=begun.as_ref() else{panic!("upgrade")};
             let table=upgrade.catalogue.iter().position(|table|table.name=="keys").unwrap() as u32;
-            let page=prepared.bootstrap(Arc::new(Request::SourcePage {upgrade:upgrade.reference.clone(),snapshot:upgrade.snapshot,family:crate::source_interpretation::SOURCE_OWNER,selector:SourceSelector::Scan {table},cursor:None,bounds:limit})).await.unwrap();
+            let page=prepared.bootstrap(Arc::new(Request::SourcePage {upgrade:upgrade.reference.clone(),snapshot:upgrade.snapshot,family:inspected.source.as_ref().unwrap().format.unwrap().owner,selector:SourceSelector::Scan {table},cursor:None,bounds:limit})).await.unwrap();
             let Response::SourcePage(page)=page.as_ref() else{panic!("source page")};assert!(!page.rows.is_empty());assert_eq!(page.snapshot,upgrade.snapshot);
             let target=prepared.target(upgrade.reference.clone()).await.unwrap();assert_eq!(target.info(),upgrade.target);target.clock(upgrade.target.dataset).await.unwrap();
             assert!(prepared.serving().is_err());assert_eq!(prepared.phase(),lifecycle::Phase::Upgrading);
