@@ -1185,9 +1185,12 @@ impl Session {
             )
         })
         .map_err(|e| match e {
-            super::Error::RowTooLarge => Error::Bounds,
+            super::Error::RowTooLarge
+            | super::Error::InvalidLimits
+            | super::Error::UnsupportedShape
+            | super::Error::Allocation => Error::Bounds,
             super::Error::InvalidCursor => Error::Refused,
-            _ => Error::Corrupt,
+            super::Error::Sqlite | super::Error::UnsupportedVersion => Error::Unavailable,
         })?;
         let next = if page.exhausted {
             None

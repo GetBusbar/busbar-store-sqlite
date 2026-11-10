@@ -147,14 +147,15 @@ pub(super) fn run(store: &SqliteV4, request: &Request<Own>) -> Result<Response<O
                 .map_err(native)?;
             let (connection, target) = session.target(upgrade.id).map_err(native)?;
             let info = facts(&target);
+            let binding =
+                protected(session.authority().map_err(native)?).map_err(|_| Error::Bounds)?;
             *store.connection.lock().map_err(|_| Error::Unavailable)? = connection;
             *store.info.lock().map_err(|_| Error::Unavailable)? = info;
             store.enabled.store(true, Ordering::Release);
             Ok(Response::Target(lifecycle::TargetBinding {
                 upgrade: upgrade.id,
                 info,
-                binding: protected(session.authority().map_err(native)?)
-                    .map_err(|_| Error::Bounds)?,
+                binding,
             }))
         }
         Request::CheckFence { upgrade } => {
