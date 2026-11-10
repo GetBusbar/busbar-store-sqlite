@@ -37,3 +37,6 @@ rusqlite = { workspace = true, features = ["hooks"] }
 busbar-contract = { workspace = true, features = ["test-seal"] }
 [target.'cfg(windows)'.dependencies]
 winapi-util = "=0.1.11"
+
+[package.metadata.busbar.test-contexts]
+sqlite_application = [{ path = "tests/application/credential_flush_response_actual.rs", module = "admin_application_credential_flush_response_actual" }, { path = "tests/application/external_accepted_events.rs", module = "kernel_application_external_accepted_events" }, { path = "tests/application/misc_boot.rs", module = "misc_boot" }]
