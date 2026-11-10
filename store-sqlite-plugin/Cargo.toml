@@ -32,3 +32,6 @@ rusqlite = { workspace = true }
 # Dev-only: native persistence calls are asynchronous.
 tokio = { workspace = true, features = ["rt"] }
 busbar-contract = { workspace = true, features = ["test-seal"] }
+
+[package.metadata.busbar.test-artifacts]
+cdylib = ["BUSBAR_TEST_SQLITE_CDYLIB", "BUSBAR_BOOTSTRAP_TEST_STORE_PLUGIN"]
