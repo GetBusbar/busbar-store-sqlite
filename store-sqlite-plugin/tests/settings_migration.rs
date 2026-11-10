@@ -3,7 +3,7 @@
 
 //! Exercise the actual linked and dropped cold migration entries, without opening a store.
 
-use busbar_contract::abi::sdk::migrate::Migrated;
+use busbar_contract::abi::sdk::migrate::{Migrated, MigrationAnswer};
 use busbar_plugin_loader::dispatch::{load::raw, migrate};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ fn cdylib() -> PathBuf {
     path
 }
 
-fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
+fn assert_migration(migrate: impl Fn(&Value) -> MigrationAnswer, tag: &str) {
     let root = std::env::temp_dir().join(format!(
         "sqlite-settings-migration-{}-{tag}",
         std::process::id()
@@ -41,10 +41,16 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
         "busy_timeout_ms": 731,
         "license_key": {"env": "SQLITE_OBSOLETE_LICENSE_SENTINEL"}
     });
+    let expected = json!({"db_path": path, "busy_timeout_ms": 731});
     let answer = migrate(&settings);
     assert_eq!(
-        answer.settings,
-        json!({"db_path": path, "busy_timeout_ms": 731})
+        answer,
+        Migrated {
+            settings: expected.clone(),
+            report: vec!["Removed obsolete license_key; SQLite does not use this setting.".into()],
+            needs: Vec::new(),
+        }
+        .into()
     );
     assert_eq!(
         answer.report,
@@ -52,8 +58,8 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
     );
     assert!(answer.needs.is_empty());
     assert!(!root.exists(), "cold migration must not open a database");
-    let again = migrate(&answer.settings);
-    assert_eq!(again, Migrated::unchanged(answer.settings));
+    let again = migrate(&expected);
+    assert_eq!(again, Migrated::unchanged(expected).into());
 
     // Only this obsolete field is removed. References, unknown future settings and every
     // untouched JSON shape survive exactly; validation and reference resolution run later.
@@ -62,7 +68,15 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
     let mut expected = settings.clone();
     expected.as_object_mut().unwrap().remove("license_key");
     let answer = migrate(&settings);
-    assert_eq!(answer.settings, expected);
+    assert_eq!(
+        answer,
+        Migrated {
+            settings: expected,
+            report: answer.report.clone(),
+            needs: answer.needs.clone(),
+        }
+        .into()
+    );
     assert_eq!(answer.report.len(), 1);
     assert!(!answer.report[0].contains("SENTINEL"));
     for unchanged in [
@@ -71,7 +85,7 @@ fn assert_migration(migrate: impl Fn(&Value) -> Migrated, tag: &str) {
         json!({}),
         json!({"busy_timeout_ms": 0}),
     ] {
-        assert_eq!(migrate(&unchanged), Migrated::unchanged(unchanged));
+        assert_eq!(migrate(&unchanged), Migrated::unchanged(unchanged).into());
     }
 }
 

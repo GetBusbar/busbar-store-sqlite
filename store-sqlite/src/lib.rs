@@ -17,3 +17,6 @@ pub(crate) mod v4;
 pub use v4::{door, MACRO_DOOR};
 
 mod source_interpretation;
+
+// Owner-controlled source paths are consumed only by the assembled application tests.
+include!(concat!(env!("OUT_DIR"), "/context_test_source.rs"));
