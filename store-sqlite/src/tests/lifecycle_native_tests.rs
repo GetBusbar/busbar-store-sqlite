@@ -227,3 +227,17 @@ fn hardlink_alias_refuses_before_mutation_and_lock_replacement_revokes_capabilit
     std::fs::write(&lock, b"").unwrap();
     assert_eq!(session.check(upgrade.upgrade), Err(Error::Changed));
 }
+#[test]
+fn memory_uri_with_rw_mode_resolves_to_in_memory() {
+    let session = Session::inspect(Path::new("file::memory:?mode=rw"), 0, 1024 * 1024).unwrap();
+    assert_eq!(session.inspection, Inspection::Empty);
+    assert_eq!(session.database_name(), Path::new(":memory:"));
+    assert!(session.may_write());
+}
+#[test]
+fn memory_uri_with_ro_mode_resolves_to_in_memory() {
+    let session = Session::inspect(Path::new("file::memory:?mode=ro"), 0, 1024 * 1024).unwrap();
+    assert_eq!(session.inspection, Inspection::Empty);
+    assert_eq!(session.database_name(), Path::new(":memory:"));
+    assert!(!session.may_write());
+}

@@ -569,8 +569,10 @@ fn configured_path(input: &Path) -> Result<(PathBuf, bool, bool), Error> {
                 _ => return Err(Error::Unsupported),
             }
         }
-        if mode == Some("memory") || (name == ":memory:" && matches!(mode, None | Some("rwc"))) {
-            return Ok((PathBuf::from(":memory:"), true, true));
+        if mode == Some("memory")
+            || (name == ":memory:" && matches!(mode, None | Some("ro" | "rw" | "rwc")))
+        {
+            return Ok((PathBuf::from(":memory:"), mode != Some("ro"), true));
         }
         if !matches!(mode, None | Some("ro" | "rw" | "rwc")) {
             return Err(Error::Unsupported);
