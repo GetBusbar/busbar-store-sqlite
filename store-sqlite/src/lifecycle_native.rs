@@ -233,7 +233,14 @@ pub(crate) fn whole_empty(c: &Connection) -> Result<bool, Error> {
     Ok(!records && !receipts)
 }
 fn guard_sql(table: &str, verb: &str) -> String {
-    format!("CREATE TRIGGER {} BEFORE {verb} ON {} BEGIN SELECT RAISE(ABORT,'Busbar legacy source is frozen'); END",quote(&format!("__busbar_freeze_{}_{table}",verb.to_ascii_lowercase())),quote(table))
+    format!(
+        "CREATE TRIGGER {} BEFORE {verb} ON {} BEGIN SELECT RAISE(ABORT,'Busbar legacy source is frozen'); END",
+        quote(&format!(
+            "__busbar_freeze_{}_{table}",
+            verb.to_ascii_lowercase()
+        )),
+        quote(table)
+    )
 }
 fn random() -> Result<[u8; 16], Error> {
     loop {
@@ -1060,7 +1067,7 @@ impl Session {
                     owner: if current {
                         *b"busbar.core.v1\0\0"
                     } else {
-                        *b"legacy.sqlite.v1"
+                        crate::source_interpretation::SOURCE_OWNER
                     },
                     physical: physical as u32,
                     logical: 1,
@@ -1121,9 +1128,6 @@ impl Session {
         if snapshot_id != upgrade.frozen_digest[..16] {
             return Err(Error::Changed);
         }
-        if family != busbar_contract::persistence::lifecycle::SQLITE_SOURCE_OWNER {
-            return Err(Error::Refused);
-        }
         if bounds.bytes <= 256
             || bounds.bytes > 64 * 1024 * 1024
             || bounds.items == 0
@@ -1132,6 +1136,9 @@ impl Session {
             return Err(Error::Bounds);
         }
         let (table, prefix, exact) = match selector {
+            SourceSelector::Interpret { reader, bounds } => {
+                return self.interpreted_page(request, owner, *reader, *bounds);
+            }
             SourceSelector::Scan { table } => (*table, None, false),
             SourceSelector::Exact { table, key } => (*table, Some(key), true),
             SourceSelector::IndexPrefix {
@@ -1145,6 +1152,9 @@ impl Session {
                 (*table, Some(prefix), false)
             }
         };
+        if family != crate::source_interpretation::SOURCE_OWNER {
+            return Err(Error::Refused);
+        }
         let after = cursor.map(|v| busbar_contract::Secret::held(v.expose_own(owner).clone()));
         let prefix = prefix.map(|v| busbar_contract::Secret::held(v.expose_own(owner).clone()));
         let reopened;
@@ -1288,3 +1298,184 @@ impl Session {
 #[cfg(test)]
 #[path = "tests/lifecycle_native_tests.rs"]
 mod tests;
+
+impl Session {
+    fn interpreted_page<O: busbar_contract::redacted::OwnerSeal>(
+        &self,
+        request: &busbar_contract::persistence::lifecycle::Request<O>,
+        owner: &O,
+        reader: busbar_contract::persistence::lifecycle::SourceReader,
+        interpretation: busbar_contract::persistence::lifecycle::InterpretationBounds,
+    ) -> Result<busbar_contract::persistence::lifecycle::SourcePage<O>, Error> {
+        use busbar_contract::{persistence::lifecycle as l, Secret};
+        let map = |error| match error {
+            l::Error::Bounds => Error::Bounds,
+            l::Error::UnsupportedFormat => Error::Unsupported,
+            l::Error::SourceChanged => Error::Changed,
+            _ => Error::Corrupt,
+        };
+        interpretation.validate().map_err(map)?;
+        let l::Request::SourcePage {
+            upgrade,
+            snapshot,
+            family,
+            cursor,
+            bounds,
+            ..
+        } = request
+        else {
+            return Err(Error::Refused);
+        };
+        if *family != l::INTERPRETED_SOURCE {
+            return Err(Error::Refused);
+        }
+        let retained = self.check(upgrade.id)?;
+        let (source, tables) = self.frozen_view()?;
+        let physical = source.format.ok_or(Error::Corrupt)?.physical;
+        if crate::source_interpretation::descriptor(physical).map_err(map)? != reader {
+            return Err(Error::Changed);
+        }
+        crate::source_interpretation::validate_catalogue(physical, &tables).map_err(map)?;
+        let charge = tables.iter().try_fold(
+            tables
+                .len()
+                .checked_mul(std::mem::size_of::<
+                    busbar_contract::persistence::archive::Table,
+                >())
+                .ok_or(Error::Bounds)?,
+            |total, table| {
+                total
+                    .checked_add(table.name.capacity())
+                    .and_then(|n| n.checked_add(table.native_layout.capacity()))
+                    .and_then(|n| {
+                        table.columns.iter().try_fold(n, |n, c| {
+                            n.checked_add(c.capacity() + std::mem::size_of::<String>())
+                        })
+                    })
+                    .ok_or(Error::Bounds)
+            },
+        )?;
+        if charge > interpretation.index_bytes as usize {
+            return Err(Error::Bounds);
+        }
+        let (mut table, mut position): (u32, Option<Secret<Vec<u8>, O>>) = if let Some(cursor) =
+            cursor
+        {
+            let bytes = cursor.expose_own(owner);
+            if bytes.len() < 41 || bytes[0] != 1 || bytes[1..33] != reader.decoder_digest() {
+                return Err(Error::Refused);
+            }
+            let table = u32::from_le_bytes(bytes[33..37].try_into().map_err(|_| Error::Corrupt)?);
+            let length =
+                u32::from_le_bytes(bytes[37..41].try_into().map_err(|_| Error::Corrupt)?) as usize;
+            if bytes.len() != 41usize.checked_add(length).ok_or(Error::Bounds)? {
+                return Err(Error::Refused);
+            }
+            (
+                table,
+                (length != 0).then(|| Secret::held(bytes[41..].to_vec())),
+            )
+        } else {
+            (0, None)
+        };
+        while (table as usize) < tables.len() {
+            let raw = self.page(
+                &l::Request::SourcePage {
+                    upgrade: upgrade.clone(),
+                    snapshot: *snapshot,
+                    family: crate::source_interpretation::SOURCE_OWNER,
+                    selector: l::SourceSelector::Scan { table },
+                    cursor: position.take(),
+                    bounds: l::Bounds {
+                        items: 1,
+                        bytes: interpretation.semantic_bytes.min(64 * 1024 * 1024),
+                    },
+                },
+                owner,
+            )?;
+            let selected = table;
+            position = raw.next;
+            if position.is_none() {
+                table = table.checked_add(1).ok_or(Error::Bounds)?;
+            }
+            if raw.rows.is_empty() {
+                if position.is_some() {
+                    return Err(Error::Corrupt);
+                }
+                continue;
+            }
+            if raw.rows.len() != 1 {
+                return Err(Error::Corrupt);
+            }
+            let chunk = crate::source_interpretation::interpret(
+                physical,
+                &tables[selected as usize],
+                &raw.rows[0],
+                interpretation.semantic_bytes as usize,
+                owner,
+            )
+            .map_err(map)?;
+            let value = l::codec::encode_source_chunk_owned(
+                &chunk,
+                l::Bounds {
+                    items: u32::MAX,
+                    bytes: bounds.bytes.checked_sub(256).ok_or(Error::Bounds)?,
+                },
+            )
+            .map_err(map)?;
+            let next = if table as usize == tables.len() {
+                None
+            } else {
+                let length = position.as_ref().map_or(0, |v| v.expose_own(owner).len());
+                let capacity = 41usize.checked_add(length).ok_or(Error::Bounds)?;
+                if capacity > bounds.bytes as usize {
+                    return Err(Error::Bounds);
+                }
+                let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+                bytes.push(1);
+                bytes.extend_from_slice(&reader.decoder_digest());
+                bytes.extend_from_slice(&table.to_le_bytes());
+                bytes.extend_from_slice(
+                    &u32::try_from(length)
+                        .map_err(|_| Error::Bounds)?
+                        .to_le_bytes(),
+                );
+                if let Some(position) = &position {
+                    bytes.extend_from_slice(position.expose_own(owner));
+                }
+                Some(Secret::held(std::mem::take(&mut *bytes)))
+            };
+            let mut coverage = busbar_contract::persistence::archive::Hasher::new();
+            coverage.update(&retained.frozen_digest);
+            coverage.update(&reader.decoder_digest());
+            coverage.update(&raw.coverage_digest);
+            coverage.update(value.expose_own(owner));
+            return Ok(l::SourcePage {
+                snapshot: *snapshot,
+                family: *family,
+                rows: vec![l::SourceRow {
+                    table: 0,
+                    native_key: chunk.group,
+                    value,
+                }],
+                next,
+                source_digest: retained.frozen_digest,
+                coverage_digest: coverage.finish(),
+            });
+        }
+        if table as usize != tables.len() {
+            return Err(Error::Refused);
+        }
+        let mut coverage = busbar_contract::persistence::archive::Hasher::new();
+        coverage.update(&retained.frozen_digest);
+        coverage.update(&reader.decoder_digest());
+        Ok(l::SourcePage {
+            snapshot: *snapshot,
+            family: *family,
+            rows: vec![],
+            next: None,
+            source_digest: retained.frozen_digest,
+            coverage_digest: coverage.finish(),
+        })
+    }
+}

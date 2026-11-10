@@ -15,3 +15,5 @@ pub(crate) mod v4;
 
 /// The validated entry and generated registration descriptor.
 pub use v4::{door, MACRO_DOOR};
+
+mod source_interpretation;

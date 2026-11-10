@@ -36,14 +36,22 @@ fn bounds(bounds: lifecycle::Bounds) -> Result<(), Error> {
         Ok(())
     }
 }
-fn ready_state(session: &Session) -> lifecycle::InspectionState {
-    match session.inspection {
+fn ready_state(session: &Session) -> Result<lifecycle::InspectionState, Error> {
+    Ok(match &session.inspection {
         Inspection::Empty => lifecycle::InspectionState::Empty,
         Inspection::Current => lifecycle::InspectionState::Current,
-        Inspection::Legacy { .. } => lifecycle::InspectionState::Legacy,
+        Inspection::Legacy { physical, .. } => {
+            lifecycle::InspectionState::Legacy(crate::source_interpretation::descriptor(
+                u32::try_from(*physical).map_err(|_| Error::Corrupt)?,
+            )?)
+        }
         Inspection::InProgress(Upgrade { phase: 2, .. }) => lifecycle::InspectionState::Current,
-        Inspection::InProgress(_) => lifecycle::InspectionState::InProgress,
-    }
+        Inspection::InProgress(upgrade) => {
+            lifecycle::InspectionState::InProgress(crate::source_interpretation::descriptor(
+                u32::try_from(upgrade.source_physical).map_err(|_| Error::Corrupt)?,
+            )?)
+        }
+    })
 }
 pub(super) fn run(store: &SqliteV4, request: &Request<Own>) -> Result<Response<Own>, Error> {
     let mut session = store.native.lock().map_err(|_| Error::Unavailable)?;
@@ -71,7 +79,7 @@ pub(super) fn run(store: &SqliteV4, request: &Request<Own>) -> Result<Response<O
             }
             let marker = session.admission().map_err(native)?.map(Secret::held);
             Ok(Response::Inspected(lifecycle::Inspection {
-                state: ready_state(&session),
+                state: ready_state(&session)?,
                 source,
                 admission_marker: marker,
                 catalogue,
@@ -305,7 +313,10 @@ mod tests {
             else {
                 panic!("inspection")
             };
-            assert_eq!(inspected.state, lifecycle::InspectionState::Legacy);
+            assert!(matches!(
+                inspected.state,
+                lifecycle::InspectionState::Legacy(_)
+            ));
             let Response::Begun(upgrade) = run(
                 &store,
                 &Request::BeginOrResume {
@@ -326,7 +337,7 @@ mod tests {
             let request = Request::SourcePage {
                 upgrade: upgrade.reference.clone(),
                 snapshot: upgrade.snapshot,
-                family: lifecycle::SQLITE_SOURCE_OWNER,
+                family: crate::source_interpretation::SOURCE_OWNER,
                 selector: lifecycle::SourceSelector::Scan { table: key_table },
                 cursor: None,
                 bounds: limit,
@@ -338,7 +349,7 @@ mod tests {
             let request = Request::SourcePage {
                 upgrade: upgrade.reference.clone(),
                 snapshot: upgrade.snapshot,
-                family: lifecycle::SQLITE_SOURCE_OWNER,
+                family: crate::source_interpretation::SOURCE_OWNER,
                 selector: lifecycle::SourceSelector::Exact {
                     table: key_table,
                     key: page.rows[0].native_key.clone(),
@@ -581,6 +592,137 @@ mod tests {
                 .unwrap();
             assert_eq!(reopened.facts(), facts);
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod interpretation_tests {
+    use super::*;
+    #[test]
+    fn native_interpretation_binds_reader_original_bytes_and_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "sqlite-interpreted-{}",
+            crate::v4::random()
+                .unwrap()
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.db");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/1.5.5/governance.db"),
+            &source,
+        )
+        .unwrap();
+        let config = serde_json::to_vec(&serde_json::json!({"db_path":source})).unwrap();
+        let store = SqliteV4::open(&config, &[], None).unwrap();
+        let bounds = lifecycle::Bounds {
+            items: 64,
+            bytes: 4 * 1024 * 1024,
+        };
+        let Response::Inspected(inspection) = run(&store, &Request::Inspect { bounds }).unwrap()
+        else {
+            panic!("inspection");
+        };
+        let reader = inspection.state.reader().unwrap();
+        let Response::Begun(upgrade) = run(
+            &store,
+            &Request::BeginOrResume {
+                expected_source: inspection.source.unwrap(),
+                route_digest: [4; 32],
+                target_format: lifecycle::CORE_FORMAT,
+                operation_id: [3; 16],
+            },
+        )
+        .unwrap() else {
+            panic!("upgrade");
+        };
+        let make = |reader, cursor| Request::SourcePage {
+            upgrade: upgrade.reference.clone(),
+            snapshot: upgrade.snapshot,
+            family: lifecycle::INTERPRETED_SOURCE,
+            selector: lifecycle::SourceSelector::Interpret {
+                reader,
+                bounds: lifecycle::InterpretationBounds {
+                    semantic_bytes: 4 * 1024 * 1024,
+                    index_bytes: 1024 * 1024,
+                    storage_bytes: 16 * 1024 * 1024,
+                },
+            },
+            cursor,
+            bounds,
+        };
+        let different = lifecycle::SourceReader::new(
+            lifecycle::SourceCodec::HistoricalV1,
+            lifecycle::DocumentSemantics::Historical,
+            [9; 32],
+        )
+        .unwrap();
+        assert!(matches!(
+            run(&store, &make(different, None)),
+            Err(Error::SourceChanged)
+        ));
+        let mut cursor = None;
+        let mut facts = 0;
+        loop {
+            let request = make(reader, cursor);
+            let Response::SourcePage(page) = run(&store, &request).unwrap() else {
+                panic!("source");
+            };
+            let Response::SourcePage(replay) = run(&store, &request).unwrap() else {
+                panic!("replay");
+            };
+            assert_eq!(page.rows.len(), replay.rows.len());
+            assert_eq!(page.next, replay.next);
+            assert_eq!(page.coverage_digest, replay.coverage_digest);
+            for (row, again) in page.rows.iter().zip(&replay.rows) {
+                assert_eq!(row.value, again.value);
+                let chunk = lifecycle::codec::decode_source_chunk_owned::<Own>(
+                    row.value.expose_own(&store.owner),
+                    bounds,
+                )
+                .unwrap();
+                assert_eq!(chunk.reader, reader);
+                assert!(chunk.complete);
+                facts += chunk.facts.len();
+                for evidence in chunk.evidence {
+                    let Response::SourcePage(original) = run(
+                        &store,
+                        &Request::SourcePage {
+                            upgrade: upgrade.reference.clone(),
+                            snapshot: upgrade.snapshot,
+                            family: crate::source_interpretation::SOURCE_OWNER,
+                            selector: lifecycle::SourceSelector::Exact {
+                                table: evidence.table,
+                                key: evidence.native_key,
+                            },
+                            cursor: None,
+                            bounds,
+                        },
+                    )
+                    .unwrap() else {
+                        panic!("original");
+                    };
+                    assert_eq!(original.rows.len(), 1);
+                    assert_eq!(
+                        busbar_contract::persistence::archive::digest(
+                            original.rows[0].value.expose_own(&store.owner)
+                        ),
+                        evidence.value_digest
+                    );
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+            assert!(facts < 1000);
+        }
+        assert!(facts > 4);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
