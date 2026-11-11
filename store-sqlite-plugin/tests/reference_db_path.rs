@@ -47,15 +47,36 @@ fn the_db_path_is_not_declared_secret() {
 #[test]
 fn a_reference_at_the_db_path_resolves_as_the_kernel_resolves_it() {
     let (p, _d) = linked();
-    let mut tree = serde_json::json!({"db_path": {"env": "REFCAP_DB_PATH_FOR_TEST"}});
+    // Source shorthand is expanded with admitted source metadata before this
+    // context-free resolution step; it receives the canonical owner reference.
+    let mut tree = serde_json::json!({
+        "db_path": {"module": "env", "settings": {"key": "REFCAP_DB_PATH_FOR_TEST"}}
+    });
+    let expected = busbar_contract::secret_ref::SecretRef::Source(
+        busbar_contract::secret_ref::SourceReference {
+            module: "env".into(),
+            settings: serde_json::Map::from_iter([(
+                "key".into(),
+                "REFCAP_DB_PATH_FOR_TEST".into(),
+            )])
+            .into(),
+        },
+    );
+    let mut resolutions = 0;
     busbar_contract::secret_fields::resolve_declared_fields(
         &mut tree,
         p.secret_refs(),
         p.reference_fields(),
         p.name(),
-        |_, _| Ok(DB_PATH.to_string()),
+        |field, reference| {
+            assert_eq!(field, "db_path");
+            assert_eq!(reference, &expected);
+            resolutions += 1;
+            Ok(DB_PATH.to_string())
+        },
     )
     .expect("a reference at the db_path resolves");
+    assert_eq!(resolutions, 1);
     assert_eq!(tree["db_path"], DB_PATH);
 }
 
