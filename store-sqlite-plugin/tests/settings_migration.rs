@@ -45,11 +45,11 @@ fn assert_migration(migrate: impl Fn(&Value) -> MigrationAnswer, tag: &str) {
     let answer = migrate(&settings);
     assert_eq!(
         answer,
-        Migrated {
-            settings: expected.clone(),
-            report: vec!["Removed obsolete license_key; SQLite does not use this setting.".into()],
-            needs: Vec::new(),
-        }
+        Migrated::new(
+            expected.clone(),
+            vec!["Removed obsolete license_key; SQLite does not use this setting.".into()],
+            Vec::new()
+        )
         .into()
     );
     assert_eq!(
@@ -70,12 +70,7 @@ fn assert_migration(migrate: impl Fn(&Value) -> MigrationAnswer, tag: &str) {
     let answer = migrate(&settings);
     assert_eq!(
         answer,
-        Migrated {
-            settings: expected,
-            report: answer.report.clone(),
-            needs: answer.needs.clone(),
-        }
-        .into()
+        Migrated::new(expected, answer.report.clone(), answer.needs.clone()).into()
     );
     assert_eq!(answer.report.len(), 1);
     assert!(!answer.report[0].contains("SENTINEL"));
