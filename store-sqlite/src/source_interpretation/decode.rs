@@ -1067,13 +1067,20 @@ mod physical_regressions {
 
     #[test]
     fn synthetic_wide_timestamp_bits_are_preserved_separately_from_counts() {
+        // A clearly synthetic envelope generated at test time, so no credential-shaped literal
+        // sits in source: `v1:plain:test-only-envelope-<random hex>`.
+        let hex = {
+            use std::hash::BuildHasher;
+            std::collections::hash_map::RandomState::new().hash_one("envelope")
+        };
+        let envelope = format!("v1:plain:test-only-envelope-{hex:016x}");
         let cells = [
             Cell::Text(b"id"),
             Cell::Text(b"key"),
             Cell::Text(b"sigv4"),
             Cell::Integer(0),
             Cell::Text(b"public"),
-            Cell::Text(b"v1:plain:secret"),
+            Cell::Text(envelope.as_bytes()),
             Cell::Text(b"recoverable"),
             Cell::Integer(i64::MIN),
             Cell::Integer(i64::MIN),
@@ -1090,7 +1097,7 @@ mod physical_regressions {
             };
             assert_eq!(value.meta.created_at, 1u64 << 63);
             assert_eq!(value.meta.expires_at, Some((1u64 << 63) + 1));
-            assert_eq!(value.envelope, Some(b"v1:plain:secret".as_slice()));
+            assert_eq!(value.envelope, Some(envelope.as_bytes()));
         });
     }
 }
